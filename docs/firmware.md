@@ -149,6 +149,7 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 | NTP | Display Unit | pool servers | Synced periodically; UI shows synced time |
 | Battery clock | Display Unit | on (auto-detected) | PCF85063 + CR927 coin cell keeps time through power loss (v1.6.0) — see [Battery-backed RTC](#battery-backed-rtc-v160); status in Settings → System |
 | Clock format | Display Unit | 24-hour | Settings → Display → *12-hour clock* switch (v1.6.0, persisted). Presentation only — schedules, MQTT and the HTTP API stay 24-hour |
+| SD feed log | Display Unit | auto-detected | Insert a microSD card (FAT32/exFAT); feed history lands in `/feeds.csv`. Compile-out with `-DCATFISH_FEATURE_SD` removal — see [Optional SD card](#optional-sd-card-v170) |
 | Backlight | Display Unit | on | Settings → Display → Backlight switch (persisted across reboots); screen auto-dims after 10 min idle and wakes on touch |
 | MQTT / Home Assistant | Display Unit | disabled | Settings → HOME ASSISTANT (MQTT) → *Configure*: broker, port, credentials, topic prefix — topic map and behaviour in [mqtt.md](mqtt.md) |
 | Feeding mechanism | Relay Unit | `motor` | Display UI: Settings → Relay Unit → *Mechanism* → *Configure* (motor / servo / stepper + servo angles / stepper rate), or `POST /config` with `{"mechanism":...}` — semantics and wiring in [api.md](api.md#feeding-mechanisms-v140). Stored in a separate EEPROM record; factory reset restores `motor` |
@@ -196,6 +197,19 @@ What the firmware does now:
 - **Shared I2C bus** — the RTC, GT911 touch controller and CH422G expander share one I2C bus (SDA GPIO8 / SCL GPIO9). Arduino `Wire` owns the legacy I2C driver and the panel stack attaches to it (`ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST` / `ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST` = 1 in `include/esp_panel_board_custom_conf.h`). Do **not** set those flags back to 0 — the panel would try to re-install the driver Wire already owns and the touch/expander would fail.
 
 All stored/derived times are UTC internally; the `PHT-8` timezone applies at render time only.
+
+## Optional SD card (v1.7.0)
+
+The board's TF slot (SPI: MOSI GPIO11, SCK GPIO12, MISO GPIO13, card CS on expander **EXIO4**) is used as an optional **feed-history log**:
+
+- **Compile-time optional**: enabled by `-DCATFISH_FEATURE_SD=1` in `firmware/display-unit/platformio.ini`. Remove that line and rebuild for an SD-free image.
+- **Runtime-optional**: no card in the slot just reports `no card` in Settings → STORAGE — everything else behaves identically.
+- **What gets logged**: every feed result (manual, scheduled, HA, dashboard — successes *and* failures) appends one line to `/feeds.csv`: `epoch,iso8601,tankMask,seconds,ok`. Rows are only written once the clock is valid (RTC or NTP).
+- **Rotation**: when `/feeds.csv` passes 2 MB it is renamed to `/feeds.old.csv` (previous copy replaced) and a fresh file starts.
+- **Reading the log**: eject the card and open it on a PC, or `cat` it over the serial console — no HTTP endpoint by design (LAN appliance keeps its surface small).
+- **Bus etiquette**: the card's CS is asserted only around each SD operation, so the SPI bus is free between writes (relevant when the optional nRF24L01 shares the same pins in v1.8.0+).
+
+Mount happens once in `setup()` (blocking ~100–300 ms, before the UI comes up). Cards ≥ 8 GB formatted FAT32/exFAT are fine.
 
 ## OTA updates
 

@@ -33,6 +33,7 @@
 #include "web_server.h"
 #include "ui/ui.h"
 #include "pcf85063.h"
+#include "sd_log.h"
 #include <catfish_protocol.h>
 #include <catfish_mech.h>
 #include <catfish_time.h>
@@ -706,6 +707,12 @@ static void handleWorkerResult(const net_worker::Result &r) {
   }
 
   if (r.kind == net_worker::Result::RES_FEED) {
+    // v1.7.0: failed feeds land in the SD history too (when the clock is valid)
+    if (!r.ok && feed_scheduler::timeValid()) {
+      sd_log::logFeed((uint32_t)time(nullptr),
+                      (uint8_t)(r.tanksFail ? r.tanksFail : 0x01), r.seconds,
+                      false);
+    }
     if (r.ok) {
       if (!r.manual) clearRetryFor(r.hour, r.minute);
 
@@ -715,6 +722,8 @@ static void handleWorkerResult(const net_worker::Result &r) {
       if (clock_ok) {
         const uint32_t epoch = (uint32_t)time(nullptr);
         prefs::setLastFedEpoch(epoch);
+        sd_log::logFeed(epoch, (uint8_t)(r.tanksOk ? r.tanksOk : 0x01),
+                        r.seconds, true);
         when = r.manual ? formatLastFed(epoch)
                         : (String("Today ") + fmtHhmm(r.hour, r.minute));
       }
@@ -876,6 +885,12 @@ void setup() {
     s_board->getBacklight()->setBrightness(1); // switch type: on (no PWM)
   }
 
+  // --- optional microSD feed log (v1.7.0) ---
+  // After board begin(): the CH422G expander (TF-card CS) is up. Blocking
+  // mount is fine here (setup context); a missing card just disables it.
+  sd_log::begin(s_board->getIO_Expander() ? s_board->getIO_Expander()->getBase()
+                                          : nullptr);
+
   if (!lvgl_port_init(s_board->getLCD(), s_board->getTouch())) {
     Serial.println("[SYS] ERROR: LVGL port init failed");
   }
@@ -886,6 +901,7 @@ void setup() {
   ui_set_backlight_cb(appSetBacklight, prefs::getBacklightOn());
   ui_set_hour12(prefs::getHour12());
   ui_set_rtc(s_rtc_status);
+  ui_set_sd(sd_log::summary());
   ui_set_relay(false, prefs::getTankIp(1));
   ui_set_last_feed(formatLastFed(prefs::getLastFedEpoch()));
   {

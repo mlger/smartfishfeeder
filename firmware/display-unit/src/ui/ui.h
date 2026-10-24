@@ -164,6 +164,9 @@ void ui_set_hour12(bool h12);
 /** v1.6.0: Settings > System RTC status line (battery/clock state). */
 void ui_set_rtc(const String &text);
 
+/** v1.7.0: Settings > STORAGE card SD-card summary ("no card", "1.9 GB free"). */
+void ui_set_sd(const String &text);
+
 /** Request a manual feed (safe to call from LVGL callbacks). */
 void ui_request_feed(uint8_t seconds);
 
