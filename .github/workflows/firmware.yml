@@ -6,7 +6,9 @@
 #   DIO flash mode) used directly by the web flasher.
 # - Relay unit: espressif8266 produces a self-contained firmware.bin flashed at 0x0.
 # - Serves web-flasher/ + fresh firmware manifests on GitHub Pages (build_type=workflow)
-# - Attaches firmware binaries to GitHub releases on v* tags
+# - Attaches firmware binaries to GitHub releases on v* tags, and maintains a
+#   rolling "latest" prerelease on every main build (so firmware is always
+#   attached to a release without needing a tag)
 #
 # Permissions are least-privilege per job; PR runs get a read-only token.
 
@@ -35,10 +37,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -55,10 +57,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -66,7 +68,7 @@ jobs:
         run: pip install platformio==6.2.0
 
       - name: Cache PlatformIO packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.platformio
           key: pio-display-unit-${{ runner.os }}-${{ hashFiles('firmware/display-unit/platformio.ini') }}
@@ -98,7 +100,7 @@ jobs:
           cp firmware/display-unit/.pio/build/display-unit/firmware.elf staging/
 
       - name: Upload display-unit artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fw-display-unit-${{ github.sha }}
           path: staging/*
@@ -111,10 +113,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -122,7 +124,7 @@ jobs:
         run: pip install platformio==6.2.0
 
       - name: Cache PlatformIO packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.platformio
           key: pio-relay-unit-${{ runner.os }}-${{ hashFiles('firmware/relay-unit/platformio.ini') }}
@@ -152,7 +154,7 @@ jobs:
           cp firmware/relay-unit/.pio/build/relay-unit/firmware.elf staging/relay-unit-firmware.elf
 
       - name: Upload relay-unit artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fw-relay-unit-${{ github.sha }}
           path: staging/*
@@ -175,16 +177,16 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download display-unit artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: fw-display-unit-${{ github.sha }}
           path: dist/display-unit
 
       - name: Download relay-unit artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: fw-relay-unit-${{ github.sha }}
           path: dist/relay-unit
@@ -248,16 +250,16 @@ jobs:
           PY
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   release:
     name: Attach firmware to GitHub release
@@ -268,13 +270,13 @@ jobs:
       contents: write
     steps:
       - name: Download display-unit artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: fw-display-unit-${{ github.sha }}
           path: dist/display-unit
 
       - name: Download relay-unit artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: fw-relay-unit-${{ github.sha }}
           path: dist/relay-unit
@@ -292,7 +294,59 @@ jobs:
           cp dist/relay-unit/relay-unit-firmware.elf "assets/relay-unit-firmware-${V}.elf"
 
       - name: Attach assets to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: assets/*
           generate_release_notes: true
+
+  # Rolling prerelease so firmware is always attached to a release without
+  # needing a v* tag. Stable asset names + delete/recreate: the release always
+  # reflects the newest main build and download URLs never change (per-sha
+  # names would accumulate stale assets on every push).
+  release-latest:
+    name: Publish rolling latest firmware prerelease
+    needs: [build-display-unit, build-relay-unit]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout (for app version string)
+        uses: actions/checkout@v7
+
+      - name: Download display-unit artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: fw-display-unit-${{ github.sha }}
+          path: dist/display-unit
+
+      - name: Download relay-unit artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: fw-relay-unit-${{ github.sha }}
+          path: dist/relay-unit
+
+      - name: Collect assets (stable latest names)
+        run: |
+          mkdir -p assets
+          cp dist/display-unit/firmware.factory.bin  assets/catfish-display-unit-latest.bin
+          cp dist/display-unit/firmware.bin          assets/catfish-display-unit-app-latest.bin
+          cp dist/display-unit/bootloader.bin        assets/catfish-display-unit-bootloader-latest.bin
+          cp dist/display-unit/partitions.bin        assets/catfish-display-unit-partitions-latest.bin
+          cp dist/display-unit/firmware.elf          assets/catfish-display-unit-latest.elf
+          cp dist/relay-unit/relay-unit-firmware.bin assets/catfish-relay-unit-latest.bin
+          cp dist/relay-unit/relay-unit-firmware.elf assets/catfish-relay-unit-latest.elf
+
+      - name: Publish/update the latest prerelease
+        run: |
+          SHA="${GITHUB_SHA::7}"
+          APPV=$(grep -m1 '^#define CATFISH_APP_VERSION' firmware/common/catfish_protocol.h | sed 's/.*"\(.*\)".*/\1/')
+          NOTES=$(printf 'Rolling firmware build from `main` @ %s (app v%s).\n\nProduced automatically on every main build — these are the same images the [web flasher](https://%s.github.io/%s/) serves. For tagged releases, see the `v*` releases.' "$SHA" "$APPV" "$GITHUB_REPOSITORY_OWNER" "${GITHUB_REPOSITORY#*/}")
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest assets/* \
+            --prerelease \
+            --title "Firmware — rolling latest" \
+            --notes "$NOTES"
