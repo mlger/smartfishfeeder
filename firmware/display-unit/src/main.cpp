@@ -4,9 +4,15 @@
  *
  * Architecture:
  *  - LVGL runs in its own FreeRTOS task (lvgl_v8_port), touch via GT911.
- *  - "wifi-task" (core 0) owns WiFiManager/mDNS/NTP; main loop stays free.
- *  - loop(): 1 Hz scheduler tick + manual-feed handling + ui_tick(),
- *    30 s WiFi UI refresh, 60 s relay probe. Blocking only for feed POSTs.
+ *  - "wifi-task" (core 0) owns WiFiManager/mDNS/NTP.
+ *  - "net-worker" (core 0) owns ALL blocking relay HTTP/discovery calls.
+ *    loop() never blocks: it enqueues commands and drains results.
+ *  - loop(): drains UI events + worker results every pass (~50 ms),
+ *    1 Hz scheduler tick + persist flush + retry logic + ui_tick(),
+ *    30 s WiFi UI refresh, 60 s relay probe (via worker).
+ *
+ * Scheduled-feed resilience: a failed scheduled feed is retried once ~30 s
+ * later; persistent failure surfaces a "Feed FAILED" toast.
  *
  * Serial log tags: [FEED] [NET] [UI] [SYS].
  */
@@ -18,12 +24,13 @@
 
 #include "feed_scheduler.h"
 #include "net_wifi.h"
+#include "net_worker.h"
 #include "prefs.h"
 #include "relay_client.h"
 #include "ui/ui.h"
 
 using namespace esp_panel::board;
-using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*)
+using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
 
 static Board *s_board = nullptr;
 
@@ -31,6 +38,16 @@ static Board *s_board = nullptr;
 static uint32_t s_t_1s = 0;
 static uint32_t s_t_30s = 0;
 static uint32_t s_t_60s = 0;
+
+// Scheduled-feed retry (one retry, ~30 s later)
+struct SchedRetry {
+  bool pending = false;
+  uint8_t hour = 0;
+  uint8_t minute = 0;
+  uint8_t seconds = 0;
+  uint32_t dueMs = 0;
+};
+static SchedRetry s_retry;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -88,80 +105,166 @@ static void refreshNextFeedUi() {
   lvgl_port_unlock();
 }
 
-/**
- * Execute a feed command (blocking HTTP POST, up to ~6 s).
- * Manual feeds: relay token + default pulse; scheduled: entry time shown.
- */
-static void doFeed(uint8_t seconds, bool manual, uint8_t feedHour = 0,
-                   uint8_t feedMinute = 0) {
+static void uiToast(const String &msg) {
+  lvgl_port_lock(-1);
+  ui_toast(msg);
+  lvgl_port_unlock();
+}
+
+/** Route a feed request to the worker; manual feeds get immediate feedback. */
+static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
+                        uint8_t minute, bool retry) {
   if (!net_wifi::wifi_is_connected()) {
-    lvgl_port_lock(-1);
-    ui_toast("WiFi not connected");
-    lvgl_port_unlock();
+    uiToast("WiFi not connected");
     Serial.println("[FEED] aborted: WiFi down");
     return;
   }
-
-  lvgl_port_lock(-1);
-  ui_toast(manual ? "Feeding fish..." : "Feeding time!");
-  lvgl_port_unlock();
-
-  const relay_client::Result r = relay_client::feed(seconds);
-  bool ok = r.ok;
-  String when;
-
-  if (ok) {
-    const uint32_t epoch = (uint32_t)time(nullptr);
-    prefs::setLastFedEpoch(epoch);
-    when = manual ? formatLastFed(epoch)
-                  : (String("Today ") + fmtHhmm(feedHour, feedMinute));
-    Serial.printf("[FEED] feed OK via %s (%u s)\n", r.ip.c_str(),
-                  (unsigned)seconds);
-  } else {
-    Serial.printf("[FEED] feed FAILED: %s\n", r.error.c_str());
+  if (!net_worker::enqueueFeed(seconds, manual, hour, minute, retry)) {
+    uiToast("Too busy, try again");
+    Serial.println("[FEED] worker queue full, request dropped");
+    return;
   }
-
-  lvgl_port_lock(-1);
-  if (ok) {
-    ui_set_last_feed(when);
-    ui_toast(manual ? (String("Fed OK (") + seconds + " s)")
-                    : (String("Fed ") + fmtHhmm(feedHour, feedMinute)));
-  } else {
-    ui_toast(String("Feed failed: ") + r.error);
+  if (manual) {
+    lvgl_port_lock(-1);
+    ui_toast("Feeding fish...");
+    ui_set_feed_busy(true);
+    lvgl_port_unlock();
   }
-  lvgl_port_unlock();
-
-  if (ok) refreshNextFeedUi();
 }
 
-/** Probe relay (fetchStatus, discovering first when needed) and update UI. */
-static void probeRelay(bool report) {
-  bool online = false;
-  String version;
+/** Apply a schedule change: persist + rebuild list + refresh next-feed. */
+static void afterScheduleChange(bool removed) {
+  feed_scheduler::flushIfDirty();
+  lvgl_port_lock(-1);
+  ui_schedule_refresh();
+  ui_toast(removed ? "Feeding time removed" : "Feeding time added");
+  ui_editor_close(); // no-op unless the editor overlay is open
+  lvgl_port_unlock();
+  refreshNextFeedUi();
+}
 
-  if (net_wifi::wifi_is_connected()) {
-    if (!relay_client::hasIp()) {
-      const relay_client::Result d = relay_client::discover();
-      online = d.ok;
+// ---------------------------------------------------------------------------
+// UI event handling (loop context; never blocks except in-event flash writes)
+// ---------------------------------------------------------------------------
+static void handleUiEvent(const UiEvent &ev) {
+  switch (ev.type) {
+    case UI_EVT_FEED:
+      Serial.printf("[FEED] manual feed %u s\n", (unsigned)ev.a);
+      requestFeed(ev.a, true, 0, 0, false);
+      break;
+
+    case UI_EVT_RELAY_TEST:
+      Serial.println("[NET] relay test requested");
+      if (!net_worker::enqueueProbe(true))
+        uiToast("Too busy, try again");
+      break;
+
+    case UI_EVT_REBOOT:
+      Serial.println("[SYS] reboot requested");
+      feed_scheduler::flushIfDirty();
+      delay(300);
+      ESP.restart();
+      break;
+
+    case UI_EVT_SET_PULSE:
+      prefs::setDefaultPulse(ev.a);
+      Serial.printf("[FEED] default pulse set to %u s\n", (unsigned)ev.a);
+      break;
+
+    case UI_EVT_SET_TOKEN:
+      prefs::setRelayToken(String(ev.token));
+      Serial.println("[NET] pairing token updated");
+      uiToast("Pairing token updated");
+      break;
+
+    case UI_EVT_SCHED_ADD: {
+      const bool full =
+          feed_scheduler::getCount() >= feed_scheduler::MAX_FEED_TIMES;
+      const FeedTime t{ev.a, ev.b, true, ev.c};
+      if (feed_scheduler::add(t)) {
+        afterScheduleChange(false);
+      } else {
+        uiToast(full ? "Schedule full (max 8)" : "Time already scheduled");
+        Serial.println("[FEED] schedule add rejected");
+      }
+      break;
     }
-    if (relay_client::hasIp() || online) {
-      const relay_client::Status st = relay_client::fetchStatus();
-      online = st.ok;
-      if (st.ok) version = st.version;
+
+    case UI_EVT_SCHED_REMOVE:
+      if (feed_scheduler::removeByIdentity(ev.a, ev.b, ev.c)) {
+        afterScheduleChange(true);
+      } else {
+        Serial.println("[FEED] schedule remove: entry not found");
+      }
+      break;
+
+    case UI_EVT_SCHED_PERSIST:
+      feed_scheduler::flushIfDirty();
+      refreshNextFeedUi(); // enable/disable changes the next occurrence
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Worker result handling
+// ---------------------------------------------------------------------------
+static void handleWorkerResult(const net_worker::Result &r) {
+  if (r.kind == net_worker::Result::RES_FEED) {
+    lvgl_port_lock(-1);
+    ui_set_feed_busy(false);
+    lvgl_port_unlock();
+
+    if (r.ok) {
+      s_retry.pending = false;
+      const uint32_t epoch = (uint32_t)time(nullptr);
+      prefs::setLastFedEpoch(epoch);
+      const String when = r.manual
+                              ? formatLastFed(epoch)
+                              : (String("Today ") + fmtHhmm(r.hour, r.minute));
+      lvgl_port_lock(-1);
+      ui_set_last_feed(when);
+      ui_toast(r.manual ? (String("Fed OK (") + r.seconds + " s)")
+                        : (String("Fed ") + fmtHhmm(r.hour, r.minute)));
+      lvgl_port_unlock();
+      Serial.printf("[FEED] feed OK via %s (%u s)\n", r.ip, (unsigned)r.seconds);
+      refreshNextFeedUi();
+    } else if (r.manual) {
+      lvgl_port_lock(-1);
+      ui_toast(String("Feed failed: ") + r.error);
+      lvgl_port_unlock();
+      Serial.printf("[FEED] manual feed FAILED: %s\n", r.error);
+    } else {
+      // scheduled feed
+      if (r.retry || s_retry.pending) {
+        s_retry.pending = false;
+        uiToast(String("Feed FAILED: ") + r.error);
+        Serial.printf("[FEED] scheduled feed FAILED (no more retries): %s\n",
+                      r.error);
+      } else {
+        s_retry.pending = true;
+        s_retry.hour = r.hour;
+        s_retry.minute = r.minute;
+        s_retry.seconds = r.seconds;
+        s_retry.dueMs = millis() + 30000UL;
+        uiToast("Feed failed - retrying in 30 s");
+        Serial.printf("[FEED] scheduled feed failed (%s), retry armed\n",
+                      r.error);
+      }
     }
+    return;
   }
 
-  // Show the cached IP either way: "Online • ip" or "Offline • ip".
-  // With no IP at all the UI falls back to "Searching...".
-  const String shown_ip = relay_client::hasIp() ? relay_client::ip() : String("");
-
+  // RES_PROBE
   lvgl_port_lock(-1);
-  ui_set_relay(online, shown_ip);
-  if (report) {
+  ui_set_relay(r.online, r.ip, r.feeding);
+  if (r.report) {
     if (!net_wifi::wifi_is_connected())
       ui_toast("WiFi not connected");
-    else if (online)
-      ui_toast(String("Relay OK  v") + version);
+    else if (r.online)
+      ui_toast(String("Relay OK  v") + r.version);
     else
       ui_toast("Relay unreachable");
   }
@@ -205,7 +308,10 @@ void setup() {
   lvgl_port_unlock();
   refreshNextFeedUi();
 
-  // --- wifi (own task, LVGL stays responsive) ---
+  // --- background tasks ---
+  if (!net_worker::begin()) {
+    Serial.println("[SYS] ERROR: net worker unavailable; feeds will fail");
+  }
   net_wifi::start();
 
   // prime loop() cadence: first relay probe ~15 s after boot
@@ -219,9 +325,19 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
+  // ---- drain UI events + worker results (every pass, ~50 ms latency) ----
+  UiEvent ev;
+  while (ui_event_receive(ev)) handleUiEvent(ev);
+
+  net_worker::Result res;
+  while (net_worker::receive(res)) handleWorkerResult(res);
+
   // ---------------- 1 Hz block ----------------
   if ((now - s_t_1s) >= 1000) {
     s_t_1s = now;
+
+    // catch-all persist flush (covers setEnabled-only edits)
+    feed_scheduler::flushIfDirty();
 
     // scheduled feeding
     const FeedTime due = feed_scheduler::tick();
@@ -229,36 +345,17 @@ void loop() {
       Serial.printf("[FEED] scheduled feed %02u:%02u (%u s)\n",
                     (unsigned)due.hour, (unsigned)due.minute,
                     (unsigned)due.seconds);
-      doFeed(due.seconds, false, due.hour, due.minute);
+      uiToast("Feeding time!");
+      requestFeed(due.seconds, false, due.hour, due.minute, false);
     }
 
-    // manual FEED NOW from UI
-    if (g_feed_request) {
-      const uint8_t secs = g_feed_seconds;
-      g_feed_request = false;
-      Serial.printf("[FEED] manual feed %u s\n", (unsigned)secs);
-      doFeed(secs, true);
-    }
-
-    // relay "Test connection" from Settings
-    if (g_relay_test_request) {
-      g_relay_test_request = false;
-      Serial.println("[NET] relay test requested");
-      probeRelay(true);
-    }
-
-    // reboot from Settings
-    if (g_reboot_request) {
-      g_reboot_request = false;
-      Serial.println("[SYS] reboot requested");
-      delay(300);
-      ESP.restart();
-    }
-
-    // schedule changed on UI -> recompute next feeding
-    if (g_schedule_dirty) {
-      g_schedule_dirty = false;
-      refreshNextFeedUi();
+    // armed retry for a failed scheduled feed
+    if (s_retry.pending && (int32_t)(now - s_retry.dueMs) >= 0) {
+      s_retry.pending = false;
+      Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u s)\n",
+                    (unsigned)s_retry.hour, (unsigned)s_retry.minute,
+                    (unsigned)s_retry.seconds);
+      requestFeed(s_retry.seconds, false, s_retry.hour, s_retry.minute, true);
     }
 
     // UI housekeeping (clock, countdown, relay dot)
@@ -276,11 +373,11 @@ void loop() {
     lvgl_port_unlock();
   }
 
-  // ---------------- 60 s block: relay probe (only if WiFi up) ----------------
+  // ---------------- 60 s block: relay probe (via worker, only if WiFi up) ----
   if ((now - s_t_60s) >= 60000) {
     s_t_60s = now;
     if (net_wifi::wifi_is_connected()) {
-      probeRelay(false);
+      net_worker::enqueueProbe(false);
     }
   }
 

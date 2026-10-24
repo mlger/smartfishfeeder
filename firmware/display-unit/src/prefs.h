@@ -5,6 +5,10 @@
  * Namespace "catfish". Load-on-boot via prefs::begin(), save-on-change via the
  * setters below (each setter writes NVS immediately and updates the RAM cache).
  * Getters return cached values, so they are cheap enough to call from loop().
+ *
+ * Threading: setters are called only from loop() (single writer). The network
+ * worker task reads getRelayToken() concurrently — token access is internally
+ * guarded, all other getters are benign snapshot reads.
  */
 #ifndef CATFISH_PREFS_H
 #define CATFISH_PREFS_H
@@ -26,11 +30,14 @@ bool isLoaded();
 
 // ---- Feeding schedule blob (owned by feed_scheduler, JSON array string) ----
 String getScheduleJson();
-void setScheduleJson(const String &json);
+/** @return false when the blob exceeds the cache size (rejected, not truncated). */
+bool setScheduleJson(const String &json);
 
 // ---- Relay unit pairing ----
 /** LAN pairing token sent with every /feed POST (default "catfish"). */
 String getRelayToken();
+/** Store a new pairing token (clamped to CATFISH_TOKEN_LEN-1 chars). */
+void setRelayToken(const String &token);
 /** Last known relay IP as dotted string, "" if never discovered. */
 String getRelayIp();
 void setRelayIp(const String &ip);

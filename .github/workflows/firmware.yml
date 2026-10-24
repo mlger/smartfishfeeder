@@ -8,8 +8,7 @@
 # - Serves web-flasher/ + fresh firmware manifests on GitHub Pages (build_type=workflow)
 # - Attaches firmware binaries to GitHub releases on v* tags
 #
-# NOTE: firmware/display-unit and firmware/relay-unit each need a runnable
-# src/main.cpp (Tasks 4-a / 4-b); CI fails fast until those exist.
+# Permissions are least-privilege per job; PR runs get a read-only token.
 
 name: Firmware
 
@@ -20,15 +19,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One build per ref; PR builds cancel superseded runs, main/tag runs never do.
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 jobs:
   build-display-unit:
     name: Build Display Unit (ESP32-S3)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,7 +43,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install PlatformIO
-        run: pip install platformio
+        run: pip install "platformio>=6.1,<7"
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -71,6 +75,8 @@ jobs:
   build-relay-unit:
     name: Build Relay Unit (ESP8266)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,7 +87,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install PlatformIO
-        run: pip install platformio
+        run: pip install "platformio>=6.1,<7"
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -113,6 +119,10 @@ jobs:
     needs: [build-display-unit, build-relay-unit]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     concurrency:
       group: pages
       cancel-in-progress: false
@@ -210,6 +220,8 @@ jobs:
     needs: [build-display-unit, build-relay-unit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download display-unit artifact
         uses: actions/download-artifact@v4
@@ -223,14 +235,15 @@ jobs:
           name: fw-relay-unit-${{ github.sha }}
           path: dist/relay-unit
 
-      - name: Collect release assets
+      - name: Collect release assets (versioned filenames)
         run: |
           mkdir -p assets
-          cp dist/display-unit/firmware.factory.bin assets/merged-firmware.bin
-          cp dist/display-unit/firmware.bin assets/display-unit-firmware.bin
-          cp dist/display-unit/bootloader.bin assets/display-unit-bootloader.bin
-          cp dist/display-unit/partitions.bin assets/display-unit-partitions.bin
-          cp dist/relay-unit/relay-unit-firmware.bin assets/relay-unit-firmware.bin
+          V="${{ github.ref_name }}"
+          cp dist/display-unit/firmware.factory.bin "assets/merged-firmware-${V}.bin"
+          cp dist/display-unit/firmware.bin "assets/display-unit-firmware-${V}.bin"
+          cp dist/display-unit/bootloader.bin "assets/display-unit-bootloader-${V}.bin"
+          cp dist/display-unit/partitions.bin "assets/display-unit-partitions-${V}.bin"
+          cp dist/relay-unit/relay-unit-firmware.bin "assets/relay-unit-firmware-${V}.bin"
 
       - name: Attach assets to release
         uses: softprops/action-gh-release@v2

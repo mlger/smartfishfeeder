@@ -7,25 +7,33 @@
  *
  * Threading: all ui_* entry points are called under lvgl_port_lock() by the
  * main loop; LVGL event callbacks run inside the LVGL task (mutex owned).
- * Callbacks never block: they set volatile request flags consumed by loop().
+ * Callbacks never block: they enqueue a UiEvent (FreeRTOS queue) consumed by
+ * loop(). No flash writes, no scheduler mutations, no network I/O here.
  */
 #include "ui.h"
 #include <Arduino.h>
+#include <freertos/queue.h>
 #include <lvgl.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <catfish_protocol.h>
 #include "../feed_scheduler.h"
 #include "../prefs.h"
 
 // ---------------------------------------------------------------------------
-// Cross-thread request flags
+// Event queue: LVGL callbacks -> loop()
 // ---------------------------------------------------------------------------
-volatile bool g_feed_request = false;
-volatile uint8_t g_feed_seconds = 3;
-volatile bool g_relay_test_request = false;
-volatile bool g_reboot_request = false;
-volatile bool g_schedule_dirty = false;
+static QueueHandle_t s_evt_queue = nullptr;
+
+static bool uiEventSend(const UiEvent &ev) {
+  if (!s_evt_queue) return false;
+  if (xQueueSend(s_evt_queue, &ev, 0) != pdTRUE) {
+    Serial.println("[UI] WARN: event queue full, event dropped");
+    return false;
+  }
+  return true;
+}
 
 namespace ui {
 
@@ -55,6 +63,7 @@ lv_obj_t *s_wifi_sym[3] = {nullptr, nullptr, nullptr};
 lv_obj_t *s_nav_btn[3][3] = {};
 
 // Home
+lv_obj_t *s_feed_btn = nullptr;
 lv_obj_t *s_next_value = nullptr;
 lv_obj_t *s_next_sub = nullptr;
 lv_obj_t *s_last_value = nullptr;
@@ -76,6 +85,11 @@ lv_obj_t *s_lbl_ip = nullptr;
 lv_obj_t *s_lbl_rssi = nullptr;
 lv_obj_t *s_lbl_relay_ip = nullptr;
 
+// Token editor overlay (lv_layer_top)
+lv_obj_t *s_tok_overlay = nullptr;
+lv_obj_t *s_tok_ta = nullptr;
+lv_obj_t *s_tok_kb = nullptr;
+
 // Toast
 lv_obj_t *s_toast_box = nullptr;
 lv_obj_t *s_toast_lbl = nullptr;
@@ -85,6 +99,7 @@ lv_timer_t *s_toast_tmr = nullptr;
 void (*s_bl_cb)(bool) = nullptr;
 bool s_bl_on = true;
 bool s_relay_online = false;
+bool s_relay_feeding = false;
 bool s_dot_blink = false;
 bool s_next_valid = false;
 bool s_next_tomorrow = false;
@@ -106,7 +121,6 @@ void navCb(lv_event_t *e);
 void feedBtnCb(lv_event_t *e);
 void enableSwitchCb(lv_event_t *e);
 void trashCb(lv_event_t *e);
-void trashDeferredCb(void *param);
 void editorSaveCb(lv_event_t *e);
 void editorCancelCb(lv_event_t *e);
 void pulseSpinCb(lv_event_t *e);
@@ -121,6 +135,12 @@ void openEditor();
 void closeEditor();
 void addBtnCb(lv_event_t *e);
 void updateNextFeedUi();
+void buildTokenOverlay();
+void openTokenOverlay();
+void closeTokenOverlay();
+void tokenEditCb(lv_event_t *e);
+void tokenSaveCb(lv_event_t *e);
+void tokenCancelCb(lv_event_t *e);
 
 // ---------------------------------------------------------------------------
 // Small widget builders
@@ -322,23 +342,24 @@ void enableSwitchCb(lv_event_t *e) {
   const int idx = (int)(intptr_t)lv_event_get_user_data(e);
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   const bool en = lv_obj_has_state(sw, LV_STATE_CHECKED);
-  feed_scheduler::setEnabled(idx, en);
-  g_schedule_dirty = true;
+  feed_scheduler::setEnabled(idx, en); // RAM flip + dirty mark only
+  UiEvent ev;
+  ev.type = UI_EVT_SCHED_PERSIST;
+  uiEventSend(ev); // loop() flushes NVS + refreshes next-feed
   Serial.printf("[UI] schedule entry %d %s\n", idx, en ? "enabled" : "disabled");
 }
 
-void trashDeferredCb(void *param) {
-  const int idx = (int)(intptr_t)param;
-  if (feed_scheduler::remove(idx)) {
-    g_schedule_dirty = true;
-    rebuildScheduleList();
-    ui_toast("Feeding time removed");
-  }
-}
-
 void trashCb(lv_event_t *e) {
-  // defer: the trash button lives inside the container we are about to clean
-  lv_async_call(trashDeferredCb, lv_event_get_user_data(e));
+  // user_data packs the entry identity (h<<12 | m<<6 | s) so a tap is immune
+  // to index shifts caused by other pending removals; loop() does the actual
+  // feed_scheduler::removeByIdentity() + list rebuild under the LVGL lock.
+  const uintptr_t packed = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  UiEvent ev;
+  ev.type = UI_EVT_SCHED_REMOVE;
+  ev.a = (uint8_t)((packed >> 12) & 0x1F);
+  ev.b = (uint8_t)((packed >> 6) & 0x3F);
+  ev.c = (uint8_t)(packed & 0x3F);
+  uiEventSend(ev);
 }
 
 void addBtnCb(lv_event_t *e) {
@@ -348,20 +369,14 @@ void addBtnCb(lv_event_t *e) {
 
 void editorSaveCb(lv_event_t *e) {
   (void)e;
-  FeedTime t;
-  t.hour = (uint8_t)lv_roller_get_selected(s_r_hour);
-  t.minute = (uint8_t)lv_roller_get_selected(s_r_min);
-  t.seconds = (uint8_t)lv_spinbox_get_value(s_sb_sec);
-  t.enabled = true;
-
-  if (feed_scheduler::add(t)) {
-    g_schedule_dirty = true;
-    rebuildScheduleList();
-    ui_toast("Feeding time added");
-    closeEditor();
-  } else {
-    ui_toast("Schedule full (max 8)");
-  }
+  UiEvent ev;
+  ev.type = UI_EVT_SCHED_ADD;
+  ev.a = (uint8_t)lv_roller_get_selected(s_r_hour);
+  ev.b = (uint8_t)lv_roller_get_selected(s_r_min);
+  ev.c = (uint8_t)lv_spinbox_get_value(s_sb_sec);
+  // loop() performs the add: on success it rebuilds the list, closes the
+  // editor and toasts; on failure the editor stays open with the reason.
+  uiEventSend(ev);
 }
 
 void editorCancelCb(lv_event_t *e) {
@@ -371,9 +386,10 @@ void editorCancelCb(lv_event_t *e) {
 
 void pulseSpinCb(lv_event_t *e) {
   lv_obj_t *sb = (lv_obj_t *)lv_event_get_target(e);
-  const uint8_t v = (uint8_t)lv_spinbox_get_value(sb);
-  prefs::setDefaultPulse(v);
-  Serial.printf("[UI] default pulse set to %u s\n", (unsigned)v);
+  UiEvent ev;
+  ev.type = UI_EVT_SET_PULSE;
+  ev.a = (uint8_t)lv_spinbox_get_value(sb);
+  uiEventSend(ev); // loop() persists (keeps flash writes out of the LVGL task)
 }
 
 void blSwitchCb(lv_event_t *e) {
@@ -386,12 +402,39 @@ void blSwitchCb(lv_event_t *e) {
 
 void relayTestCb(lv_event_t *e) {
   (void)e;
-  g_relay_test_request = true; // loop() performs the (blocking) probe
+  UiEvent ev;
+  ev.type = UI_EVT_RELAY_TEST;
+  uiEventSend(ev); // loop() enqueues the (blocking) probe on the net worker
 }
 
 void rebootCb(lv_event_t *e) {
   (void)e;
-  g_reboot_request = true; // loop() performs the reboot
+  UiEvent ev;
+  ev.type = UI_EVT_REBOOT;
+  uiEventSend(ev); // loop() performs the reboot
+}
+
+void tokenEditCb(lv_event_t *e) {
+  (void)e;
+  openTokenOverlay();
+}
+
+void tokenCancelCb(lv_event_t *e) {
+  (void)e;
+  closeTokenOverlay();
+}
+
+void tokenSaveCb(lv_event_t *e) {
+  (void)e;
+  const char *t = lv_textarea_get_text(s_tok_ta);
+  if (!t || t[0] == '\0' || strlen(t) >= CATFISH_TOKEN_LEN) {
+    ui_toast("Token: 1-23 characters");
+    return;
+  }
+  UiEvent ev;
+  ev.type = UI_EVT_SET_TOKEN;
+  strlcpy(ev.token, t, sizeof(ev.token));
+  if (uiEventSend(ev)) closeTokenOverlay(); // loop() persists + toasts
 }
 
 void toastTimerCb(lv_timer_t *t) {
@@ -469,7 +512,9 @@ void rebuildScheduleList() {
     lv_obj_set_style_text_color(ti, lv_color_hex(C_RED), 0);
     lv_obj_set_style_text_font(ti, &lv_font_montserrat_20, 0);
     lv_obj_center(ti);
-    lv_obj_add_event_cb(trash, trashCb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    lv_obj_add_event_cb(trash, trashCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)((en.hour << 12) | (en.minute << 6) |
+                                            en.seconds));
   }
 }
 
@@ -520,10 +565,12 @@ void buildHome() {
 
   // FEED NOW — big amber action button
   lv_obj_t *feed = lv_btn_create(c);
+  s_feed_btn = feed;
   lv_obj_set_size(feed, 420, 120);
   lv_obj_set_style_radius(feed, 24, 0);
   lv_obj_set_style_bg_color(feed, lv_color_hex(C_AMBER), 0);
   lv_obj_set_style_bg_color(feed, lv_color_hex(C_AMBER_HI), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(feed, lv_color_hex(C_CARD), LV_STATE_DISABLED);
   lv_obj_set_style_bg_opa(feed, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(feed, 0, 0);
   lv_obj_set_style_shadow_width(feed, 0, 0);
@@ -531,6 +578,7 @@ void buildHome() {
   lv_label_set_text(fl, LV_SYMBOL_PLAY "  FEED NOW");
   lv_obj_set_style_text_font(fl, &lv_font_montserrat_32, 0);
   lv_obj_set_style_text_color(fl, lv_color_hex(C_INK), 0);
+  lv_obj_set_style_text_color(fl, lv_color_hex(C_MUTED), LV_STATE_DISABLED);
   lv_obj_center(fl);
   lv_obj_add_event_cb(feed, feedBtnCb, LV_EVENT_CLICKED, nullptr);
 
@@ -780,6 +828,25 @@ void buildSettings() {
   lv_label_set_text(s_lbl_relay_ip, "Relay IP: not found");
   lv_obj_set_style_text_font(s_lbl_relay_ip, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_lbl_relay_ip, lv_color_hex(C_TEXT), 0);
+
+  // -- pairing token row (opens the keyboard overlay on lv_layer_top)
+  lv_obj_t *tok_row = lv_obj_create(card_relay);
+  lv_obj_remove_style_all(tok_row);
+  lv_obj_set_size(tok_row, lv_pct(100), 64);
+  lv_obj_set_flex_flow(tok_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(tok_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(tok_row, 12, 0);
+  lv_obj_clear_flag(tok_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *tok_lbl = lv_label_create(tok_row);
+  lv_label_set_text(tok_lbl, "Pairing token");
+  lv_obj_set_style_text_font(tok_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(tok_lbl, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(tok_lbl, 1);
+  lv_obj_t *tok_edit = makeBtn(tok_row, LV_SYMBOL_EDIT "  Edit", C_CARD,
+                               C_AMBER, C_CARD_HI, 140, 64);
+  lv_obj_add_event_cb(tok_edit, tokenEditCb, LV_EVENT_CLICKED, nullptr);
+
   lv_obj_t *test = makeBtn(card_relay, LV_SYMBOL_REFRESH "  Test connection",
                            C_CARD, C_AMBER, C_CARD_HI, lv_pct(100), 64);
   lv_obj_set_style_border_color(test, lv_color_hex(C_AMBER), 0);
@@ -875,22 +942,113 @@ void toastTimerInit() {
   lv_timer_pause(s_toast_tmr);
 }
 
+// ---------------------------------------------------------------------------
+// Pairing-token editor (lv_layer_top overlay: card + on-screen keyboard)
+// ---------------------------------------------------------------------------
+void buildTokenOverlay() {
+  s_tok_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_tok_overlay);
+  lv_obj_set_size(s_tok_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_tok_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_tok_overlay, LV_OPA_70, 0);
+  lv_obj_add_flag(s_tok_overlay, LV_OBJ_FLAG_CLICKABLE); // swallow clicks behind
+  lv_obj_add_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_tok_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *card = makeCard(s_tok_overlay, 720, LV_SIZE_CONTENT);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 56);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 12, 0);
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, "PAIRING TOKEN");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  lv_obj_t *hint = lv_label_create(card);
+  lv_label_set_text(
+      hint, "Must match the relay unit token (Settings value it accepts on /feed).");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
+
+  s_tok_ta = lv_textarea_create(card);
+  lv_textarea_set_one_line(s_tok_ta, true);
+  lv_textarea_set_max_length(s_tok_ta, CATFISH_TOKEN_LEN - 1);
+  lv_textarea_set_placeholder_text(s_tok_ta, "relay pairing token");
+  lv_obj_set_width(s_tok_ta, lv_pct(100));
+  lv_obj_set_style_bg_color(s_tok_ta, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_tok_ta, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(s_tok_ta, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_font(s_tok_ta, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_border_color(s_tok_ta, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(s_tok_ta, 1, 0);
+  lv_obj_set_style_radius(s_tok_ta, 8, 0);
+  lv_obj_set_style_pad_all(s_tok_ta, 10, 0);
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *save = makeBtn(btns, LV_SYMBOL_OK "  Save", C_AMBER, C_INK,
+                           C_AMBER_HI, 100, 64);
+  lv_obj_set_flex_grow(save, 1);
+  lv_obj_add_event_cb(save, tokenSaveCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *cancel = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                             C_CARD_HI, 100, 64);
+  lv_obj_set_flex_grow(cancel, 1);
+  lv_obj_add_event_cb(cancel, tokenCancelCb, LV_EVENT_CLICKED, nullptr);
+
+  s_tok_kb = lv_keyboard_create(s_tok_overlay);
+  lv_obj_set_size(s_tok_kb, lv_pct(100), 210);
+  lv_obj_align(s_tok_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(s_tok_kb, s_tok_ta);
+  lv_obj_set_style_bg_color(s_tok_kb, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_tok_kb, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(s_tok_kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
+  lv_obj_set_style_text_color(s_tok_kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
+}
+
+void openTokenOverlay() {
+  if (!s_tok_overlay) return;
+  lv_textarea_set_text(s_tok_ta, prefs::getRelayToken().c_str());
+  lv_obj_clear_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_tok_overlay);
+}
+
+void closeTokenOverlay() {
+  if (s_tok_overlay) lv_obj_add_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
+  if (s_tok_kb) lv_keyboard_set_textarea(s_tok_kb, nullptr);
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // Public API (caller holds lvgl_port_lock unless running inside LVGL task)
 // ---------------------------------------------------------------------------
 void ui_init() {
+  if (!s_evt_queue) s_evt_queue = xQueueCreate(8, sizeof(UiEvent));
   buildRollerOptions();
   buildHome();
   buildSchedule();
   buildSettings();
   toastTimerInit();
+  buildTokenOverlay();
 
   showScreen(0);
   ui_set_next_feed("Waiting for time sync...");
   ui_set_last_feed("Never");
   Serial.println("[UI] screens built (home, schedule, settings)");
+}
+
+bool ui_event_receive(UiEvent &out) {
+  if (!s_evt_queue) return false;
+  return xQueueReceive(s_evt_queue, &out, 0) == pdTRUE;
 }
 
 void ui_tick() {
@@ -913,9 +1071,9 @@ void ui_tick() {
   // next-feed countdown
   updateNextFeedUi();
 
-  // relay dot pulse while relay not confirmed online
+  // relay dot pulse while relay not confirmed online and not feeding
   if (s_relay_dot) {
-    if (!s_relay_online) {
+    if (!s_relay_online && !s_relay_feeding) {
       s_dot_blink = !s_dot_blink;
       lv_obj_set_style_bg_opa(s_relay_dot, s_dot_blink ? LV_OPA_COVER : LV_OPA_30, 0);
     } else {
@@ -924,7 +1082,7 @@ void ui_tick() {
   }
 }
 
-void ui_set_wifi(bool connected, String ssid, String ip, int rssi) {
+void ui_set_wifi(bool connected, const String &ssid, const String &ip, int rssi) {
   for (int i = 0; i < 3; i++) {
     if (s_wifi_sym[i]) {
       lv_obj_set_style_text_color(s_wifi_sym[i],
@@ -951,8 +1109,9 @@ void ui_set_wifi(bool connected, String ssid, String ip, int rssi) {
   }
 }
 
-void ui_set_relay(bool online, String ip) {
+void ui_set_relay(bool online, const String &ip, bool feeding) {
   s_relay_online = online;
+  s_relay_feeding = feeding;
   strlcpy(s_relay_ip_cache, ip.c_str(), sizeof(s_relay_ip_cache));
 
   if (s_relay_dot) {
@@ -961,14 +1120,19 @@ void ui_set_relay(bool online, String ip) {
     lv_obj_set_style_bg_opa(s_relay_dot, LV_OPA_COVER, 0);
   }
   if (s_relay_txt) {
-    if (online && s_relay_ip_cache[0])
-      lv_label_set_text_fmt(s_relay_txt, "Online  \xE2\x80\xA2  %s",
-                            s_relay_ip_cache);
-    else if (s_relay_ip_cache[0])
-      lv_label_set_text_fmt(s_relay_txt, "Offline  \xE2\x80\xA2  %s",
-                            s_relay_ip_cache);
-    else
+    if (s_relay_ip_cache[0]) {
+      if (feeding)
+        lv_label_set_text_fmt(s_relay_txt, "Feeding...  \xE2\x80\xA2  %s",
+                              s_relay_ip_cache);
+      else if (online)
+        lv_label_set_text_fmt(s_relay_txt, "Online  \xE2\x80\xA2  %s",
+                              s_relay_ip_cache);
+      else
+        lv_label_set_text_fmt(s_relay_txt, "Offline  \xE2\x80\xA2  %s",
+                              s_relay_ip_cache);
+    } else {
       lv_label_set_text(s_relay_txt, "Searching...");
+    }
   }
   if (s_lbl_relay_ip) {
     lv_label_set_text_fmt(s_lbl_relay_ip, "Relay IP: %s",
@@ -976,7 +1140,7 @@ void ui_set_relay(bool online, String ip) {
   }
 }
 
-void ui_set_next_feed(String text) {
+void ui_set_next_feed(const String &text) {
   s_next_valid = false;
   s_val_cache[0] = '\0';
   s_sub_cache[0] = '\0';
@@ -997,11 +1161,11 @@ void ui_set_next_feed_time(int hour, int minute, bool tomorrow, bool valid) {
   }
 }
 
-void ui_set_last_feed(String text) {
+void ui_set_last_feed(const String &text) {
   if (s_last_value) lv_label_set_text(s_last_value, text.c_str());
 }
 
-void ui_toast(String msg) {
+void ui_toast(const String &msg) {
   if (!s_toast_box) return;
   lv_label_set_text(s_toast_lbl, msg.c_str());
   lv_obj_clear_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
@@ -1023,14 +1187,29 @@ void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on) {
 }
 
 void ui_request_feed(uint8_t seconds) {
-  if (seconds >= 1 && seconds <= 30) {
-    g_feed_seconds = seconds;
-  } else {
+  if (seconds < 1 || seconds > CATFISH_PULSE_S_LIMIT) {
     uint8_t d = prefs::getDefaultPulse();
-    g_feed_seconds = (d >= 1 && d <= 30) ? d : 3;
+    seconds = (d >= 1 && d <= CATFISH_PULSE_S_LIMIT) ? d : CATFISH_DEFAULT_PULSE_S;
   }
-  g_feed_request = true;
-  Serial.printf("[UI] feed requested: %u s\n", (unsigned)g_feed_seconds);
+  UiEvent ev;
+  ev.type = UI_EVT_FEED;
+  ev.a = seconds;
+  ev.flag = true; // manual
+  uiEventSend(ev);
+  Serial.printf("[UI] feed requested: %u s\n", (unsigned)seconds);
 }
+
+void ui_set_feed_busy(bool busy) {
+  if (s_feed_btn) {
+    if (busy)
+      lv_obj_add_state(s_feed_btn, LV_STATE_DISABLED);
+    else
+      lv_obj_clear_state(s_feed_btn, LV_STATE_DISABLED);
+  }
+}
+
+void ui_schedule_refresh() { rebuildScheduleList(); }
+
+void ui_editor_close() { closeEditor(); }
 
 } // namespace ui
