@@ -1,0 +1,38 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/ipch/
+.vscode/launch.json
+
+# Build artifacts
+*.bin
+*.elf
+*.map
+!web-flasher/**
+firmware/**/merged*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node
+node_modules/
+web-flasher/dist/
+
+# Secrets - NEVER commit tokens/keys
+.env
+.env.*
+*.pem
+secrets/
+FIGMA_TOKEN
+GH_TOKEN
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
