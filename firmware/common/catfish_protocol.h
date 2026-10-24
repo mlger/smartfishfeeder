@@ -17,7 +17,7 @@
 // strings from this). The #ifndef guard lets an external -DCATFISH_APP_VERSION
 // override it without redefinition warnings.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.1.0"
+#define CATFISH_APP_VERSION "1.2.0"
 #endif
 
 // ------------------------------------------------------------ protocol version
@@ -26,6 +26,19 @@
 // The relay reports this in GET /status as "proto"; the display parses it and
 // warns when the two firmwares disagree (e.g. only one unit was re-flashed).
 #define CATFISH_PROTOCOL_VERSION 1
+
+// ------------------------------------------------------------ MQTT / Home Assistant
+// The DISPLAY unit is the MQTT hub (the relay stays HTTP-only so the ESP8266
+// budget is protected). State + command topics live under CATFISH_MQTT_PREFIX;
+// HA discovery configs are published (retained) to the standard
+// "homeassistant/" prefix. Field caps keep prefs, UI buffers and this header
+// in sync.
+#define CATFISH_MQTT_PREFIX     "catfish" // default state/command topic root
+#define CATFISH_MQTT_PREFIX_LEN 16        // storage capacity incl. NUL
+#define CATFISH_MQTT_PORT       1883
+#define CATFISH_MQTT_HOST_LEN   64        // host/IP capacity incl. NUL
+#define CATFISH_MQTT_USER_LEN   32
+#define CATFISH_MQTT_PASS_LEN   64
 
 // ------------------------------------------------------------ discovery (LAN UDP broadcast)
 #define CATFISH_DISCOVERY_UDP_PORT   5050

@@ -23,6 +23,14 @@ uint8_t s_pulse = CATFISH_DEFAULT_PULSE_S;
 uint32_t s_last_fed = 0;
 bool s_bl_on = true;
 
+// MQTT / Home Assistant (loop-context only access; no guard needed)
+bool s_mq_en = false;
+char s_mq_host[CATFISH_MQTT_HOST_LEN] = {0};
+uint16_t s_mq_port = CATFISH_MQTT_PORT;
+char s_mq_user[CATFISH_MQTT_USER_LEN] = {0};
+char s_mq_pass[CATFISH_MQTT_PASS_LEN] = {0};
+char s_mq_prefix[CATFISH_MQTT_PREFIX_LEN] = CATFISH_MQTT_PREFIX;
+
 // Guards s_token: written by loop(), read by the net worker task.
 portMUX_TYPE s_token_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -56,6 +64,19 @@ bool begin() {
 
   s_last_fed = s_nvs.getULong("lastFed", 0);
   s_bl_on = s_nvs.getBool("blOn", true);
+
+  s_mq_en = s_nvs.getBool("mqEn", false);
+  v = s_nvs.getString("mqHost", "");
+  strlcpy(s_mq_host, v.c_str(), sizeof(s_mq_host));
+  s_mq_port = s_nvs.getUShort("mqPort", CATFISH_MQTT_PORT);
+  if (s_mq_port == 0) s_mq_port = CATFISH_MQTT_PORT;
+  v = s_nvs.getString("mqUser", "");
+  strlcpy(s_mq_user, v.c_str(), sizeof(s_mq_user));
+  v = s_nvs.getString("mqPass", "");
+  strlcpy(s_mq_pass, v.c_str(), sizeof(s_mq_pass));
+  v = s_nvs.getString("mqPre", CATFISH_MQTT_PREFIX);
+  strlcpy(s_mq_prefix, v.c_str(), sizeof(s_mq_prefix));
+  if (!s_mq_prefix[0]) strlcpy(s_mq_prefix, CATFISH_MQTT_PREFIX, sizeof(s_mq_prefix));
 
   s_loaded = true;
   Serial.println("[SYS] prefs loaded from NVS (namespace 'catfish')");
@@ -121,6 +142,51 @@ bool getBacklightOn() { return s_bl_on; }
 void setBacklightOn(bool on) {
   s_bl_on = on;
   if (s_loaded && !s_nvs.putBool("blOn", on)) nvsLogFail("blOn");
+}
+
+// ---------------------------------------------------------------- MQTT
+bool getMqttEnabled() { return s_mq_en; }
+
+void setMqttEnabled(bool on) {
+  s_mq_en = on;
+  if (s_loaded && !s_nvs.putBool("mqEn", on)) nvsLogFail("mqEn");
+}
+
+String getMqttHost() { return String(s_mq_host); }
+
+void setMqttHost(const String &host) {
+  strlcpy(s_mq_host, host.c_str(), sizeof(s_mq_host));
+  if (s_loaded && s_nvs.putString("mqHost", host) == 0) nvsLogFail("mqHost");
+}
+
+uint16_t getMqttPort() { return s_mq_port; }
+
+void setMqttPort(uint16_t port) {
+  if (port == 0) port = CATFISH_MQTT_PORT;
+  s_mq_port = port;
+  if (s_loaded && s_nvs.putUShort("mqPort", port) == 0) nvsLogFail("mqPort");
+}
+
+String getMqttUser() { return String(s_mq_user); }
+
+void setMqttUser(const String &user) {
+  strlcpy(s_mq_user, user.c_str(), sizeof(s_mq_user));
+  if (s_loaded && s_nvs.putString("mqUser", user) == 0) nvsLogFail("mqUser");
+}
+
+String getMqttPass() { return String(s_mq_pass); }
+
+void setMqttPass(const String &pass) {
+  strlcpy(s_mq_pass, pass.c_str(), sizeof(s_mq_pass));
+  if (s_loaded && s_nvs.putString("mqPass", pass) == 0) nvsLogFail("mqPass");
+}
+
+String getMqttPrefix() { return String(s_mq_prefix); }
+
+void setMqttPrefix(const String &prefix) {
+  strlcpy(s_mq_prefix, prefix.c_str(), sizeof(s_mq_prefix));
+  if (!s_mq_prefix[0]) strlcpy(s_mq_prefix, CATFISH_MQTT_PREFIX, sizeof(s_mq_prefix));
+  if (s_loaded && s_nvs.putString("mqPre", s_mq_prefix) == 0) nvsLogFail("mqPre");
 }
 
 } // namespace prefs
