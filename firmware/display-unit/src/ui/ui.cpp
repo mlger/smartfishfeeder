@@ -88,6 +88,8 @@ lv_obj_t *s_sw_bl = nullptr;
 lv_obj_t *s_sw_h12 = nullptr; // v1.6.0: 12-hour clock switch
 lv_obj_t *s_lbl_rtc = nullptr; // v1.6.0: Settings > System RTC status line
 lv_obj_t *s_lbl_sd = nullptr;  // v1.7.0: Settings > STORAGE card summary
+lv_obj_t *s_lbl_espnow = nullptr; // v1.8.0: RADIOS card ESP-NOW line
+lv_obj_t *s_lbl_rf24 = nullptr;   // v1.8.0: RADIOS card nRF24L01 line
 lv_obj_t *s_lbl_ssid = nullptr;
 lv_obj_t *s_lbl_ip = nullptr;
 lv_obj_t *s_lbl_rssi = nullptr;
@@ -1314,6 +1316,20 @@ void buildSettings() {
   lv_obj_set_style_text_font(s_lbl_sd, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(s_lbl_sd, lv_color_hex(C_TEXT), 0);
 
+  // -- RADIOS card (v1.8.0, optional ESP-NOW + nRF24L01 feed nodes)
+  lv_obj_t *card_rf = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_rf, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_rf, 8, 0);
+  makeTitle(card_rf, "RADIOS");
+  s_lbl_espnow = lv_label_create(card_rf);
+  lv_label_set_text(s_lbl_espnow, "ESP-NOW: ...");
+  lv_obj_set_style_text_font(s_lbl_espnow, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_lbl_espnow, lv_color_hex(C_TEXT), 0);
+  s_lbl_rf24 = lv_label_create(card_rf);
+  lv_label_set_text(s_lbl_rf24, "nRF24L01: ...");
+  lv_obj_set_style_text_font(s_lbl_rf24, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_lbl_rf24, lv_color_hex(C_TEXT), 0);
+
   // -- Home Assistant / MQTT card
   lv_obj_t *card_mq = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(card_mq, LV_FLEX_FLOW_COLUMN);
@@ -2387,6 +2403,13 @@ void ui_set_rtc(const String &text) {
 
 void ui_set_sd(const String &text) {
   if (s_lbl_sd) lv_label_set_text_fmt(s_lbl_sd, "SD card: %s", text.c_str());
+}
+
+void ui_set_radios(const String &espnow, const String &rf24) {
+  if (s_lbl_espnow)
+    lv_label_set_text_fmt(s_lbl_espnow, "ESP-NOW: %s", espnow.c_str());
+  if (s_lbl_rf24)
+    lv_label_set_text_fmt(s_lbl_rf24, "nRF24L01: %s", rf24.c_str());
 }
 
 void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz) {

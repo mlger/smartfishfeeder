@@ -211,6 +211,21 @@ The board's TF slot (SPI: MOSI GPIO11, SCK GPIO12, MISO GPIO13, card CS on expan
 
 Mount happens once in `setup()` (blocking ~100–300 ms, before the UI comes up). Cards ≥ 8 GB formatted FAT32/exFAT are fine.
 
+## Optional wireless feed nodes (v1.8.0)
+
+Battery "pucks" (any ESP8266/ESP32 + button) can trigger a feed wirelessly. Both radios implement the same **node datagram contract** ([`catfish_rfnode.h`](../firmware/common/catfish_rfnode.h)) and the display hub routes accepted requests through the *same* feed pipeline as touch/MQTT/dashboard — the relay unit is untouched.
+
+| Transport | Feature flag | Status shown in Settings → RADIOS |
+|-----------|--------------|-----------------------------------|
+| **ESP-NOW** (hub is the receiver) | `-DCATFISH_FEATURE_ESPNOW=1` (default) | `listening` once WiFi connects (channel follows the AP — pucks must send on the same channel) |
+| **nRF24L01+** (CE GPIO43 / CSN GPIO44, SPI shared with the TF card) | `-DCATFISH_FEATURE_NRF24=1` (default) | `listening` / `not found` when no module answers |
+
+**Packet** (12 bytes): magic `'C''F'`, protocol version, command (`1` = feed), tank mask (0 = hub's current selection), seconds (0 = hub default pulse, hard-capped 60), a uint16 sequence number (repeated broadcasts are dropped), and a 4-byte key = FNV-1a of the **pairing token**. Trust model equals the LAN HTTP API: rotating the token invalidates every puck until it is re-provisioned (the hub re-keys automatically).
+
+**Puck settings (nRF24)**: 1 Mbps, channel 76 (`-DCATFISH_RF24_CHANNEL`), 5-byte address `0xCA 0x74 0xF1 0x5B 0x01`. **Puck settings (ESP-NOW)**: broadcast the 12-byte datagram on the hub's WiFi channel.
+
+**SPI sharing**: the nRF24 and the TF card sit on the same SPI pins; every SD and radio operation is serialized by `src/spi_bus_guard.h`, so both features can be enabled together. Remove a `-DCATFISH_FEATURE_*` line in `platformio.ini` to build a radio-free image — each feature degrades to a status line ("disabled"/"not found").
+
 ## OTA updates
 
 **Both units run ArduinoOTA**, so firmware updates need no cable once they are on the network:
