@@ -45,7 +45,7 @@ pio run -d firmware/relay-unit       # ESP8266 relay
 
 The first build downloads the toolchains and registry libraries (LVGL, ArduinoJson, WiFiManager); the panel libraries are already vendored in `firmware/display-unit/lib/`. Artifacts land in `firmware/<unit>/.pio/build/<env>/` (`firmware.bin`, `bootloader.bin`, `partitions.bin` for the S3).
 
-Library/platform versions are pinned (ArduinoJson 7.4.2, WiFiManager 2.0.17, espressif8266 4.2.1, CI uses PlatformIO 6.1.19) so builds are reproducible.
+Library/platform versions are pinned (ArduinoJson 7.4.2, WiFiManager 2.0.17, espressif8266 4.2.1, CI uses PlatformIO 6.2.0) so builds are reproducible.
 
 ## Test (host-side, no hardware)
 
