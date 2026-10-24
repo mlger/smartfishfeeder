@@ -101,7 +101,14 @@
     #define ESP_PANEL_BOARD_LCD_RGB_VBP               (23)
     #define ESP_PANEL_BOARD_LCD_RGB_VFP               (12)
 #else
-    #define ESP_PANEL_BOARD_LCD_RGB_CLK_HZ            (16 * 1000 * 1000)
+#ifndef CATFISH_LCD_PCLK_HZ
+#define CATFISH_LCD_PCLK_HZ (16 * 1000 * 1000)
+#endif
+// Pixel clock is build-tunable (v1.6.1): if the panel shows periodic
+// flicker / signal artifacts, rebuild with -DCATFISH_LCD_PCLK_HZ=12000000
+// (or 8000000) in platformio.ini build_flags — see docs/firmware.md
+// troubleshooting. 16 MHz is the vendor default.
+#define ESP_PANEL_BOARD_LCD_RGB_CLK_HZ            (CATFISH_LCD_PCLK_HZ)
     #define ESP_PANEL_BOARD_LCD_RGB_HPW               (4)
     #define ESP_PANEL_BOARD_LCD_RGB_HBP               (8)
     #define ESP_PANEL_BOARD_LCD_RGB_HFP               (8)

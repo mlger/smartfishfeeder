@@ -183,6 +183,18 @@ constexpr uint32_t UI_BACKLIGHT_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 // ---------------------------------------------------------------------------
 // Internal prototypes (order-independent wiring)
 // ---------------------------------------------------------------------------
+// Shared keyboard behavior (v1.6.1): every editor keyboard follows ONE
+// pattern — hidden until a textarea gains focus, rebinds to the focused
+// field, scrolls the field above the keyboard, and hides again on the
+// keyboard's OK (LV_EVENT_READY) or close (LV_EVENT_CANCEL) key. Clearing
+// LV_STATE_FOCUSED on hide makes the next tap re-send FOCUSED (LVGL v8
+// re-sends when the state was cleared), so the keyboard comes back.
+static void kbHide(lv_obj_t *kb);
+static void kbShowFor(lv_obj_t *kb, lv_obj_t *ta);
+static void kbStyle(lv_obj_t *kb);
+void kbReadyCb(lv_event_t *e);
+void kbCancelCb(lv_event_t *e);
+void tokenTaFocusCb(lv_event_t *e);
 void showScreen(int idx);
 void navCb(lv_event_t *e);
 void feedBtnCb(lv_event_t *e);
@@ -236,6 +248,40 @@ void scanTanksCb(lv_event_t *e);
 void tankChipCb(lv_event_t *e);
 void rebuildTankChips();
 void rebuildTankRows();
+
+// ---------------------------------------------------------------------------
+// Keyboard helpers (v1.6.1) — shared by the token, MQTT and tank editors
+// ---------------------------------------------------------------------------
+static void kbHide(lv_obj_t *kb) {
+  if (!kb) return;
+  const lv_obj_t *ta = lv_keyboard_get_textarea(kb);
+  if (ta) lv_obj_clear_state((lv_obj_t *)ta, LV_STATE_FOCUSED);
+  lv_keyboard_set_textarea(kb, nullptr);
+  lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void kbShowFor(lv_obj_t *kb, lv_obj_t *ta) {
+  if (!kb || !ta) return;
+  lv_keyboard_set_textarea(kb, ta);
+  lv_obj_scroll_to_view(ta, LV_ANIM_ON); // focused field above the keyboard
+  lv_obj_clear_flag(kb, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(kb);
+}
+
+static void kbStyle(lv_obj_t *kb) {
+  lv_obj_set_style_bg_color(kb, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
+  lv_obj_set_style_text_color(kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
+}
+
+void kbReadyCb(lv_event_t *e) {
+  kbHide((lv_obj_t *)lv_event_get_target(e)); // OK key
+}
+
+void kbCancelCb(lv_event_t *e) {
+  kbHide((lv_obj_t *)lv_event_get_target(e)); // keyboard close key
+}
 
 // ---------------------------------------------------------------------------
 // Small widget builders
@@ -591,11 +637,7 @@ void mqttCancelCb(lv_event_t *e) {
 }
 
 void mqttTaFocusCb(lv_event_t *e) {
-  lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
-  if (s_mq_kb) {
-    lv_keyboard_set_textarea(s_mq_kb, ta);
-    lv_obj_clear_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN);
-  }
+  kbShowFor(s_mq_kb, (lv_obj_t *)lv_event_get_target(e));
 }
 
 void mqttSaveCb(lv_event_t *e) {
@@ -1389,10 +1431,11 @@ void buildTokenOverlay() {
   lv_obj_add_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_tok_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *card = makeCard(s_tok_overlay, 720, LV_SIZE_CONTENT);
-  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 56);
+  lv_obj_t *card = makeCard(s_tok_overlay, 720, 416);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 48);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(card, 12, 0);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE); // field scrolls above keyboard
 
   lv_obj_t *title = lv_label_create(card);
   lv_label_set_text(title, "PAIRING TOKEN");
@@ -1426,6 +1469,7 @@ void buildTokenOverlay() {
   lv_obj_set_style_border_width(s_tok_ta, 1, 0);
   lv_obj_set_style_radius(s_tok_ta, 8, 0);
   lv_obj_set_style_pad_all(s_tok_ta, 10, 0);
+  lv_obj_add_event_cb(s_tok_ta, tokenTaFocusCb, LV_EVENT_FOCUSED, nullptr);
 
   lv_obj_t *btns = lv_obj_create(card);
   lv_obj_remove_style_all(btns);
@@ -1448,24 +1492,29 @@ void buildTokenOverlay() {
   s_tok_kb = lv_keyboard_create(s_tok_overlay);
   lv_obj_set_size(s_tok_kb, lv_pct(100), 210);
   lv_obj_align(s_tok_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_keyboard_set_textarea(s_tok_kb, s_tok_ta);
-  lv_obj_set_style_bg_color(s_tok_kb, lv_color_hex(C_BG_DARK), 0);
-  lv_obj_set_style_bg_opa(s_tok_kb, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(s_tok_kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
-  lv_obj_set_style_text_color(s_tok_kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
+  kbStyle(s_tok_kb);
+  lv_obj_add_event_cb(s_tok_kb, kbReadyCb, LV_EVENT_READY, nullptr);
+  lv_obj_add_event_cb(s_tok_kb, kbCancelCb, LV_EVENT_CANCEL, nullptr);
+  lv_keyboard_set_textarea(s_tok_kb, nullptr);
+  lv_obj_add_flag(s_tok_kb, LV_OBJ_FLAG_HIDDEN); // appears on field focus (v1.6.1)
 }
 
 void openTokenOverlay() {
   if (!s_tok_overlay) return;
   lv_textarea_set_text(s_tok_ta, prefs::getRelayToken().c_str());
   if (s_tok_rotate) lv_obj_clear_state(s_tok_rotate, LV_STATE_CHECKED);
+  lv_obj_add_flag(s_tok_kb, LV_OBJ_FLAG_HIDDEN); // field focus brings it up
   lv_obj_clear_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_tok_overlay);
 }
 
 void closeTokenOverlay() {
   if (s_tok_overlay) lv_obj_add_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
-  if (s_tok_kb) lv_keyboard_set_textarea(s_tok_kb, nullptr);
+  kbHide(s_tok_kb);
+}
+
+void tokenTaFocusCb(lv_event_t *e) {
+  kbShowFor(s_tok_kb, (lv_obj_t *)lv_event_get_target(e));
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,12 +1661,11 @@ void buildMqttOverlay() {
   s_mq_kb = lv_keyboard_create(s_mq_overlay);
   lv_obj_set_size(s_mq_kb, lv_pct(100), 180);
   lv_obj_align(s_mq_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  kbStyle(s_mq_kb);
+  lv_obj_add_event_cb(s_mq_kb, kbReadyCb, LV_EVENT_READY, nullptr);
+  lv_obj_add_event_cb(s_mq_kb, kbCancelCb, LV_EVENT_CANCEL, nullptr);
   lv_keyboard_set_textarea(s_mq_kb, nullptr);
   lv_obj_add_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN); // appears on first field focus
-  lv_obj_set_style_bg_color(s_mq_kb, lv_color_hex(C_BG_DARK), 0);
-  lv_obj_set_style_bg_opa(s_mq_kb, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(s_mq_kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
-  lv_obj_set_style_text_color(s_mq_kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
 }
 
 void openMqttOverlay() {
@@ -1638,10 +1686,7 @@ void openMqttOverlay() {
 
 void closeMqttOverlay() {
   if (s_mq_overlay) lv_obj_add_flag(s_mq_overlay, LV_OBJ_FLAG_HIDDEN);
-  if (s_mq_kb) {
-    lv_keyboard_set_textarea(s_mq_kb, nullptr);
-    lv_obj_add_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN);
-  }
+  kbHide(s_mq_kb);
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,11 +1857,7 @@ void tankCancelCb(lv_event_t *e) {
 }
 
 void tankTaFocusCb(lv_event_t *e) {
-  lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
-  if (s_tank_kb) {
-    lv_keyboard_set_textarea(s_tank_kb, ta);
-    lv_obj_clear_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
-  }
+  kbShowFor(s_tank_kb, (lv_obj_t *)lv_event_get_target(e));
 }
 
 void tankSaveCb(lv_event_t *e) {
@@ -1844,10 +1885,11 @@ void buildTankOverlay() {
   lv_obj_add_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_tank_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *card = makeCard(s_tank_overlay, 720, LV_SIZE_CONTENT);
-  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 56);
+  lv_obj_t *card = makeCard(s_tank_overlay, 720, 416);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 48);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(card, 12, 0);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE); // fields scroll above keyboard
 
   lv_obj_t *title = lv_label_create(card);
   lv_label_set_text(title, "EDIT TANK");
@@ -1906,12 +1948,11 @@ void buildTankOverlay() {
   s_tank_kb = lv_keyboard_create(s_tank_overlay);
   lv_obj_set_size(s_tank_kb, lv_pct(100), 210);
   lv_obj_align(s_tank_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  kbStyle(s_tank_kb);
+  lv_obj_add_event_cb(s_tank_kb, kbReadyCb, LV_EVENT_READY, nullptr);
+  lv_obj_add_event_cb(s_tank_kb, kbCancelCb, LV_EVENT_CANCEL, nullptr);
   lv_keyboard_set_textarea(s_tank_kb, nullptr);
   lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN); // appears on field focus
-  lv_obj_set_style_bg_color(s_tank_kb, lv_color_hex(C_BG_DARK), 0);
-  lv_obj_set_style_bg_opa(s_tank_kb, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(s_tank_kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
-  lv_obj_set_style_text_color(s_tank_kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
 }
 
 void openTankOverlay(uint8_t tank1) {
@@ -1927,10 +1968,7 @@ void openTankOverlay(uint8_t tank1) {
 
 void closeTankOverlay() {
   if (s_tank_overlay) lv_obj_add_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
-  if (s_tank_kb) {
-    lv_keyboard_set_textarea(s_tank_kb, nullptr);
-    lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
-  }
+  kbHide(s_tank_kb);
 }
 
 void rebuildTankChips() {
