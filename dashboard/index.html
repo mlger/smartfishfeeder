@@ -132,11 +132,15 @@ const $=id=>document.getElementById(id);
 let token=localStorage.catfishToken||"";
 let pulse=3, schedule=[], dirty=false, feedBusy=false;
 let tanks=[], selTank=0; // selTank: 0-based index or "all"
+let hour12=false; // v1.6.0: presentation only, from /api/status
+let lastHour12=null;
 
 function toast(m,ms=2200){const t=$("toast");t.textContent=m;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms)}
-function iso(s){if(!s)return"never";const d=new Date(s*1000);const p=n=>String(n).padStart(2,"0");const now=new Date();
+// 24h "07:30" or 12h "7:30 AM" per the device preference (machine values stay 24h)
+function fmtHm(h,m){if(!hour12)return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");let h12=h%12;if(h12===0)h12=12;return h12+":"+String(m).padStart(2,"0")+" "+(h<12?"AM":"PM")}
+function iso(s){if(!s)return"never";const d=new Date(s*1000);const now=new Date();
   const sameDay=d.toDateString()===now.toDateString();
-  return(sameDay?"Today ":"")+p(d.getHours())+":"+p(d.getMinutes())}
+  return(sameDay?"Today ":"")+fmtHm(d.getHours(),d.getMinutes())}
 function maskOf(sel,n){return sel==="all"?((1<<n)-1):(1<<sel)}
 function maskTag(m){const p=[];for(let i=0;i<4;i++)if(m&(1<<i))p.push(i+1);return p.length?"T"+p.join("+"):""}
 
@@ -181,7 +185,8 @@ async function refresh(){
   if(document.hidden)return;
   try{
     const s=await api("/api/status");
-    $("nextTime").textContent=s.nextFeed==="none"?"none scheduled":(s.nextFeed||"waiting for time sync");
+    hour12=!!s.hour12;
+    $("nextTime").textContent=s.nextFeed==="none"?"none scheduled":(s.nextFeed&&s.nextFeed.includes(":")?fmtHm(parseInt(s.nextFeed.split(":")[0],10),parseInt(s.nextFeed.split(":")[1],10)):(s.nextFeed||"waiting for time sync"));
     $("lastTime").textContent="Last fed: "+(s.lastFeedIso&&s.lastFeedIso!=="unknown"?iso(s.lastFedEpoch):"never");
     $("feeding").style.display=s.feeding?"block":"none";
     $("feedBtn").disabled=feedBusy||s.feeding;
@@ -196,6 +201,7 @@ async function refresh(){
     $("mqttLine").textContent="MQTT: "+(s.mqtt||"n/a");
     if(JSON.stringify(s.tanks||[])!==JSON.stringify(tanks)){tanks=s.tanks||[];renderTanks();renderAddTanks();renderSched()}
     else renderTanks();
+    if(hour12!==lastHour12){lastHour12=hour12;renderSched()} // relabel once per format change
     if(!dirty){pulse=s.pulse||3;renderPulse()}
   }catch(e){}
 }
@@ -224,7 +230,7 @@ function renderSched(){
     const sl=document.createElement("span");sl.className="slider";
     sw.append(cb,sl);
     const t=document.createElement("span");t.className="time";
-    t.textContent=String(e.h).padStart(2,"0")+":"+String(e.m).padStart(2,"0");
+    t.textContent=fmtHm(e.h,e.m);
     const tag=maskTag(e.t||1);
     const s=document.createElement("span");s.className="sec";s.textContent=e.s+" s"+(tanks.length>1&&tag?" \u00B7 "+tag:"");
     const del=document.createElement("button");del.className="mini";del.textContent="\u2715";

@@ -13,6 +13,7 @@ Catfish Feeder is a two-board, self-hosted fish feeder. The **Display Unit** (Wa
 
 - Touch UI on a 4.3" 800x480 panel (LVGL 8.4): **Feed Now**, **Schedule**, **Settings**
 - NTP time sync with Asia/Manila timezone (`PHT-8`, UTC+8, no DST)
+- **Battery-backed RTC** (v1.6.0): the onboard PCF85063 + CR927 coin cell keeps wall time through power cuts — schedules fire and the clock is correct even before WiFi/NTP (or with none); 12/24-hour display format toggle — see [docs/firmware.md](docs/firmware.md)
 - First-boot WiFi provisioning via WiFiManager captive portal (AP `CatfishFeeder-Setup`)
 - Browser-based flashing (ESP Web Tools) — no toolchain install required
 - ArduinoOTA updates on both units (relay: `catfish-relay.local`, display: `catfishfeeder.local`)

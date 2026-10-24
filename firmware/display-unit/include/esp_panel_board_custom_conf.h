@@ -218,7 +218,7 @@
  * So it is not necessary to set the macro to `1`. For other drivers (like `Wire`), please set the macro to `1`
  * ensure that the host is initialized only once.
  */
-#define ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST        (0)     // 0/1. Typically set to 0
+#define ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST        (1)     // 1 = GT911 attaches to the Wire-owned I2C driver (RTC sharing, v1.6.0)
 #endif
 
 /**
@@ -335,7 +335,7 @@
  * So it is not necessary to set the macro to `1`. For other devices, please set the macro to `1` ensure that the
  * host is initialized only once.
  */
-#define ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST     (0)     // 0/1
+#define ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST     (1)     // 1 = CH422G attaches to the Wire-owned I2C driver (RTC sharing, v1.6.0)
 /* For general */
 #define ESP_PANEL_BOARD_EXPANDER_I2C_HOST_ID        (0)     // Typically set to 0
 /* For host */

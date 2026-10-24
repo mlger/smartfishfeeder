@@ -37,6 +37,7 @@ enum UiEventType : uint8_t {
   UI_EVT_SET_PULSE,     // default pulse changed (a=seconds)
   UI_EVT_SET_TOKEN,     // pairing token saved   (token=new, flag=also rotate relay)
   UI_EVT_SET_BL,        // backlight switch flipped (flag=on; loop persists)
+  UI_EVT_SET_FMT12,     // v1.6.0: 12/24-hour clock switch (flag=true = 12-hour)
   UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s, tankMask=target tanks)
   UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
   UI_EVT_SCHED_PERSIST, // enable switch flipped (a=index, flag=enabled — loop applies + flushes)
@@ -152,6 +153,16 @@ void ui_toast(const String &msg);
 
 /** Register the backlight on/off handler (no PWM on this board) + initial state. */
 void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on);
+
+/**
+ * v1.6.0: switch the clock presentation (true = 12-hour "7:30 AM", false =
+ * 24-hour). Rebuilds the hour roller options + re-renders schedule labels on
+ * the next refresh; cached labels repaint on the next ui_tick().
+ */
+void ui_set_hour12(bool h12);
+
+/** v1.6.0: Settings > System RTC status line (battery/clock state). */
+void ui_set_rtc(const String &text);
 
 /** Request a manual feed (safe to call from LVGL callbacks). */
 void ui_request_feed(uint8_t seconds);

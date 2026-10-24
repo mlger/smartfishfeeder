@@ -32,8 +32,11 @@
 #include "relay_client.h"
 #include "web_server.h"
 #include "ui/ui.h"
+#include "pcf85063.h"
 #include <catfish_protocol.h>
 #include <catfish_mech.h>
+#include <catfish_time.h>
+#include <esp_sntp.h>
 
 using namespace esp_panel::board;
 using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
@@ -193,12 +196,14 @@ static String formatLastFed(uint32_t epoch) {
   struct tm ln;
   localtime_r(&now, &ln);
 
+  char hm[12];
+  catfishFormatHm(hm, sizeof(hm), lt.tm_hour, lt.tm_min, prefs::getHour12());
   char buf[40];
   if (ln.tm_year == lt.tm_year && ln.tm_yday == lt.tm_yday)
-    snprintf(buf, sizeof(buf), "Today %02d:%02d", lt.tm_hour, lt.tm_min);
+    snprintf(buf, sizeof(buf), "Today %s", hm);
   else
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", lt.tm_year + 1900,
-             lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d  %s", lt.tm_year + 1900,
+             lt.tm_mon + 1, lt.tm_mday, hm);
   return String(buf);
 }
 
@@ -314,6 +319,7 @@ static void webPublishSnapshot() {
   s.pulse = prefs::getDefaultPulse();
   s.schedCount = (uint16_t)feed_scheduler::getCount();
   s.clockValid = feed_scheduler::timeValid();
+  s.hour12 = prefs::getHour12();
   strlcpy(s.version, CATFISH_APP_VERSION, sizeof(s.version));
   const mqtt_mgr::Status st = mqtt_mgr::status();
   const char *mtxt = "disabled";
@@ -346,6 +352,53 @@ static void webPublishSnapshot() {
 // fire in the same task context as every other UI update, so toasts are safe.
 // ---------------------------------------------------------------------------
 static bool s_ota_ready = false;
+
+// ---------------------------------------------------------------------------
+// Battery-backed RTC (v1.6.0): the PCF85063 + CR927 cell keeps wall time while
+// main power is off. Boot: if the chip holds a plausible time, restore it via
+// settimeofday() so schedules/last-fed are correct immediately (even offline).
+// Once NTP actually syncs, the wall clock is written back into the chip.
+// ---------------------------------------------------------------------------
+static bool s_rtc_present = false;
+static bool s_rtc_ntp_synced = false;
+static String s_rtc_status = "not present";
+
+// "Plausible" floor: 2024-01-01 UTC. An RTC older than this was never set
+// (fresh board / battery just added) — don't restore garbage.
+static const time_t CATFISH_RTC_MIN_EPOCH = 1704067200;
+
+static void rtcBootInit() {
+  s_rtc_present = pcf85063::begin();
+  if (!s_rtc_present) {
+    s_rtc_status = "not present";
+    Serial.println("[SYS] WARN: PCF85063 RTC not found (CR927 cell / holder?)");
+    return;
+  }
+  time_t rtcEpoch = 0;
+  bool oscStopped = false;
+  if (!pcf85063::readUtc(&rtcEpoch, &oscStopped)) {
+    s_rtc_status = "read error";
+    Serial.println("[SYS] WARN: RTC present but registers unreadable");
+    return;
+  }
+  if (oscStopped) {
+    s_rtc_status = "battery dead/absent";
+    Serial.println("[SYS] WARN: RTC oscillator stopped - replace the CR927 cell");
+    return;
+  }
+  if (rtcEpoch < CATFISH_RTC_MIN_EPOCH) {
+    s_rtc_status = "time never set";
+    Serial.println("[SYS] RTC present but implausible - waiting for NTP");
+    return;
+  }
+  struct timeval tv;
+  tv.tv_sec = rtcEpoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  s_rtc_status = "battery OK";
+  Serial.printf("[SYS] RTC restore: epoch %lld (battery OK)\n",
+                (long long)rtcEpoch);
+}
 
 static void beginOtaOnce() {
   if (s_ota_ready || !net_wifi::wifi_is_connected()) return;
@@ -497,6 +550,19 @@ static void handleUiEvent(const UiEvent &ev) {
       Serial.printf("[SYS] backlight preference saved: %s\n",
                     ev.flag ? "on" : "off");
       break;
+
+    case UI_EVT_SET_FMT12: {
+      // v1.6.0: clock presentation toggle. Persists here (single writer), the
+      // UI re-renders its cached labels; MQTT/HTTP stay 24-hour by contract.
+      prefs::setHour12(ev.flag);
+      lvgl_port_lock(-1);
+      ui_set_hour12(ev.flag);
+      ui_set_last_feed(formatLastFed(prefs::getLastFedEpoch()));
+      lvgl_port_unlock();
+      refreshNextFeedUi();
+      Serial.printf("[SYS] clock format saved: %s\n", ev.flag ? "12-hour" : "24-hour");
+      break;
+    }
 
     case UI_EVT_SCHED_ADD: {
       const bool full =
@@ -794,6 +860,11 @@ void setup() {
     Serial.println("[SYS] WARN: web dashboard unavailable (continuing without)");
   }
 
+  // --- I2C bus + battery-backed RTC (before the panel stack) ---
+  // Wire OWNS the legacy I2C driver on host 0; GT911/CH422G attach to it via
+  // the board config's *_SKIP_INIT_HOST flags. Must precede board init.
+  rtcBootInit();
+
   // --- board + LVGL ---
   s_board = new Board();
   s_board->init();
@@ -813,6 +884,8 @@ void setup() {
   lvgl_port_lock(-1);
   ui_init();
   ui_set_backlight_cb(appSetBacklight, prefs::getBacklightOn());
+  ui_set_hour12(prefs::getHour12());
+  ui_set_rtc(s_rtc_status);
   ui_set_relay(false, prefs::getTankIp(1));
   ui_set_last_feed(formatLastFed(prefs::getLastFedEpoch()));
   {
@@ -888,6 +961,22 @@ void loop() {
 
     // catch-all persist flush (covers setEnabled-only edits)
     feed_scheduler::flushIfDirty();
+
+    // v1.6.0: once NTP has actually synced (not the RTC boot restore), write
+    // the wall clock back into the PCF85063 so the CR927 cell stays current.
+    if (s_rtc_present && !s_rtc_ntp_synced &&
+        sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+      if (pcf85063::writeUtc(time(nullptr))) {
+        s_rtc_ntp_synced = true;
+        if (s_rtc_status != "battery OK") {
+          s_rtc_status = "battery OK";
+          lvgl_port_lock(-1);
+          ui_set_rtc(s_rtc_status);
+          lvgl_port_unlock();
+        }
+        Serial.println("[SYS] RTC updated from NTP");
+      }
+    }
 
     // scheduled feeding (targets restricted to the configured tanks)
     const FeedTime due = feed_scheduler::tick();

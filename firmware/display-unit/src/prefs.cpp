@@ -22,6 +22,7 @@ char s_relay_ip[16] = {0};
 uint8_t s_pulse = CATFISH_DEFAULT_PULSE_S;
 uint32_t s_last_fed = 0;
 bool s_bl_on = true;
+bool s_hour12 = false;
 
 // Multi-tank (Phase 5): 1-based tank ids, indexes below are tank-1.
 uint8_t s_tank_count = 1;
@@ -71,6 +72,7 @@ bool begin() {
 
   s_last_fed = s_nvs.getULong("lastFed", 0);
   s_bl_on = s_nvs.getBool("blOn", true);
+  s_hour12 = s_nvs.getBool("fmt12", false);
 
   s_mq_en = s_nvs.getBool("mqEn", false);
   v = s_nvs.getString("mqHost", "");
@@ -245,6 +247,13 @@ bool getBacklightOn() { return s_bl_on; }
 void setBacklightOn(bool on) {
   s_bl_on = on;
   if (s_loaded && !s_nvs.putBool("blOn", on)) nvsLogFail("blOn");
+}
+
+bool getHour12() { return s_hour12; }
+
+void setHour12(bool h12) {
+  s_hour12 = h12;
+  if (s_loaded && !s_nvs.putBool("fmt12", h12)) nvsLogFail("fmt12");
 }
 
 // ---------------------------------------------------------------- MQTT

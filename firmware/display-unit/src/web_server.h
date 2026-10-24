@@ -40,6 +40,7 @@ struct Snapshot {
   char version[12] = {0};
   char mqtt[20] = {0};
   uint8_t mqttState = 0; // 0 disabled, 1 busy, 2 connected (dashboard dot)
+  bool hour12 = false;   // v1.6.0: user clock preference (presentation only)
   // Multi-tank (P5): first tankCount entries are valid
   uint8_t tankCount = 1;
   uint8_t selectedTank = 0; // 0-based; 0xFE = "All"
