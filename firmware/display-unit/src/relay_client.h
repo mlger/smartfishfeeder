@@ -36,6 +36,10 @@ struct Status {
   String version = "";
   String state = "";
   int protocolVersion = -1; // relay "proto" field; -1 = old firmware that does not report it
+  String mechanism = "";    // "motor"/"servo"/"stepper"; "" = relay firmware without P4
+  int servoRest = -1;       // mechanism params from /status (-1 = unknown/pre-P4)
+  int servoFeed = -1;
+  int stepHz = -1;
   String error = "";
 };
 
@@ -66,6 +70,19 @@ Result feed(uint8_t seconds);
  * caller must persist the new token locally (prefs::setRelayToken).
  */
 Result rotateToken(const String &newToken);
+
+/**
+ * POST /config switching the feeding mechanism on the relay (Phase 4).
+ * Values are pre-clamped by the shared catfish_mech.h helpers; the relay
+ * clamps again (belt and braces). The relay authorizes with the current
+ * token. Call from the net worker task only.
+ * @param mech CATFISH_MECH_* id
+ * @param restDeg/feedDeg servo angles (used when mech == servo)
+ * @param stepHz stepper rate (used when mech == stepper)
+ * @param stepDir DIR level during feed (used when mech == stepper)
+ */
+Result configureMech(uint8_t mech, uint8_t restDeg, uint8_t feedDeg,
+                     uint16_t stepHz, uint8_t stepDir);
 
 /**
  * GET /status -> parse {"state","feeding","lastFeedEpoch","version","proto",...}.

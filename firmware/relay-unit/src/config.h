@@ -13,6 +13,7 @@
 #pragma once
 
 #include <catfish_protocol.h>
+#include <catfish_mech.h>
 
 // --------------------------------------------------- shared protocol (aliases)
 // Relay firmware keeps its historical macro names; values live in the shared
@@ -45,6 +46,20 @@
 #define RELAY_ON           (RELAY_ACTIVE_LEVEL)
 #define RELAY_OFF          (!RELAY_ACTIVE_LEVEL)
 
+// ------------------------------------------------ feeding mechanism pins (P4)
+// All three mechanisms keep the "feed for N seconds" semantics; only what the
+// pins DO during those seconds differs (see catfish_mech.h + docs/firmware.md).
+//
+//   motor   (default) D1 relay/FET output ON for N s (existing wiring)
+//   servo   D5 (GPIO14) signal wire of an SG90-class servo (red=5V, brown=GND)
+//   stepper D2 (GPIO4)  -> driver STEP input
+//           D6 (GPIO12) -> driver DIR input
+//           (A4988/DRV8825: also tie /ENABLE+RESET+SLEEP per its datasheet,
+//            MS1-MS3 set microstepping; VMOT decoupling cap >= 100 uF!)
+#define SERVO_PIN          D5
+#define STEP_PIN           D2
+#define DIR_PIN            D6
+
 // ------------------------------------------------------------- status LED
 // LED_BUILTIN == D4/GPIO2 on NodeMCU V3, active LOW (sinks through the LED).
 #define STATUS_LED         LED_BUILTIN
@@ -74,9 +89,13 @@
 #define FACTORY_RESET_BTN      0        // GPIO0 = FLASH button on NodeMCU
 #define FACTORY_RESET_HOLD_MS  5000UL   // hold duration to trigger the wipe
 
-// ------------------------------------------- EEPROM config blob (see main.cpp)
+// ------------------------------------------- EEPROM config blobs (see main.cpp)
 #define EEPROM_SIZE        4096
 #define CFG_MAGIC          0xC47F15EEUL  // config sentinel (0xC47F15"EE" — valid uint32)
+// Phase 4: second, ADDITIVE record at its own offset — upgrading an existing
+// install keeps the original token/pulse blob byte-for-byte intact.
+#define MECH_EEPROM_OFFSET 64
+#define MECH_MAGIC         0x4D454348UL  // "MECH" in ASCII
 
 // -------------------------------------------------------------- identity
 #define AP_NAME            "CatfishRelay-Setup" // WiFiManager fallback AP SSID

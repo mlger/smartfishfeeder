@@ -4,6 +4,7 @@
  */
 #include "net_worker.h"
 #include <freertos/queue.h>
+#include <catfish_mech.h>
 #include "relay_client.h"
 
 namespace {
@@ -46,6 +47,14 @@ void workerTask(void * /*param*/) {
       strlcpy(r.token, cmd.token, sizeof(r.token));
       strlcpy(r.ip, tr.ip.c_str(), sizeof(r.ip));
       if (!tr.ok) fillError(r, tr.error);
+    } else if (cmd.type == net_worker::Cmd::CMD_MECH) {
+      Serial.printf("[NET] worker: mechanism -> %s\n", catfishMechName(cmd.mechId));
+      const relay_client::Result mr = relay_client::configureMech(
+          cmd.mechId, cmd.mechRest, cmd.mechFeed, cmd.mechHz, cmd.mechDir);
+      r.kind = net_worker::Result::RES_MECH;
+      r.ok = mr.ok;
+      strlcpy(r.ip, mr.ip.c_str(), sizeof(r.ip));
+      if (!mr.ok) fillError(r, mr.error);
     } else {
       // PROBE: discover when needed, then GET /status
       bool online = false;
@@ -67,6 +76,10 @@ void workerTask(void * /*param*/) {
           st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION;
       strlcpy(r.ip, relay_client::ip().c_str(), sizeof(r.ip));
       strlcpy(r.version, st.version.c_str(), sizeof(r.version));
+      strlcpy(r.mech, st.mechanism.c_str(), sizeof(r.mech));
+      r.mechRest = st.servoRest;
+      r.mechFeed = st.servoFeed;
+      r.mechHz = st.stepHz;
       if (!st.ok && st.error.length()) fillError(r, st.error);
     }
 
@@ -125,6 +138,19 @@ bool enqueueTokenRotate(const char *newToken) {
   Cmd c;
   c.type = Cmd::CMD_TOKEN_ROTATE;
   strlcpy(c.token, newToken, sizeof(c.token));
+  return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
+}
+
+bool enqueueMech(uint8_t mechId, uint8_t restDeg, uint8_t feedDeg,
+                 uint16_t stepHz, uint8_t stepDir) {
+  if (!s_cmdq || mechId >= CATFISH_MECH_COUNT) return false;
+  Cmd c;
+  c.type = Cmd::CMD_MECH;
+  c.mechId = mechId;
+  c.mechRest = catfishClampServoDeg(restDeg);
+  c.mechFeed = catfishClampServoDeg(feedDeg);
+  c.mechHz = catfishClampStepHz(stepHz);
+  c.mechDir = catfishClampStepDir(stepDir);
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }
 

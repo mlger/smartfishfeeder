@@ -32,7 +32,7 @@ Energizes the relay for a pulse, running the feeder motor.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `seconds` | integer | yes | Motor run time **in seconds**. Must be a strict JSON integer (`3` ok, `"3"`/`3.5` → 400). Hard cap 60 s; values above the configured `maxPulseS` (default 30) are clamped down, not rejected. |
+| `seconds` | integer | yes | Feed duration **in seconds** (see *Feeding mechanisms* below). Must be a strict JSON integer (`3` ok, `"3"`/`3.5` → 400). Hard cap 60 s; values above the configured `maxPulseS` (default 30) are clamped down, not rejected. |
 | `token` | string | yes | Current auth token |
 
 A `GET /feed?seconds=N&token=T` variant exists with identical semantics (convenient for curl/browser testing).
@@ -75,11 +75,15 @@ Full runtime snapshot (no auth).
   "lastFeedEpoch": 1760000000,
   "pulseS": 3,
   "maxPulseS": 30,
+  "mechanism": "motor",
+  "servoRestDeg": 0,
+  "servoFeedDeg": 90,
+  "stepHz": 400,
   "uptimeS": 86400,
   "heap": 21340,
   "rssi": -58,
   "ip": "192.168.1.42",
-  "version": "1.1.0",
+  "version": "1.4.0",
   "proto": 1,
   "ntpSynced": true
 }
@@ -94,6 +98,10 @@ Full runtime snapshot (no auth).
 | `lastFeedEpoch` | int | Unix epoch of the last feed pulse. Millis-based pseudo-epoch until first NTP sync — check `ntpSynced` |
 | `pulseS` | int | Default pulse duration (used by the display unit's Feed Now) |
 | `maxPulseS` | int | Configured clamp for feed requests (1-60) |
+| `mechanism` | string | Feeding mechanism: `"motor"` (default), `"servo"` or `"stepper"` (v1.4.0+) |
+| `servoRestDeg` | int | Servo idle angle, 0-180 (meaningful when `mechanism` is `servo`) |
+| `servoFeedDeg` | int | Servo feed angle, 0-180 |
+| `stepHz` | int | Stepper step rate, steps/s, 1-1000 (meaningful when `mechanism` is `stepper`) |
 | `uptimeS` | int | Device uptime in seconds |
 | `heap` | int | Free heap bytes |
 | `rssi` | int | WiFi signal in dBm |
@@ -136,11 +144,16 @@ Changes device configuration. Requires the **current** token for auth; an option
 | `newToken` | string | no | Replacement token (non-empty, shorter than 24 chars). Takes effect immediately and persists |
 | `maxPulseS` | integer | no | New clamp for feed requests, 1-60 |
 | `pulseS` | integer | no | New default pulse duration, 1-30 |
+| `mechanism` | string | no | `"motor"`, `"servo"` or `"stepper"` (v1.4.0+). An unknown name is rejected with 400 `bad_mechanism` before anything else is applied |
+| `servoRestDeg` | integer | no | Servo idle angle, clamped to 0-180 |
+| `servoFeedDeg` | integer | no | Servo feed angle, clamped to 0-180 |
+| `stepHz` | integer | no | Stepper step rate, clamped to 1-1000 steps/s |
+| `stepDir` | integer | no | Stepper DIR level during feed, 0 or 1 |
 
 | Status | Meaning |
 |--------|---------|
-| 200 | Config updated — response echoes the applied config |
-| 400 | Malformed JSON, out-of-range values, or token too long |
+| 200 | Config updated — response echoes the applied config (including the mechanism block) |
+| 400 | Malformed JSON, out-of-range values, unknown `mechanism`, or token too long |
 | 403 | Wrong current token |
 
 ```sh
@@ -153,9 +166,29 @@ curl -X POST http://catfish-relay.local/config \
 curl -X POST http://catfish-relay.local/config \
      -H "Content-Type: application/json" \
      -d '{"token":"tuna-2025","maxPulseS":10}'
+
+# switch to a servo sweeping 20 deg -> 110 deg
+curl -X POST http://catfish-relay.local/config \
+     -H "Content-Type: application/json" \
+     -d '{"token":"tuna-2025","mechanism":"servo","servoRestDeg":20,"servoFeedDeg":110}'
+
+# switch to a stepper at 500 steps/s, DIR high while feeding
+curl -X POST http://catfish-relay.local/config \
+     -H "Content-Type: application/json" \
+     -d '{"token":"tuna-2025","mechanism":"stepper","stepHz":500,"stepDir":1}'
 ```
 
-Settings persist to EEPROM (survive reboots and power cuts).
+Settings persist to EEPROM (survive reboots and power cuts). The mechanism lives in a **separate additive EEPROM record** (own magic + checksum at offset 64), so firmware upgrades never disturb the original token/pulse blob — first boot after upgrading just writes mechanism defaults (`motor`). The display unit's Settings → Relay Unit → **Mechanism → Configure** edits all of this over the same endpoint; the factory reset (hold FLASH 5 s) resets the mechanism too.
+
+### Feeding mechanisms (v1.4.0+)
+
+`POST /feed` semantics are identical for every mechanism: **"feed for N seconds"** — the relay interprets those seconds differently per mechanism:
+
+| Mechanism | Pins | During the pulse |
+|-----------|------|------------------|
+| `motor` (default) | D1 relay/FET (existing wiring) | Output ON for N seconds |
+| `servo` | D5 signal (+5V, GND) | Sweeps rest angle ↔ feed angle every 0.5 s; parks at rest and detaches afterwards |
+| `stepper` | D2 STEP, D6 DIR (A4988/DRV8825) | STEP pulses at `stepHz`; DIR held at the `stepDir` level |
 
 ## UDP discovery protocol
 

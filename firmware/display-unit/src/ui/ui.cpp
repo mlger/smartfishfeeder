@@ -18,6 +18,7 @@
 #include <string.h>
 #include <time.h>
 #include <catfish_protocol.h>
+#include <catfish_mech.h>
 #include "../feed_scheduler.h"
 #include "../prefs.h"
 
@@ -84,6 +85,7 @@ lv_obj_t *s_lbl_ssid = nullptr;
 lv_obj_t *s_lbl_ip = nullptr;
 lv_obj_t *s_lbl_rssi = nullptr;
 lv_obj_t *s_lbl_relay_ip = nullptr;
+lv_obj_t *s_lbl_mech = nullptr; // P4: "Mechanism: ..." line on the Relay card
 lv_obj_t *s_probe_btn = nullptr;
 
 // Settings > MQTT card + editor overlay (lv_layer_top)
@@ -103,6 +105,16 @@ lv_obj_t *s_tok_overlay = nullptr;
 lv_obj_t *s_tok_ta = nullptr;
 lv_obj_t *s_tok_kb = nullptr;
 lv_obj_t *s_tok_rotate = nullptr; // "also update relay unit" checkbox
+
+// Mechanism editor overlay (P4, lv_layer_top; roller + spinboxes, no keyboard)
+lv_obj_t *s_mech_overlay = nullptr;
+lv_obj_t *s_mech_roller = nullptr;
+lv_obj_t *s_mech_row_servo = nullptr; // rest/feed angle row (visible when servo)
+lv_obj_t *s_mech_row_step = nullptr;  // stepHz + direction row (visible when stepper)
+lv_obj_t *s_mech_sb_rest = nullptr;
+lv_obj_t *s_mech_sb_feed = nullptr;
+lv_obj_t *s_mech_sb_hz = nullptr;
+lv_obj_t *s_mech_sw_dir = nullptr;
 
 // Toast
 lv_obj_t *s_toast_box = nullptr;
@@ -127,6 +139,13 @@ char s_min_opts[216] = "";
 char s_clock_cache[8] = "";
 char s_val_cache[24] = "";
 char s_sub_cache[28] = "";
+
+// P4 mechanism cache (last /status probe; -1 = unknown) — overlays prefill here
+bool s_mech_reported = false; // relay firmware reports "mechanism"
+uint8_t s_mech_id = CATFISH_MECH_DEFAULT;
+int s_mech_rest = -1;
+int s_mech_feed = -1;
+int s_mech_hz = -1;
 
 // Backlight idle timeout (M6): auto-dim after this much touch inactivity.
 // Touching the screen wakes it again; the user's on/off preference in
@@ -168,6 +187,14 @@ void mqttEditCb(lv_event_t *e);
 void mqttSaveCb(lv_event_t *e);
 void mqttCancelCb(lv_event_t *e);
 void mqttTaFocusCb(lv_event_t *e);
+void buildMechOverlay();
+void openMechOverlay();
+void closeMechOverlay();
+void mechEditCb(lv_event_t *e);
+void mechSaveCb(lv_event_t *e);
+void mechCancelCb(lv_event_t *e);
+void mechRollerCb(lv_event_t *e);
+void mechSyncRows();
 
 // ---------------------------------------------------------------------------
 // Small widget builders
@@ -532,6 +559,65 @@ void toastTimerCb(lv_timer_t *t) {
   (void)t;
   if (s_toast_box) lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
   if (s_toast_tmr) lv_timer_pause(s_toast_tmr);
+}
+
+// ---------------------------------------------------------------------------
+// Mechanism editor overlay (P4). Roller selects motor/servo/stepper; the
+// servo and stepper parameter rows appear only for their mechanism. Pure
+// LVGL widgets (roller + spinboxes + switch) — no keyboard needed.
+// ---------------------------------------------------------------------------
+void mechEditCb(lv_event_t *e) {
+  (void)e;
+  openMechOverlay();
+}
+
+void mechCancelCb(lv_event_t *e) {
+  (void)e;
+  closeMechOverlay();
+}
+
+uint8_t mechRollerToId(uint16_t sel) {
+  // roller options order matches CATFISH_MECH_* (motor, servo, stepper)
+  return (uint8_t)sel;
+}
+
+void mechRollerCb(lv_event_t *e) {
+  (void)e;
+  mechSyncRows();
+}
+
+void mechSyncRows() {
+  if (!s_mech_roller) return;
+  const uint8_t id = mechRollerToId(lv_roller_get_selected(s_mech_roller));
+  if (s_mech_row_servo) {
+    if (id == CATFISH_MECH_SERVO)
+      lv_obj_clear_flag(s_mech_row_servo, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(s_mech_row_servo, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (s_mech_row_step) {
+    if (id == CATFISH_MECH_STEPPER)
+      lv_obj_clear_flag(s_mech_row_step, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(s_mech_row_step, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void mechSaveCb(lv_event_t *e) {
+  (void)e;
+  if (!s_mech_roller) return;
+  UiEvent ev;
+  ev.type = UI_EVT_MECH_CFG;
+  ev.mechId = mechRollerToId(lv_roller_get_selected(s_mech_roller));
+  if (s_mech_sb_rest) ev.mechRest = (uint8_t)lv_spinbox_get_value(s_mech_sb_rest);
+  if (s_mech_sb_feed) ev.mechFeed = (uint8_t)lv_spinbox_get_value(s_mech_sb_feed);
+  if (s_mech_sb_hz) ev.mechHz = (uint16_t)lv_spinbox_get_value(s_mech_sb_hz);
+  if (s_mech_sw_dir)
+    ev.mechDir = lv_obj_has_state(s_mech_sw_dir, LV_STATE_CHECKED) ? 1 : 0;
+  if (uiEventSend(ev)) {
+    closeMechOverlay();
+    ui_toast("Updating mechanism..."); // RES_MECH reports the outcome
+  }
 }
 
 void spinMinusCb(lv_event_t *e) {
@@ -938,6 +1024,28 @@ void buildSettings() {
                                C_AMBER, C_CARD_HI, 140, 64);
   lv_obj_add_event_cb(tok_edit, tokenEditCb, LV_EVENT_CLICKED, nullptr);
 
+  // -- mechanism row (P4): current selection + Configure button
+  lv_obj_t *mech_row = lv_obj_create(card_relay);
+  lv_obj_remove_style_all(mech_row);
+  lv_obj_set_size(mech_row, lv_pct(100), 64);
+  lv_obj_set_flex_flow(mech_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(mech_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(mech_row, 12, 0);
+  lv_obj_clear_flag(mech_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *mech_lbl = lv_label_create(mech_row);
+  lv_label_set_text(mech_lbl, "Mechanism");
+  lv_obj_set_style_text_font(mech_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(mech_lbl, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(mech_lbl, 1);
+  lv_obj_t *mech_edit = makeBtn(mech_row, LV_SYMBOL_SETTINGS "  Configure",
+                                C_CARD, C_AMBER, C_CARD_HI, 190, 64);
+  lv_obj_add_event_cb(mech_edit, mechEditCb, LV_EVENT_CLICKED, nullptr);
+  s_lbl_mech = lv_label_create(card_relay);
+  lv_label_set_text(s_lbl_mech, "Mechanism: not reported yet");
+  lv_obj_set_style_text_font(s_lbl_mech, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_lbl_mech, lv_color_hex(C_MUTED), 0);
+
   lv_obj_t *test = makeBtn(card_relay, LV_SYMBOL_REFRESH "  Test connection",
                            C_CARD, C_AMBER, C_CARD_HI, lv_pct(100), 64);
   lv_obj_set_style_border_color(test, lv_color_hex(C_AMBER), 0);
@@ -1323,6 +1431,137 @@ void closeMqttOverlay() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mechanism editor overlay (P4)
+// ---------------------------------------------------------------------------
+void buildMechOverlay() {
+  s_mech_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_mech_overlay);
+  lv_obj_set_size(s_mech_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_mech_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_mech_overlay, LV_OPA_70, 0);
+  lv_obj_add_flag(s_mech_overlay, LV_OBJ_FLAG_CLICKABLE); // swallow clicks behind
+  lv_obj_add_flag(s_mech_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_mech_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *card = makeCard(s_mech_overlay, 720, 430);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 44);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 10, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, "FEEDING MECHANISM");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  lv_obj_t *hint = lv_label_create(card);
+  lv_label_set_text(
+      hint,
+      "All mechanisms feed for the configured seconds. Wiring: servo D5, "
+      "stepper STEP D2 / DIR D6 (see docs/firmware.md).");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
+  lv_obj_set_width(hint, lv_pct(100));
+  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+
+  s_mech_roller = makeRoller(card, "Motor relay\nServo\nStepper", 0);
+  lv_obj_add_event_cb(s_mech_roller, mechRollerCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  // -- servo params row (hidden unless Servo selected)
+  s_mech_row_servo = lv_obj_create(card);
+  lv_obj_remove_style_all(s_mech_row_servo);
+  lv_obj_set_width(s_mech_row_servo, lv_pct(100));
+  lv_obj_set_height(s_mech_row_servo, 64);
+  lv_obj_set_flex_flow(s_mech_row_servo, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(s_mech_row_servo, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(s_mech_row_servo, 10, 0);
+  lv_obj_clear_flag(s_mech_row_servo, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *rest_lbl = lv_label_create(s_mech_row_servo);
+  lv_label_set_text(rest_lbl, "Rest\xC2\xB0");
+  lv_obj_set_style_text_font(rest_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(rest_lbl, lv_color_hex(C_TEXT), 0);
+  s_mech_sb_rest = makeSpinbox(s_mech_row_servo, CATFISH_SERVO_DEG_MIN,
+                               CATFISH_SERVO_DEG_MAX, CATFISH_SERVO_REST_DEFAULT,
+                               96, 56);
+  lv_spinbox_set_digit_format(s_mech_sb_rest, 3, 0);
+  lv_obj_t *feed_lbl = lv_label_create(s_mech_row_servo);
+  lv_label_set_text(feed_lbl, "Feed\xC2\xB0");
+  lv_obj_set_style_text_font(feed_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(feed_lbl, lv_color_hex(C_TEXT), 0);
+  s_mech_sb_feed = makeSpinbox(s_mech_row_servo, CATFISH_SERVO_DEG_MIN,
+                               CATFISH_SERVO_DEG_MAX, CATFISH_SERVO_FEED_DEFAULT,
+                               96, 56);
+  lv_spinbox_set_digit_format(s_mech_sb_feed, 3, 0);
+
+  // -- stepper params row (hidden unless Stepper selected)
+  s_mech_row_step = lv_obj_create(card);
+  lv_obj_remove_style_all(s_mech_row_step);
+  lv_obj_set_width(s_mech_row_step, lv_pct(100));
+  lv_obj_set_height(s_mech_row_step, 64);
+  lv_obj_set_flex_flow(s_mech_row_step, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(s_mech_row_step, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(s_mech_row_step, 10, 0);
+  lv_obj_clear_flag(s_mech_row_step, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *hz_lbl = lv_label_create(s_mech_row_step);
+  lv_label_set_text(hz_lbl, "Steps/s");
+  lv_obj_set_style_text_font(hz_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(hz_lbl, lv_color_hex(C_TEXT), 0);
+  s_mech_sb_hz = makeSpinbox(s_mech_row_step, CATFISH_STEP_HZ_MIN,
+                             CATFISH_STEP_HZ_MAX, CATFISH_STEP_HZ_DEFAULT, 110, 56);
+  lv_spinbox_set_digit_format(s_mech_sb_hz, 4, 0);
+  lv_obj_t *dir_lbl = lv_label_create(s_mech_row_step);
+  lv_label_set_text(dir_lbl, "DIR high");
+  lv_obj_set_style_text_font(dir_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(dir_lbl, lv_color_hex(C_TEXT), 0);
+  s_mech_sw_dir = lv_switch_create(s_mech_row_step);
+  lv_obj_set_size(s_mech_sw_dir, 72, 36);
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *save = makeBtn(btns, LV_SYMBOL_OK "  Save", C_AMBER, C_INK,
+                           C_AMBER_HI, 100, 64);
+  lv_obj_set_flex_grow(save, 1);
+  lv_obj_add_event_cb(save, mechSaveCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *cancel = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                             C_CARD_HI, 100, 64);
+  lv_obj_set_flex_grow(cancel, 1);
+  lv_obj_add_event_cb(cancel, mechCancelCb, LV_EVENT_CLICKED, nullptr);
+
+  mechSyncRows();
+}
+
+void openMechOverlay() {
+  if (!s_mech_overlay || !s_mech_roller) return;
+  // prefill from the last /status probe (falls back to shared defaults)
+  const uint8_t id = s_mech_reported ? s_mech_id : CATFISH_MECH_DEFAULT;
+  lv_roller_set_selected(s_mech_roller, id, LV_ANIM_OFF);
+  lv_spinbox_set_value(s_mech_sb_rest,
+                       (s_mech_rest >= 0) ? s_mech_rest : CATFISH_SERVO_REST_DEFAULT);
+  lv_spinbox_set_value(s_mech_sb_feed,
+                       (s_mech_feed >= 0) ? s_mech_feed : CATFISH_SERVO_FEED_DEFAULT);
+  lv_spinbox_set_value(s_mech_sb_hz,
+                       (s_mech_hz >= 0) ? s_mech_hz : CATFISH_STEP_HZ_DEFAULT);
+  lv_obj_clear_state(s_mech_sw_dir, LV_STATE_CHECKED); // DIR level not reported; default low
+  mechSyncRows();
+  lv_obj_clear_flag(s_mech_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_mech_overlay);
+}
+
+void closeMechOverlay() {
+  if (s_mech_overlay) lv_obj_add_flag(s_mech_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1337,6 +1576,7 @@ void ui_init() {
   toastTimerInit();
   buildTokenOverlay();
   buildMqttOverlay();
+  buildMechOverlay();
 
   showScreen(0);
   ui_set_next_feed("Waiting for time sync...");
@@ -1551,6 +1791,44 @@ void ui_set_mqtt_broker(const String &text) {
 
 void ui_set_pulse(uint8_t seconds) {
   if (s_sb_pulse) lv_spinbox_set_value(s_sb_pulse, seconds);
+}
+
+void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz) {
+  // cache for the editor overlay prefill
+  if (mechName.length()) {
+    s_mech_reported = true;
+    const uint8_t id = catfishMechFromName(mechName.c_str());
+    s_mech_id = (id == 0xFF) ? CATFISH_MECH_DEFAULT : id;
+  } else {
+    s_mech_reported = false;
+    s_mech_id = CATFISH_MECH_DEFAULT;
+  }
+  s_mech_rest = restDeg;
+  s_mech_feed = feedDeg;
+  s_mech_hz = stepHz;
+
+  if (!s_lbl_mech) return;
+  if (!s_mech_reported) {
+    lv_label_set_text(s_lbl_mech, "Mechanism: not reported (update relay)");
+    lv_obj_set_style_text_color(s_lbl_mech, lv_color_hex(C_MUTED), 0);
+    return;
+  }
+  char buf[48];
+  switch (s_mech_id) {
+    case CATFISH_MECH_SERVO:
+      snprintf(buf, sizeof(buf), "Mechanism: Servo (%d\xC2\xB0 \xE2\x86\x92 %d\xC2\xB0)",
+               (s_mech_rest >= 0) ? s_mech_rest : 0, (s_mech_feed >= 0) ? s_mech_feed : 0);
+      break;
+    case CATFISH_MECH_STEPPER:
+      snprintf(buf, sizeof(buf), "Mechanism: Stepper (%d steps/s)",
+               (s_mech_hz >= 0) ? s_mech_hz : 0);
+      break;
+    default:
+      snprintf(buf, sizeof(buf), "Mechanism: Motor relay");
+      break;
+  }
+  lv_label_set_text(s_lbl_mech, buf);
+  lv_obj_set_style_text_color(s_lbl_mech, lv_color_hex(C_TEXT), 0);
 }
 
 } // namespace ui

@@ -17,7 +17,20 @@
  *   GET  /feed?seconds=N&token=T  -> same logic, curl convenience (auth)
  *   GET  /                        -> minimal status page, 10 s auto-refresh
  *   POST /config                  -> {"token":"<current>", "maxPulseS":1..60,
- *                                     "pulseS":1..30, "newToken":"<optional>"} (auth)
+ *                                     "pulseS":1..30, "newToken":"<optional>",
+ *                                     "mechanism":"motor|servo|stepper",
+ *                                     "servoRestDeg","servoFeedDeg","stepHz",
+ *                                     "stepDir"} (auth; P4 keys optional)
+ *
+ * Feeding mechanisms (Phase 4; all keep "feed for N seconds" semantics):
+ *   motor (default) D1 relay/FET ON for N s — original behaviour
+ *   servo           D5 servo sweeps rest<->feed angle every 0.5 s for N s,
+ *                   parks at rest after (attach/feed/detach per feed)
+ *   stepper         D2 STEP pulses at stepHz for N s, D6 DIR held at the
+ *                   configured level (A4988/DRV8825-style driver)
+ * The mechanism + its parameters live in a second, ADDITIVE EEPROM record
+ * (offset 64, own magic/checksum) so an upgrade never touches the original
+ * token/pulse blob.
  *
  * Feed pulse rules:
  *   - hard cap MAX_PULSE_LIMIT_S (60 s) enforced at request parse AND engine start
@@ -47,6 +60,7 @@
 #include <ArduinoOTA.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <Servo.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,6 +148,79 @@ static void configLoad() {
 }
 
 // ---------------------------------------------------------------------------
+// Mechanism config — second, ADDITIVE EEPROM record (Phase 4). Lives at
+// MECH_EEPROM_OFFSET with its own magic/checksum, so flashing this firmware
+// onto an existing install preserves the original token/pulse blob at
+// offset 0 byte-for-byte and only writes defaults into the new record.
+// ---------------------------------------------------------------------------
+struct __attribute__((packed)) MechanismConfig {
+  uint32_t magic;        // MECH_MAGIC
+  uint8_t mechanism;     // CATFISH_MECH_* (0=motor 1=servo 2=stepper)
+  uint8_t servoRestDeg;  // idle angle 0..180
+  uint8_t servoFeedDeg;  // feed angle 0..180
+  uint16_t stepHz;       // stepper step rate, steps/s (1..1000)
+  uint8_t stepDir;       // DIR level during feed (0/1)
+  uint32_t checksum;     // FNV-1a over everything above this field
+};
+static_assert(sizeof(MechanismConfig) == 14, "MechanismConfig EEPROM layout changed");
+
+static MechanismConfig g_mech;
+static Servo g_servo;
+
+static uint32_t mechChecksum(const MechanismConfig &m) {
+  return fnv1a(&m, offsetof(MechanismConfig, checksum));
+}
+
+static void mechDefaults(MechanismConfig &m) {
+  memset(&m, 0, sizeof(m));
+  m.magic = MECH_MAGIC;
+  m.mechanism = CATFISH_MECH_DEFAULT;
+  m.servoRestDeg = CATFISH_SERVO_REST_DEFAULT;
+  m.servoFeedDeg = CATFISH_SERVO_FEED_DEFAULT;
+  m.stepHz = CATFISH_STEP_HZ_DEFAULT;
+  m.stepDir = 0;
+  m.checksum = mechChecksum(m);
+}
+
+static void saveMechConfig() {
+  g_mech.checksum = mechChecksum(g_mech);
+  EEPROM.put(MECH_EEPROM_OFFSET, g_mech);
+  EEPROM.commit();  // only rewrites flash when bytes actually changed
+}
+
+static void mechConfigLoad() {
+  MechanismConfig m;
+  EEPROM.get(MECH_EEPROM_OFFSET, m);
+  if ((m.magic != MECH_MAGIC) || (m.checksum != mechChecksum(m))) {
+    LOG("mech EEPROM empty/invalid -> writing defaults (motor)");
+    mechDefaults(m);
+    g_mech = m;
+    saveMechConfig();
+    return;
+  }
+  // Belt and braces: never trust flash-resident ranges.
+  if (m.mechanism >= CATFISH_MECH_COUNT) m.mechanism = CATFISH_MECH_DEFAULT;
+  m.servoRestDeg = catfishClampServoDeg(m.servoRestDeg);
+  m.servoFeedDeg = catfishClampServoDeg(m.servoFeedDeg);
+  m.stepHz = catfishClampStepHz(m.stepHz);
+  m.stepDir = catfishClampStepDir(m.stepDir);
+  g_mech = m;
+  LOG("mech loaded: %s rest=%u feed=%u hz=%u dir=%u", catfishMechName(g_mech.mechanism),
+      (unsigned)g_mech.servoRestDeg, (unsigned)g_mech.servoFeedDeg,
+      (unsigned)g_mech.stepHz, (unsigned)g_mech.stepDir);
+}
+
+/** STEP/DIR idle-low from the first microseconds (same discipline as RELAY_PIN). */
+static void mechPinsBootSafe() {
+  digitalWrite(STEP_PIN, LOW);
+  pinMode(STEP_PIN, OUTPUT);
+  digitalWrite(STEP_PIN, LOW);
+  digitalWrite(DIR_PIN, LOW);
+  pinMode(DIR_PIN, OUTPUT);
+  digitalWrite(DIR_PIN, LOW);
+}
+
+// ---------------------------------------------------------------------------
 // Feed token — constant-time-ish compare (only the length leaks, acceptable
 // for a LAN appliance per task spec).
 // ---------------------------------------------------------------------------
@@ -190,11 +277,27 @@ static void statusLedTick() {
 }
 
 // ---------------------------------------------------------------------------
-// Pulse engine — non-blocking, millis()-based
+// Pulse engine — non-blocking, millis()/micros()-based, mechanism-aware.
+// "Feed for N seconds" semantics are identical for all mechanisms; only the
+// pin behaviour during those seconds differs (catfish_mech.h).
 // ---------------------------------------------------------------------------
 static bool g_feeding = false;
 static uint32_t g_feedStartMs = 0;
 static uint32_t g_feedDurMs = 0;
+
+// servo sweep phase + stepper edge timing (engine-local, reset on each start)
+static uint32_t g_mech_phase_ms = 0;
+static bool g_servo_at_rest = true;
+static uint32_t g_last_step_edge_us = 0;
+static bool g_step_level = false;
+
+/** Attach + drive to the rest angle, let it arrive, detach (holds by detent). */
+static void mechServoPark() {
+  g_servo.attach(SERVO_PIN);
+  g_servo.write(g_mech.servoRestDeg);
+  delay(400);  // setup/config context only — never called from loop()
+  g_servo.detach();
+}
 
 static void startFeedPulse(uint32_t seconds) {
   if (seconds < 1) seconds = 1;  // paranoia
@@ -204,16 +307,74 @@ static void startFeedPulse(uint32_t seconds) {
   g_cfg.lastFeedEpoch = currentEpoch();
   g_feeding = true;
   g_ledMode = LED_MODE_FEED;
-  digitalWrite(RELAY_PIN, RELAY_ON);
+  switch (g_mech.mechanism) {
+    case CATFISH_MECH_SERVO:
+      g_servo.attach(SERVO_PIN);
+      g_servo.write(g_mech.servoRestDeg);  // start from rest, sweep below
+      g_mech_phase_ms = millis();
+      g_servo_at_rest = true;
+      break;
+    case CATFISH_MECH_STEPPER:
+      digitalWrite(DIR_PIN, g_mech.stepDir ? HIGH : LOW);
+      g_last_step_edge_us = micros();
+      g_step_level = false;
+      break;
+    case CATFISH_MECH_MOTOR:
+    default:
+      digitalWrite(RELAY_PIN, RELAY_ON);
+      break;
+  }
   saveConfig();  // persist lastFeedEpoch even if power is cut mid-pulse
-  LOG("feed START %u s (relay ON)", (unsigned)seconds);
+  LOG("feed START %u s (%s)", (unsigned)seconds, catfishMechName(g_mech.mechanism));
 }
 
 static void stopFeedPulse() {
-  digitalWrite(RELAY_PIN, RELAY_OFF);
+  switch (g_mech.mechanism) {
+    case CATFISH_MECH_SERVO:
+      g_servo.write(g_mech.servoRestDeg);
+      g_servo.detach();  // cheap servos hold by detent; stops idle hum
+      break;
+    case CATFISH_MECH_STEPPER:
+      digitalWrite(STEP_PIN, LOW);
+      digitalWrite(DIR_PIN, LOW);
+      break;
+    case CATFISH_MECH_MOTOR:
+    default:
+      digitalWrite(RELAY_PIN, RELAY_OFF);
+      break;
+  }
   g_feeding = false;
   g_ledMode = LED_MODE_HEARTBEAT;
-  LOG("feed END (relay OFF)");
+  LOG("feed END (%s idle)", catfishMechName(g_mech.mechanism));
+}
+
+/** Per-millisecond mechanism behaviour while a feed is running. */
+static void mechTick() {
+  if (!g_feeding) return;
+  switch (g_mech.mechanism) {
+    case CATFISH_MECH_SERVO:
+      // sweep rest <-> feed every 500 ms (1 Hz full cycle)
+      if (millis() - g_mech_phase_ms >= 500) {
+        g_mech_phase_ms = millis();
+        g_servo_at_rest = !g_servo_at_rest;
+        g_servo.write(g_servo_at_rest ? g_mech.servoRestDeg : g_mech.servoFeedDeg);
+      }
+      break;
+    case CATFISH_MECH_STEPPER: {
+      // toggle STEP every half period (A4988 needs >= 1.9 us per level; at
+      // stepHz = 1 kHz that is 500 us — comfortable for a loop() poll)
+      const uint32_t half_us = 500000UL / g_mech.stepHz;
+      const uint32_t now_us = micros();
+      if (now_us - g_last_step_edge_us >= half_us) {
+        g_last_step_edge_us = now_us;
+        g_step_level = !g_step_level;
+        digitalWrite(STEP_PIN, g_step_level ? HIGH : LOW);
+      }
+      break;
+    }
+    default:
+      break;  // motor: the on/off pulse IS the whole behaviour
+  }
 }
 
 static void pulseEngineTick() {
@@ -300,6 +461,9 @@ static void factoryResetTick() {
         (unsigned)(FACTORY_RESET_HOLD_MS / 1000UL));
     configDefaults(g_cfg);
     saveConfig();
+    mechDefaults(g_mech);  // P4: mechanism record resets too (servo re-parks below)
+    saveMechConfig();
+    if (g_mech.mechanism == CATFISH_MECH_SERVO && !g_feeding) mechServoPark();
     g_ledMode = LED_MODE_FEED;  // fast blink as confirmation
     delay(1500);
     ESP.restart();
@@ -341,13 +505,17 @@ static void handleStatus() {
   doc["rssi"] = (int)WiFi.RSSI();
   doc["ip"] = WiFi.localIP().toString();
   doc["version"] = FIRMWARE_VERSION;
+  doc["mechanism"] = catfishMechName(g_mech.mechanism);
+  doc["servoRestDeg"] = (int)g_mech.servoRestDeg;
+  doc["servoFeedDeg"] = (int)g_mech.servoFeedDeg;
+  doc["stepHz"] = (int)g_mech.stepHz;
   // Wire-contract revision (shared header). The display parses "proto" and
   // warns when the two firmwares disagree; bump CATFISH_PROTOCOL_VERSION in
   // ../common/catfish_protocol.h whenever the JSON/endpoint contract changes.
   doc["proto"] = CATFISH_PROTOCOL_VERSION;
   doc["ntpSynced"] = ntpTimeSynced();  // extra field: explains lastFeedEpoch semantics
 
-  char buf[512];
+  char buf[640];
   const size_t n = serializeJson(doc, buf, sizeof(buf));
   if (n == 0) {
     sendJsonError(500, "serialize_failed");
@@ -432,7 +600,7 @@ static void handleFeedGet() {
 }
 
 static void handleRoot() {
-  char page[768];  // literals ~380 B + values; snprintf truncates safely anyway
+  char page[896];  // literals ~430 B + values; snprintf truncates safely anyway
   const char* state = g_feeding ? "FEEDING" : "ready";
   char lastFeed[24];
   snprintf(lastFeed, sizeof(lastFeed), "%u", (unsigned)g_cfg.lastFeedEpoch);
@@ -442,12 +610,15 @@ static void handleRoot() {
            "<title>Catfish Feeder Relay</title></head>"
            "<body><h2>Catfish Feeder &mdash; Relay Unit</h2>"
            "<p>State: <b>%s</b></p>"
+           "<p>Mechanism: <b>%s</b>%s</p>"
            "<p>Last feed epoch: %s%s</p>"
            "<p>IP: %s</p>"
            "<p>Firmware: %s | Uptime: %u s | Free heap: %u B</p>"
            "<p>API: GET /health, GET /status, POST/GET /feed, POST /config</p>"
            "</body></html>",
-           state, lastFeed, ntpTimeSynced() ? " (NTP)" : " (boot-seconds, NTP not synced)",
+           state, catfishMechName(g_mech.mechanism),
+           g_feeding ? "" : " (idle)",
+           lastFeed, ntpTimeSynced() ? " (NTP)" : " (boot-seconds, NTP not synced)",
            WiFi.localIP().toString().c_str(), FIRMWARE_VERSION, (unsigned)(millis() / 1000UL),
            (unsigned)ESP.getFreeHeap());
   g_server.send(200, "text/html", page);
@@ -465,6 +636,14 @@ static void handleConfig() {
   const char* token = doc["token"] | "";  // current token == auth credential
   if (!tokenMatches(token)) {
     sendJsonError(403, "auth");
+    return;
+  }
+
+  // Validate the mechanism name BEFORE any mutation so a bad body never
+  // leaves the config half-applied (mirrors the maxPulseS/pulseS contract).
+  if (doc["mechanism"].is<const char*>() &&
+      catfishMechFromName(doc["mechanism"].as<const char*>()) == 0xFF) {
+    sendJsonError(400, "bad_mechanism");
     return;
   }
 
@@ -504,16 +683,54 @@ static void handleConfig() {
     changed = true;
   }
 
+  // ---- Phase 4: mechanism keys (all optional; clamped via shared helpers) --
+  bool mechChanged = false;
+  if (doc["mechanism"].is<const char*>()) {
+    const uint8_t id = catfishMechFromName(doc["mechanism"].as<const char*>());
+    if (id != g_mech.mechanism) {
+      g_mech.mechanism = id;
+      mechChanged = true;
+    }
+  }
+  if (doc["servoRestDeg"].is<long>()) {
+    const uint8_t d = catfishClampServoDeg(doc["servoRestDeg"].as<long>());
+    if (d != g_mech.servoRestDeg) { g_mech.servoRestDeg = d; mechChanged = true; }
+  }
+  if (doc["servoFeedDeg"].is<long>()) {
+    const uint8_t d = catfishClampServoDeg(doc["servoFeedDeg"].as<long>());
+    if (d != g_mech.servoFeedDeg) { g_mech.servoFeedDeg = d; mechChanged = true; }
+  }
+  if (doc["stepHz"].is<long>()) {
+    const uint16_t hz = catfishClampStepHz(doc["stepHz"].as<long>());
+    if (hz != g_mech.stepHz) { g_mech.stepHz = hz; mechChanged = true; }
+  }
+  if (doc["stepDir"].is<long>()) {
+    const uint8_t d = catfishClampStepDir(doc["stepDir"].as<long>());
+    if (d != g_mech.stepDir) { g_mech.stepDir = d; mechChanged = true; }
+  }
+  if (mechChanged) {
+    // apply immediately: (re)park the servo when switching to/retuning servo
+    if (g_mech.mechanism == CATFISH_MECH_SERVO && !g_feeding) mechServoPark();
+    saveMechConfig();
+    LOG("mech config: %s rest=%u feed=%u hz=%u dir=%u", catfishMechName(g_mech.mechanism),
+        (unsigned)g_mech.servoRestDeg, (unsigned)g_mech.servoFeedDeg,
+        (unsigned)g_mech.stepHz, (unsigned)g_mech.stepDir);
+  }
+
   if (changed) saveConfig();
 
   // Echo the effective config back to the authenticated caller (LAN convenience).
   JsonDocument echo;
   echo["ok"] = true;
-  echo["changed"] = changed;
+  echo["changed"] = (changed || mechChanged);
   echo["token"] = g_cfg.token;
   echo["maxPulseS"] = (int)g_cfg.maxPulseS;
   echo["pulseS"] = (int)g_cfg.pulseS;
-  char buf[192];
+  echo["mechanism"] = catfishMechName(g_mech.mechanism);
+  echo["servoRestDeg"] = (int)g_mech.servoRestDeg;
+  echo["servoFeedDeg"] = (int)g_mech.servoFeedDeg;
+  echo["stepHz"] = (int)g_mech.stepHz;
+  char buf[320];
   const size_t n = serializeJson(echo, buf, sizeof(buf));
   if (n == 0) {
     sendJsonError(500, "serialize_failed");
@@ -553,12 +770,18 @@ void setup() {
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, LED_OFF);
   pinMode(FACTORY_RESET_BTN, INPUT_PULLUP);  // FLASH button (factory reset)
+  mechPinsBootSafe();  // STEP/DIR low before anything else (P4)
 
   Serial.begin(115200);
-  LOG("boot v%s (relay D1 active-%s, LED D4) -- relay forced INACTIVE at boot",
+  LOG("boot v%s (relay D1 active-%s, LED D4) -- outputs forced INACTIVE at boot",
       FIRMWARE_VERSION, (RELAY_ACTIVE_LEVEL == LOW) ? "LOW" : "HIGH");
 
   configLoad();
+  mechConfigLoad();  // additive record at EEPROM offset 64 (P4)
+  if (g_mech.mechanism == CATFISH_MECH_SERVO) {
+    mechServoPark();  // servo starts parked at its rest angle
+    LOG("servo parked at %u deg", (unsigned)g_mech.servoRestDeg);
+  }
 
   // Relay must respond fast -> no WiFi power-save latency, auto-reconnect on.
   WiFi.hostname(HOSTNAME);
@@ -622,7 +845,8 @@ void setup() {
 }
 
 void loop() {
-  pulseEngineTick();   // FIRST: relay must release on time even under network load
+  pulseEngineTick();   // FIRST: outputs must release on time even under network load
+  mechTick();          // P4: servo sweep / stepper pulses while feeding
   statusLedTick();
   factoryResetTick();  // FLASH button held -> wipe config + reboot
   g_server.handleClient();

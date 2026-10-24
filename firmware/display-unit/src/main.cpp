@@ -33,6 +33,7 @@
 #include "web_server.h"
 #include "ui/ui.h"
 #include <catfish_protocol.h>
+#include <catfish_mech.h>
 
 using namespace esp_panel::board;
 using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
@@ -428,6 +429,17 @@ static void handleUiEvent(const UiEvent &ev) {
       mqttSyncUi();
       break;
 
+    case UI_EVT_MECH_CFG:
+      // P4: POST /config on the relay via the worker; RES_MECH reports back.
+      if (net_worker::enqueueMech(ev.mechId, ev.mechRest, ev.mechFeed,
+                                  ev.mechHz, ev.mechDir)) {
+        Serial.printf("[SYS] mechanism change queued: %s\n",
+                      catfishMechName(ev.mechId));
+      } else {
+        uiToast("Too busy - mechanism not changed");
+      }
+      break;
+
     default:
       break;
   }
@@ -445,6 +457,18 @@ static void handleWorkerResult(const net_worker::Result &r) {
     } else {
       uiToast(String("Token rotate failed: ") + r.error);
       Serial.printf("[NET] relay token rotate FAILED: %s\n", r.error);
+    }
+    return;
+  }
+
+  if (r.kind == net_worker::Result::RES_MECH) {
+    if (r.ok) {
+      uiToast("Mechanism updated");
+      Serial.printf("[NET] mechanism updated OK (ip %s) - re-probing\n", r.ip);
+      net_worker::enqueueProbe(true); // refresh the Settings mechanism line
+    } else {
+      uiToast(String("Mechanism update failed: ") + r.error);
+      Serial.printf("[NET] mechanism update FAILED: %s\n", r.error);
     }
     return;
   }
@@ -518,6 +542,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
   lvgl_port_lock(-1);
   ui_set_probe_busy(false);
   ui_set_relay(r.online, r.ip, r.feeding);
+  ui_set_mech(String(r.mech), r.mechRest, r.mechFeed, r.mechHz);
   lvgl_port_unlock();
   // Retained MQTT mirror of the relay state (no-ops when disconnected).
   mqtt_mgr::publishRelayOnline(r.online);

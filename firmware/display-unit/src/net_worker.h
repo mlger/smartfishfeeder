@@ -18,7 +18,12 @@
 namespace net_worker {
 
 struct Cmd {
-  enum Type : uint8_t { CMD_FEED = 0, CMD_PROBE, CMD_TOKEN_ROTATE };
+  enum Type : uint8_t {
+    CMD_FEED = 0,
+    CMD_PROBE,
+    CMD_TOKEN_ROTATE,
+    CMD_MECH, // P4: switch the relay's feeding mechanism via POST /config
+  };
   Type type = CMD_FEED;
   uint8_t seconds = 0; // FEED: pulse duration
   bool manual = false; // FEED: manual vs scheduled
@@ -27,10 +32,16 @@ struct Cmd {
   uint8_t minute = 0;
   bool report = false; // PROBE: toast the outcome
   char token[CATFISH_TOKEN_LEN] = {0}; // TOKEN_ROTATE: new token for the relay
+  // MECH (P4): pre-clamped by the UI; relay clamps again
+  uint8_t mechId = 0;      // CATFISH_MECH_*
+  uint8_t mechRest = 0;    // servo rest angle
+  uint8_t mechFeed = 0;    // servo feed angle
+  uint16_t mechHz = 0;     // stepper step rate
+  uint8_t mechDir = 0;     // stepper DIR level
 };
 
 struct Result {
-  enum Kind : uint8_t { RES_FEED = 0, RES_PROBE, RES_TOKEN };
+  enum Kind : uint8_t { RES_FEED = 0, RES_PROBE, RES_TOKEN, RES_MECH };
   Kind kind = RES_FEED;
   bool ok = false;
   // FEED echo
@@ -46,6 +57,10 @@ struct Result {
   bool feeding = false;
   bool report = false;
   bool protoMismatch = false; // relay "proto" != CATFISH_PROTOCOL_VERSION
+  char mech[10] = {0}; // relay "mechanism" ("motor"/"servo"/"stepper"; "" = pre-P4)
+  int16_t mechRest = -1; // servo rest angle from /status (-1 = unknown/pre-P4)
+  int16_t mechFeed = -1; // servo feed angle from /status
+  int16_t mechHz = -1;   // stepper step rate from /status
   // TOKEN_ROTATE echo
   char token[CATFISH_TOKEN_LEN] = {0};
   char ip[16] = {0};
@@ -68,6 +83,13 @@ bool enqueueProbe(bool report);
  * On success the loop persists the new token locally.
  */
 bool enqueueTokenRotate(const char *newToken);
+
+/**
+ * P4: switch the relay's feeding mechanism (POST /config "mechanism" +
+ * parameters). Values are clamped by catfish_mech.h on both ends.
+ */
+bool enqueueMech(uint8_t mechId, uint8_t restDeg, uint8_t feedDeg,
+                 uint16_t stepHz, uint8_t stepDir);
 
 /** Non-blocking result drain for loop(). @return false when empty. */
 bool receive(Result &out);
