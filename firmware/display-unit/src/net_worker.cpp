@@ -63,6 +63,8 @@ void workerTask(void * /*param*/) {
       r.online = online;
       r.feeding = st.feeding;
       r.report = cmd.report;
+      r.protoMismatch =
+          st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION;
       strlcpy(r.ip, relay_client::ip().c_str(), sizeof(r.ip));
       strlcpy(r.version, st.version.c_str(), sizeof(r.version));
       if (!st.ok && st.error.length()) fillError(r, st.error);

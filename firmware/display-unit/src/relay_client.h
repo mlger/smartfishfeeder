@@ -35,6 +35,7 @@ struct Status {
   uint32_t lastFeedEpoch = 0;
   String version = "";
   String state = "";
+  int protocolVersion = -1; // relay "proto" field; -1 = old firmware that does not report it
   String error = "";
 };
 
@@ -66,7 +67,11 @@ Result feed(uint8_t seconds);
  */
 Result rotateToken(const String &newToken);
 
-/** GET /status -> parse {"state","feeding","lastFeedEpoch","version",...}. */
+/**
+ * GET /status -> parse {"state","feeding","lastFeedEpoch","version","proto",...}.
+ * A protocol-version mismatch is logged once per boot here; callers can also
+ * read protocolVersion to surface it in the UI.
+ */
 Status fetchStatus();
 
 } // namespace relay_client

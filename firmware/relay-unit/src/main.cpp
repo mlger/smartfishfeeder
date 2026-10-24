@@ -341,6 +341,10 @@ static void handleStatus() {
   doc["rssi"] = (int)WiFi.RSSI();
   doc["ip"] = WiFi.localIP().toString();
   doc["version"] = FIRMWARE_VERSION;
+  // Wire-contract revision (shared header). The display parses "proto" and
+  // warns when the two firmwares disagree; bump CATFISH_PROTOCOL_VERSION in
+  // ../common/catfish_protocol.h whenever the JSON/endpoint contract changes.
+  doc["proto"] = CATFISH_PROTOCOL_VERSION;
   doc["ntpSynced"] = ntpTimeSynced();  // extra field: explains lastFeedEpoch semantics
 
   char buf[512];

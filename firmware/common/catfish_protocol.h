@@ -17,8 +17,15 @@
 // strings from this). The #ifndef guard lets an external -DCATFISH_APP_VERSION
 // override it without redefinition warnings.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.0.0"
+#define CATFISH_APP_VERSION "1.1.0"
 #endif
+
+// ------------------------------------------------------------ protocol version
+// Wire-contract revision: bump when endpoints, JSON fields, discovery strings
+// or pairing semantics change in a way that requires BOTH units to agree.
+// The relay reports this in GET /status as "proto"; the display parses it and
+// warns when the two firmwares disagree (e.g. only one unit was re-flashed).
+#define CATFISH_PROTOCOL_VERSION 1
 
 // ------------------------------------------------------------ discovery (LAN UDP broadcast)
 #define CATFISH_DISCOVERY_UDP_PORT   5050

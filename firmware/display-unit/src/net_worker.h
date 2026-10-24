@@ -45,6 +45,7 @@ struct Result {
   bool online = false;
   bool feeding = false;
   bool report = false;
+  bool protoMismatch = false; // relay "proto" != CATFISH_PROTOCOL_VERSION
   // TOKEN_ROTATE echo
   char token[CATFISH_TOKEN_LEN] = {0};
   char ip[16] = {0};
