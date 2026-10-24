@@ -16,8 +16,9 @@
 #include <Arduino.h>
 #include <stdint.h>
 
-// Single source of truth is platformio.ini (-DCATFISH_APP_VERSION="1.0.0");
-// this fallback keeps IDE tooling happy and avoids macro redefinition.
+// Single source of truth is firmware/common/catfish_protocol.h
+// (CATFISH_APP_VERSION, shared with the relay unit); this fallback keeps IDE
+// tooling happy and avoids macro redefinition.
 #ifndef CATFISH_APP_VERSION
 #define CATFISH_APP_VERSION "1.0.0"
 #endif
@@ -28,10 +29,11 @@ enum UiEventType : uint8_t {
   UI_EVT_RELAY_TEST,    // "Test connection" pressed
   UI_EVT_REBOOT,        // "Reboot" pressed
   UI_EVT_SET_PULSE,     // default pulse changed (a=seconds)
-  UI_EVT_SET_TOKEN,     // pairing token saved   (token=new token)
+  UI_EVT_SET_TOKEN,     // pairing token saved   (token=new, flag=also rotate relay)
+  UI_EVT_SET_BL,        // backlight switch flipped (flag=on; loop persists)
   UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s)
   UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
-  UI_EVT_SCHED_PERSIST, // enable switch flipped (loop flushes NVS)
+  UI_EVT_SCHED_PERSIST, // enable switch flipped (a=index, flag=enabled — loop applies + flushes)
 };
 
 struct UiEvent {
@@ -83,6 +85,9 @@ void ui_request_feed(uint8_t seconds);
 
 /** Disable/re-enable FEED NOW while a feed request is in flight. */
 void ui_set_feed_busy(bool busy);
+
+/** Disable/re-enable "Test connection" while a relay probe is in flight. */
+void ui_set_probe_busy(bool busy);
 
 /** Rebuild the schedule list from feed_scheduler (caller holds the lock). */
 void ui_schedule_refresh();

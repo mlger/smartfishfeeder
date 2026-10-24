@@ -7,15 +7,21 @@
  * due at the current (NTP-synced) local HH:MM, firing each entry at most
  * once per calendar minute.
  *
- * Persistence is DEFERRED: mutations only mark a dirty flag (cheap, safe to
- * call from the LVGL task); loop() calls flushIfDirty() ~1 Hz to serialize +
- * write NVS. This keeps flash writes out of UI callbacks.
+ * Persistence is DEFERRED: mutations only mark a dirty flag; loop() calls
+ * flushIfDirty() ~1 Hz to serialize + write NVS. This keeps flash writes out
+ * of UI callbacks.
+ *
+ * Threading: ALL mutations (add/remove/setEnabled/toggle) must be called from
+ * the main loop() context (single writer). UI callbacks never mutate — they
+ * enqueue a UiEvent and loop() applies the change. Reads (tick/nextOccurrence)
+ * also run in loop() context, so no locking is needed.
  */
 #ifndef CATFISH_FEED_SCHEDULER_H
 #define CATFISH_FEED_SCHEDULER_H
 
 #include <Arduino.h>
 #include <stdint.h>
+#include <time.h>
 
 struct FeedTime {
   uint8_t hour;    // 0..23
@@ -59,6 +65,12 @@ bool toggle(int index);
 
 /** true when local time looks NTP-synced (struct tm year >= 2025). */
 bool timeValid();
+
+/**
+ * Test hook: replace the wall-clock source (nullptr restores system time).
+ * Used by the native (host) unit tests; production code never calls it.
+ */
+void set_time_source(time_t (*fn)());
 
 /**
  * Serialize the schedule and write it to NVS when dirty.

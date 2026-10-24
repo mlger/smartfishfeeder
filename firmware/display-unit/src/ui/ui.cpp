@@ -84,11 +84,13 @@ lv_obj_t *s_lbl_ssid = nullptr;
 lv_obj_t *s_lbl_ip = nullptr;
 lv_obj_t *s_lbl_rssi = nullptr;
 lv_obj_t *s_lbl_relay_ip = nullptr;
+lv_obj_t *s_probe_btn = nullptr;
 
 // Token editor overlay (lv_layer_top)
 lv_obj_t *s_tok_overlay = nullptr;
 lv_obj_t *s_tok_ta = nullptr;
 lv_obj_t *s_tok_kb = nullptr;
+lv_obj_t *s_tok_rotate = nullptr; // "also update relay unit" checkbox
 
 // Toast
 lv_obj_t *s_toast_box = nullptr;
@@ -97,7 +99,8 @@ lv_timer_t *s_toast_tmr = nullptr;
 
 // State
 void (*s_bl_cb)(bool) = nullptr;
-bool s_bl_on = true;
+bool s_bl_on = true;   // user preference (persisted via UI_EVT_SET_BL)
+bool s_dimmed = false; // transient: screen auto-dimmed after idle timeout
 bool s_relay_online = false;
 bool s_relay_feeding = false;
 bool s_dot_blink = false;
@@ -112,6 +115,11 @@ char s_min_opts[216] = "";
 char s_clock_cache[8] = "";
 char s_val_cache[24] = "";
 char s_sub_cache[28] = "";
+
+// Backlight idle timeout (M6): auto-dim after this much touch inactivity.
+// Touching the screen wakes it again; the user's on/off preference in
+// Settings is separate and persisted.
+constexpr uint32_t UI_BACKLIGHT_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 
 // ---------------------------------------------------------------------------
 // Internal prototypes (order-independent wiring)
@@ -330,6 +338,7 @@ void showScreen(int idx) {
 }
 
 void navCb(lv_event_t *e) {
+  closeEditor(); // never leave the schedule editor open across screens
   showScreen((int)(intptr_t)lv_event_get_user_data(e));
 }
 
@@ -342,11 +351,15 @@ void enableSwitchCb(lv_event_t *e) {
   const int idx = (int)(intptr_t)lv_event_get_user_data(e);
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   const bool en = lv_obj_has_state(sw, LV_STATE_CHECKED);
-  feed_scheduler::setEnabled(idx, en); // RAM flip + dirty mark only
+  // H3: the scheduler is single-writer (loop() context only) — the LVGL task
+  // just reports index + target state; loop() applies it and flushes NVS.
   UiEvent ev;
   ev.type = UI_EVT_SCHED_PERSIST;
-  uiEventSend(ev); // loop() flushes NVS + refreshes next-feed
-  Serial.printf("[UI] schedule entry %d %s\n", idx, en ? "enabled" : "disabled");
+  ev.a = (uint8_t)idx;
+  ev.flag = en;
+  uiEventSend(ev);
+  Serial.printf("[UI] schedule entry %d -> %s (queued)\n", idx,
+                en ? "enabled" : "disabled");
 }
 
 void trashCb(lv_event_t *e) {
@@ -392,11 +405,21 @@ void pulseSpinCb(lv_event_t *e) {
   uiEventSend(ev); // loop() persists (keeps flash writes out of the LVGL task)
 }
 
+/** Apply the effective backlight = user preference AND not idle-dimmed. */
+void applyBacklight() {
+  if (s_bl_cb) s_bl_cb(s_bl_on && !s_dimmed);
+}
+
 void blSwitchCb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
   s_bl_on = on;
-  if (s_bl_cb) s_bl_cb(on);
+  s_dimmed = false; // a manual toggle always overrides an idle dim
+  applyBacklight();
+  UiEvent ev;
+  ev.type = UI_EVT_SET_BL;
+  ev.flag = on;
+  uiEventSend(ev); // loop() persists the preference
   Serial.printf("[UI] backlight %s\n", on ? "ON" : "OFF");
 }
 
@@ -433,8 +456,9 @@ void tokenSaveCb(lv_event_t *e) {
   }
   UiEvent ev;
   ev.type = UI_EVT_SET_TOKEN;
+  ev.flag = s_tok_rotate && lv_obj_has_state(s_tok_rotate, LV_STATE_CHECKED);
   strlcpy(ev.token, t, sizeof(ev.token));
-  if (uiEventSend(ev)) closeTokenOverlay(); // loop() persists + toasts
+  if (uiEventSend(ev)) closeTokenOverlay(); // loop() persists (+rotates relay)
 }
 
 void toastTimerCb(lv_timer_t *t) {
@@ -851,7 +875,10 @@ void buildSettings() {
                            C_CARD, C_AMBER, C_CARD_HI, lv_pct(100), 64);
   lv_obj_set_style_border_color(test, lv_color_hex(C_AMBER), 0);
   lv_obj_set_style_border_width(test, 2, 0);
+  lv_obj_set_style_bg_color(test, lv_color_hex(C_CARD), LV_STATE_DISABLED);
+  lv_obj_set_style_text_color(test, lv_color_hex(C_MUTED), LV_STATE_DISABLED);
   lv_obj_add_event_cb(test, relayTestCb, LV_EVENT_CLICKED, nullptr);
+  s_probe_btn = test;
 
   // -- System card
   lv_obj_t *card_sys = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
@@ -972,6 +999,13 @@ void buildTokenOverlay() {
   lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
 
+  // M4: optionally rotate the token on the relay unit via POST /config.
+  // Only succeeds while the current display token still matches the relay.
+  s_tok_rotate = lv_checkbox_create(card);
+  lv_checkbox_set_text(s_tok_rotate, "Also update the relay unit");
+  lv_obj_set_style_text_font(s_tok_rotate, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_tok_rotate, lv_color_hex(C_TEXT), 0);
+
   s_tok_ta = lv_textarea_create(card);
   lv_textarea_set_one_line(s_tok_ta, true);
   lv_textarea_set_max_length(s_tok_ta, CATFISH_TOKEN_LEN - 1);
@@ -1017,6 +1051,7 @@ void buildTokenOverlay() {
 void openTokenOverlay() {
   if (!s_tok_overlay) return;
   lv_textarea_set_text(s_tok_ta, prefs::getRelayToken().c_str());
+  if (s_tok_rotate) lv_obj_clear_state(s_tok_rotate, LV_STATE_CHECKED);
   lv_obj_clear_flag(s_tok_overlay, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_tok_overlay);
 }
@@ -1052,6 +1087,19 @@ bool ui_event_receive(UiEvent &out) {
 }
 
 void ui_tick() {
+  // backlight idle auto-dim (M6)
+  const uint32_t inactive = lv_disp_get_inactive_time(nullptr);
+  if (s_bl_on && !s_dimmed && inactive > UI_BACKLIGHT_TIMEOUT_MS) {
+    s_dimmed = true;
+    applyBacklight();
+    Serial.println("[UI] backlight auto-dim (idle)");
+  } else if (s_dimmed && inactive <= 1000) {
+    // fresh touch activity -> wake
+    s_dimmed = false;
+    applyBacklight();
+    Serial.println("[UI] backlight wake (touch)");
+  }
+
   // clock (all status bars)
   const time_t now = time(nullptr);
   struct tm lt;
@@ -1178,6 +1226,7 @@ void ui_toast(const String &msg) {
 void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on) {
   s_bl_cb = cb;
   s_bl_on = initial_on;
+  s_dimmed = false;
   if (s_sw_bl) {
     if (initial_on)
       lv_obj_add_state(s_sw_bl, LV_STATE_CHECKED);
@@ -1205,6 +1254,15 @@ void ui_set_feed_busy(bool busy) {
       lv_obj_add_state(s_feed_btn, LV_STATE_DISABLED);
     else
       lv_obj_clear_state(s_feed_btn, LV_STATE_DISABLED);
+  }
+}
+
+void ui_set_probe_busy(bool busy) {
+  if (s_probe_btn) {
+    if (busy)
+      lv_obj_add_state(s_probe_btn, LV_STATE_DISABLED);
+    else
+      lv_obj_clear_state(s_probe_btn, LV_STATE_DISABLED);
   }
 }
 

@@ -12,6 +12,14 @@
  */
 #pragma once
 
+// ------------------------------------------------------------ firmware version
+// Single source of truth for BOTH units (display + relay derive their version
+// strings from this). The #ifndef guard lets an external -DCATFISH_APP_VERSION
+// override it without redefinition warnings.
+#ifndef CATFISH_APP_VERSION
+#define CATFISH_APP_VERSION "1.0.0"
+#endif
+
 // ------------------------------------------------------------ discovery (LAN UDP broadcast)
 #define CATFISH_DISCOVERY_UDP_PORT   5050
 #define CATFISH_DISCOVERY_REQ        "CATFISH_DISCOVER"     // exact-match request

@@ -28,7 +28,8 @@
 #define DEFAULT_PULSE_S     CATFISH_DEFAULT_PULSE_S
 
 // ---------------------------------------------------------------- firmware
-#define FIRMWARE_VERSION "1.0.0"
+// Derived from the shared protocol header — single version source for both units.
+#define FIRMWARE_VERSION CATFISH_APP_VERSION
 
 // ------------------------------------------------------------------ relay
 // D1 == GPIO5 on NodeMCU (feeds the optocoupler input of the relay module).
@@ -57,6 +58,21 @@
 
 // ---------------------------------------------------------- pulse safety
 #define DEFAULT_MAX_PULSE_S 30 // per-device soft cap (EEPROM-editable via /config)
+
+// ------------------------------------------------------------- OTA (ArduinoOTA)
+// Open OTA is a documented decision for this LAN-only appliance. To require a
+// password, add e.g.  -DOTA_PASSWORD=\"s3cret\"  to build_flags (or inject it
+// from CI). Empty string keeps the historical open behaviour.
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
+
+// ------------------------------------------------- factory reset (FLASH button)
+// Hold the NodeMCU FLASH button (GPIO0) for this long while running to wipe
+// the EEPROM config (token, pulse caps) back to factory defaults and reboot.
+// Guarded against activation while a feed pulse is running.
+#define FACTORY_RESET_BTN      0        // GPIO0 = FLASH button on NodeMCU
+#define FACTORY_RESET_HOLD_MS  5000UL   // hold duration to trigger the wipe
 
 // ------------------------------------------- EEPROM config blob (see main.cpp)
 #define EEPROM_SIZE        4096

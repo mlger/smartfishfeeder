@@ -11,9 +11,11 @@ Design goals: LAN-only, zero cloud dependencies, minimal auth. For the wiring an
 | mDNS hostname | `catfish-relay.local` (HTTP port 80) |
 | UDP discovery port | `5050` |
 | Feed token | sent **inside the JSON body** (or `?token=` on the GET variant), default **`catfish`** |
-| OTA service | ArduinoOTA (upload via PlatformIO, see [firmware.md](firmware.md)) |
+| OTA service | ArduinoOTA (upload via PlatformIO, see [firmware.md](firmware.md)); password optional via build flag |
 
 Requests that change state (`POST /feed`, `POST /config`) require the token. Read-only endpoints (`GET /status`, `GET /health`) do not.
+
+The **Display Unit's Settings screen manages the token end-to-end**: Settings → Relay Unit → *Pairing token* opens an on-screen editor. Saving updates the display's copy; ticking **"Also update the relay unit"** additionally rotates the relay's token via `POST /config` (this requires the display's current token to still match the relay, since it authorizes the rotation).
 
 ```sh
 curl http://catfish-relay.local/health
@@ -39,10 +41,12 @@ Order of checks (deterministic error codes):
 
 | Status | Meaning | Body |
 |--------|---------|------|
-| 200 | Feed pulse started | `{"ok":true,"seconds":3}` (plus a note field if the value was clamped to `maxPulseS`) |
+| 200 | Feed pulse started | `{"ok":true,"seconds":3}` — plus a `note` string when the value was clamped to `maxPulseS` |
 | 400 | Malformed JSON, or `seconds` missing/not an integer/`< 1` | `{"ok":false,"error":"bad_json"}` or `{"ok":false,"error":"bad_seconds"}` |
 | 403 | Wrong or missing token | `{"ok":false,"error":"auth"}` |
 | 409 | A feed is already running (busy) | `{"ok":false,"error":"busy"}` |
+
+The `seconds` field in a 200 response is what the relay **actually applied** (after clamping). Display-side toasts surface the clamp, e.g. `Fed OK (30 s) - clamped`.
 
 Examples:
 
@@ -175,15 +179,15 @@ The display unit resolves the relay in this order:
 
 1. **Cached last-known IP** — validated with `GET /health` (2 s timeout).
 2. **mDNS** — look up `catfish-relay.local`.
-3. **UDP discovery** — broadcast `CATFISH_DISCOVER` on port 5050 and take the first `CATFISH_RELAY|<ip>` answer (1.5 s window).
+3. **UDP discovery** — broadcast `CATFISH_DISCOVER` to both `255.255.255.255:5050` **and the subnet-directed broadcast address** (works around APs that filter global broadcasts), then take the first `CATFISH_RELAY|<ip>` answer (1.5 s window).
 4. **Fail** — the UI shows "Relay unreachable"; discovery retries on the next probe cycle or feed attempt.
 
-Successful IPs are persisted, so a relay that changes IP (DHCP) self-heals within a minute or two.
+**Stale-IP self-heal:** a persisted IP that stops answering is not trusted forever. Three consecutive transport-level failures (timeouts/refusals — any HTTP response means the relay is alive and resets the counter) drop the cached IP, and a failed feed POST immediately re-discovers and retries **once** against the fresh IP. A relay that changes IP (DHCP) therefore self-heals within a couple of minutes without a reboot.
 
 ## Security notes
 
 - **LAN-only by design.** There is no cloud relay, no inbound port mapping, no TLS (an ESP8266 serving TLS is out of scope here). Do not port-forward the relay unit to the internet.
 - The token guards `POST /feed` and `POST /config`; `/status`, `/health` and `/` are readable by anyone on the LAN. On a home network this is acceptable; on shared networks it is not.
-- **Change the default token (`catfish`)** before real use via `POST /config` (`newToken`) — the display unit reads the token from its own NVS settings; keep both sides in sync.
+- **Change the default token (`catfish`)** before real use — no `curl` needed: the display unit's Settings → Relay Unit → *Pairing token* editor can rotate the relay's token directly (tick "Also update the relay unit"). Both sides stay in sync because the display only persists the new token after the relay accepted it.
 - Because HTTP is plaintext, treat the token as a light fence, not a secret: anyone sniffing the LAN can read it. Physically securing the network is the real control.
 - Planned hardening (see README roadmap): MQTT with credentials for Home Assistant integration.

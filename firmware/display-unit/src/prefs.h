@@ -47,6 +47,11 @@ void setRelayIp(const String &ip);
 uint8_t getDefaultPulse();
 void setDefaultPulse(uint8_t seconds);
 
+// ---- Display ----
+/** User's backlight preference (idle dimming is transient, not persisted). */
+bool getBacklightOn();
+void setBacklightOn(bool on);
+
 // ---- History ----
 /** Unix epoch (UTC) of last successful feed, 0 = never. */
 uint32_t getLastFedEpoch();

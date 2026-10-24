@@ -273,6 +273,40 @@ static void wifiWatchdog() {
 }
 
 // ---------------------------------------------------------------------------
+// Factory reset: hold the FLASH button (GPIO0) for FACTORY_RESET_HOLD_MS to
+// wipe the EEPROM config back to defaults and reboot. Refused while a feed
+// pulse is running (restart while the relay is energized would glitch the
+// motor line; the wipe also persists lastFeedEpoch=0 which we do not want
+// to record mid-pulse).
+// ---------------------------------------------------------------------------
+static bool s_resetArmed = false;
+static uint32_t s_resetStartMs = 0;
+
+static void factoryResetTick() {
+  if (digitalRead(FACTORY_RESET_BTN) != LOW) {
+    if (s_resetArmed && !g_feeding) g_ledMode = LED_MODE_HEARTBEAT;
+    s_resetArmed = false;
+    return;
+  }
+  if (!s_resetArmed) {
+    s_resetArmed = true;
+    s_resetStartMs = millis();
+    if (!g_feeding) g_ledMode = LED_MODE_SOLID;  // visual "armed" feedback
+    return;
+  }
+  if (g_feeding) return;  // never wipe mid-pulse
+  if (millis() - s_resetStartMs >= FACTORY_RESET_HOLD_MS) {
+    LOG("factory reset: FLASH held %u s - wiping config to defaults",
+        (unsigned)(FACTORY_RESET_HOLD_MS / 1000UL));
+    configDefaults(g_cfg);
+    saveConfig();
+    g_ledMode = LED_MODE_FEED;  // fast blink as confirmation
+    delay(1500);
+    ESP.restart();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server (ESP8266WebServer, port 80)
 // ---------------------------------------------------------------------------
 static ESP8266WebServer g_server(80);
@@ -514,6 +548,7 @@ void setup() {
 
   pinMode(STATUS_LED, OUTPUT);
   digitalWrite(STATUS_LED, LED_OFF);
+  pinMode(FACTORY_RESET_BTN, INPUT_PULLUP);  // FLASH button (factory reset)
 
   Serial.begin(115200);
   LOG("boot v%s (relay D1 active-%s, LED D4) -- relay forced INACTIVE at boot",
@@ -558,8 +593,13 @@ void setup() {
   }
 
   ArduinoOTA.setHostname(HOSTNAME);
-  ArduinoOTA.begin();  // open (no password) -- LAN-only appliance, documented
-  LOG("OTA ready (LAN, no password)");
+  if (OTA_PASSWORD[0] != '\0') {
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    LOG("OTA ready (password protected)");
+  } else {
+    LOG("OTA ready (LAN, no password)");
+  }
+  ArduinoOTA.begin();
 
   if (g_discoveryUdp.begin(DISCOVERY_UDP_PORT)) {
     LOG("discovery responder on UDP %u (awaiting '%s')", (unsigned)DISCOVERY_UDP_PORT,
@@ -580,6 +620,7 @@ void setup() {
 void loop() {
   pulseEngineTick();   // FIRST: relay must release on time even under network load
   statusLedTick();
+  factoryResetTick();  // FLASH button held -> wipe config + reboot
   g_server.handleClient();
   ArduinoOTA.handle();
   discoveryPump();

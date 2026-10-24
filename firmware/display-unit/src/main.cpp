@@ -28,6 +28,7 @@
 #include "prefs.h"
 #include "relay_client.h"
 #include "ui/ui.h"
+#include <catfish_protocol.h>
 
 using namespace esp_panel::board;
 using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
@@ -39,7 +40,10 @@ static uint32_t s_t_1s = 0;
 static uint32_t s_t_30s = 0;
 static uint32_t s_t_60s = 0;
 
-// Scheduled-feed retry (one retry, ~30 s later)
+// Scheduled-feed retries: one delayed attempt per failed scheduled feed.
+// Two slots cover the (rare) case of two entries failing in the same ~30 s
+// window. Slots are armed on HTTP failure (30 s) or WiFi-down at fire time
+// (60 s), and fire from the 1 Hz block in loop().
 struct SchedRetry {
   bool pending = false;
   uint8_t hour = 0;
@@ -47,7 +51,34 @@ struct SchedRetry {
   uint8_t seconds = 0;
   uint32_t dueMs = 0;
 };
-static SchedRetry s_retry;
+static SchedRetry s_retries[2];
+
+// Optimistic "Feeding..." on the Home card: set right after a successful feed
+// (the relay IS running its pulse then), expired after the pulse + 2 s, or
+// superseded early by the next real /status probe.
+static bool s_opt_feeding = false;
+static uint32_t s_opt_feeding_until = 0;
+
+static void clearRetryFor(uint8_t hour, uint8_t minute) {
+  for (SchedRetry &s : s_retries) {
+    if (s.pending && s.hour == hour && s.minute == minute) s.pending = false;
+  }
+}
+
+static bool armRetry(uint8_t hour, uint8_t minute, uint8_t seconds,
+                     uint32_t delay_ms) {
+  for (SchedRetry &s : s_retries) {
+    if (!s.pending) {
+      s.pending = true;
+      s.hour = hour;
+      s.minute = minute;
+      s.seconds = seconds;
+      s.dueMs = millis() + delay_ms;
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -115,7 +146,19 @@ static void uiToast(const String &msg) {
 static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
                         uint8_t minute, bool retry) {
   if (!net_wifi::wifi_is_connected()) {
-    uiToast("WiFi not connected");
+    if (manual) {
+      uiToast("WiFi not connected");
+    } else if (!retry) {
+      // H2: a scheduled feed must survive a WiFi blip at fire time - arm a
+      // delayed attempt instead of silently dropping it.
+      if (armRetry(hour, minute, seconds, 60000UL)) {
+        uiToast("No WiFi - feed will retry");
+      } else {
+        uiToast(String("Feed FAILED: no WiFi"));
+      }
+    } else {
+      uiToast(String("Feed FAILED: no WiFi"));
+    }
     Serial.println("[FEED] aborted: WiFi down");
     return;
   }
@@ -155,8 +198,13 @@ static void handleUiEvent(const UiEvent &ev) {
 
     case UI_EVT_RELAY_TEST:
       Serial.println("[NET] relay test requested");
-      if (!net_worker::enqueueProbe(true))
+      if (net_worker::enqueueProbe(true)) {
+        lvgl_port_lock(-1);
+        ui_set_probe_busy(true);
+        lvgl_port_unlock();
+      } else {
         uiToast("Too busy, try again");
+      }
       break;
 
     case UI_EVT_REBOOT:
@@ -172,9 +220,25 @@ static void handleUiEvent(const UiEvent &ev) {
       break;
 
     case UI_EVT_SET_TOKEN:
-      prefs::setRelayToken(String(ev.token));
-      Serial.println("[NET] pairing token updated");
-      uiToast("Pairing token updated");
+      if (ev.flag) {
+        // M4: rotate on the relay unit first (POST /config newToken); the new
+        // token is only persisted locally once the relay accepted it.
+        if (net_worker::enqueueTokenRotate(ev.token)) {
+          uiToast("Updating relay token...");
+        } else {
+          uiToast("Too busy - relay not updated");
+        }
+      } else {
+        prefs::setRelayToken(String(ev.token));
+        uiToast("Pairing token updated");
+      }
+      Serial.println("[NET] pairing token update requested");
+      break;
+
+    case UI_EVT_SET_BL:
+      prefs::setBacklightOn(ev.flag);
+      Serial.printf("[SYS] backlight preference saved: %s\n",
+                    ev.flag ? "on" : "off");
       break;
 
     case UI_EVT_SCHED_ADD: {
@@ -199,6 +263,7 @@ static void handleUiEvent(const UiEvent &ev) {
       break;
 
     case UI_EVT_SCHED_PERSIST:
+      feed_scheduler::setEnabled(ev.a, ev.flag); // single-writer flip (loop ctx)
       feed_scheduler::flushIfDirty();
       refreshNextFeedUi(); // enable/disable changes the next occurrence
       break;
@@ -212,53 +277,79 @@ static void handleUiEvent(const UiEvent &ev) {
 // Worker result handling
 // ---------------------------------------------------------------------------
 static void handleWorkerResult(const net_worker::Result &r) {
-  if (r.kind == net_worker::Result::RES_FEED) {
-    lvgl_port_lock(-1);
-    ui_set_feed_busy(false);
-    lvgl_port_unlock();
-
+  if (r.kind == net_worker::Result::RES_TOKEN) {
     if (r.ok) {
-      s_retry.pending = false;
-      const uint32_t epoch = (uint32_t)time(nullptr);
-      prefs::setLastFedEpoch(epoch);
-      const String when = r.manual
-                              ? formatLastFed(epoch)
-                              : (String("Today ") + fmtHhmm(r.hour, r.minute));
+      prefs::setRelayToken(String(r.token));
+      uiToast("Relay token updated");
+      Serial.printf("[NET] relay token rotated OK (ip %s)\n", r.ip);
+    } else {
+      uiToast(String("Token rotate failed: ") + r.error);
+      Serial.printf("[NET] relay token rotate FAILED: %s\n", r.error);
+    }
+    return;
+  }
+
+  if (r.kind == net_worker::Result::RES_FEED) {
+    if (r.ok) {
+      if (!r.manual) clearRetryFor(r.hour, r.minute);
+
+      // M8: only trust the wall clock (and persist lastFed) once NTP synced.
+      const bool clock_ok = feed_scheduler::timeValid();
+      String when;
+      if (clock_ok) {
+        const uint32_t epoch = (uint32_t)time(nullptr);
+        prefs::setLastFedEpoch(epoch);
+        when = r.manual ? formatLastFed(epoch)
+                        : (String("Today ") + fmtHhmm(r.hour, r.minute));
+      }
+
       lvgl_port_lock(-1);
-      ui_set_last_feed(when);
-      ui_toast(r.manual ? (String("Fed OK (") + r.seconds + " s)")
-                        : (String("Fed ") + fmtHhmm(r.hour, r.minute)));
+      ui_set_feed_busy(false);
+      if (clock_ok) ui_set_last_feed(when);
+      ui_set_relay(true, String(r.ip), true); // M2: optimistic feeding state
+      if (r.manual) {
+        String t = String("Fed OK (") + r.seconds + " s)";
+        if (r.clamped) t += " - clamped"; // M3: relay clamp surfaced
+        ui_toast(t);
+      } else {
+        ui_toast(String("Fed ") + fmtHhmm(r.hour, r.minute));
+      }
       lvgl_port_unlock();
+
+      if (r.clamped)
+        Serial.printf("[FEED] relay clamp note: %s\n", r.note);
+      s_opt_feeding = true;
+      s_opt_feeding_until = millis() + (uint32_t)r.seconds * 1000UL + 2000UL;
       Serial.printf("[FEED] feed OK via %s (%u s)\n", r.ip, (unsigned)r.seconds);
       refreshNextFeedUi();
     } else if (r.manual) {
       lvgl_port_lock(-1);
+      ui_set_feed_busy(false);
       ui_toast(String("Feed failed: ") + r.error);
       lvgl_port_unlock();
       Serial.printf("[FEED] manual feed FAILED: %s\n", r.error);
     } else {
       // scheduled feed
-      if (r.retry || s_retry.pending) {
-        s_retry.pending = false;
+      if (r.retry) {
         uiToast(String("Feed FAILED: ") + r.error);
         Serial.printf("[FEED] scheduled feed FAILED (no more retries): %s\n",
                       r.error);
-      } else {
-        s_retry.pending = true;
-        s_retry.hour = r.hour;
-        s_retry.minute = r.minute;
-        s_retry.seconds = r.seconds;
-        s_retry.dueMs = millis() + 30000UL;
+      } else if (armRetry(r.hour, r.minute, r.seconds, 30000UL)) {
         uiToast("Feed failed - retrying in 30 s");
         Serial.printf("[FEED] scheduled feed failed (%s), retry armed\n",
                       r.error);
+      } else {
+        uiToast(String("Feed FAILED: ") + r.error);
+        Serial.println("[FEED] scheduled feed FAILED (retry slots full)");
       }
     }
     return;
   }
 
   // RES_PROBE
+  s_opt_feeding = false; // a real /status result supersedes the optimistic state
   lvgl_port_lock(-1);
+  ui_set_probe_busy(false);
   ui_set_relay(r.online, r.ip, r.feeding);
   if (r.report) {
     if (!net_wifi::wifi_is_connected())
@@ -299,10 +390,10 @@ void setup() {
     Serial.println("[SYS] ERROR: LVGL port init failed");
   }
 
-  // --- build UI under lock ---
+  // build UI under lock
   lvgl_port_lock(-1);
   ui_init();
-  ui_set_backlight_cb(appSetBacklight, true);
+  ui_set_backlight_cb(appSetBacklight, prefs::getBacklightOn());
   ui_set_relay(false, prefs::getRelayIp());
   ui_set_last_feed(formatLastFed(prefs::getLastFedEpoch()));
   lvgl_port_unlock();
@@ -349,16 +440,26 @@ void loop() {
       requestFeed(due.seconds, false, due.hour, due.minute, false);
     }
 
-    // armed retry for a failed scheduled feed
-    if (s_retry.pending && (int32_t)(now - s_retry.dueMs) >= 0) {
-      s_retry.pending = false;
-      Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u s)\n",
-                    (unsigned)s_retry.hour, (unsigned)s_retry.minute,
-                    (unsigned)s_retry.seconds);
-      requestFeed(s_retry.seconds, false, s_retry.hour, s_retry.minute, true);
+    // armed retries for failed scheduled feeds (one delayed attempt each)
+    for (SchedRetry &s : s_retries) {
+      if (s.pending && (int32_t)(now - s.dueMs) >= 0) {
+        s.pending = false;
+        Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u s)\n",
+                      (unsigned)s.hour, (unsigned)s.minute,
+                      (unsigned)s.seconds);
+        requestFeed(s.seconds, false, s.hour, s.minute, true);
+      }
     }
 
-    // UI housekeeping (clock, countdown, relay dot)
+    // end of the optimistic feeding indicator (pulse + 2 s elapsed)
+    if (s_opt_feeding && (int32_t)(now - s_opt_feeding_until) >= 0) {
+      s_opt_feeding = false;
+      lvgl_port_lock(-1);
+      ui_set_relay(true, relay_client::ip(), false);
+      lvgl_port_unlock();
+    }
+
+    // UI housekeeping (clock, countdown, relay dot, idle dim)
     lvgl_port_lock(-1);
     ui_tick();
     lvgl_port_unlock();

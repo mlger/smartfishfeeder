@@ -21,6 +21,7 @@ char s_token[CATFISH_TOKEN_LEN] = CATFISH_DEFAULT_TOKEN;
 char s_relay_ip[16] = {0};
 uint8_t s_pulse = CATFISH_DEFAULT_PULSE_S;
 uint32_t s_last_fed = 0;
+bool s_bl_on = true;
 
 // Guards s_token: written by loop(), read by the net worker task.
 portMUX_TYPE s_token_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -54,6 +55,7 @@ bool begin() {
     s_pulse = CATFISH_DEFAULT_PULSE_S;
 
   s_last_fed = s_nvs.getULong("lastFed", 0);
+  s_bl_on = s_nvs.getBool("blOn", true);
 
   s_loaded = true;
   Serial.println("[SYS] prefs loaded from NVS (namespace 'catfish')");
@@ -112,6 +114,13 @@ uint32_t getLastFedEpoch() { return s_last_fed; }
 void setLastFedEpoch(uint32_t epoch) {
   s_last_fed = epoch;
   if (s_loaded && s_nvs.putULong("lastFed", epoch) == 0) nvsLogFail("lastFed");
+}
+
+bool getBacklightOn() { return s_bl_on; }
+
+void setBacklightOn(bool on) {
+  s_bl_on = on;
+  if (s_loaded && !s_nvs.putBool("blOn", on)) nvsLogFail("blOn");
 }
 
 } // namespace prefs
