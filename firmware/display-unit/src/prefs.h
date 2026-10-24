@@ -91,6 +91,13 @@ void setMqttPrefix(const String &prefix);
 bool getBacklightOn();
 void setBacklightOn(bool on);
 
+/**
+ * Clock presentation (v1.6.0): true = 12-hour ("7:30 AM"), false = 24-hour
+ * ("07:30"). Presentation only — schedules, MQTT and the HTTP API stay 24h.
+ */
+bool getHour12();
+void setHour12(bool h12);
+
 // ---- History ----
 /** Unix epoch (UTC) of last successful feed, 0 = never. */
 uint32_t getLastFedEpoch();

@@ -69,6 +69,7 @@ void handleStatus() {
   doc["pulse"] = s_snap.pulse;
   doc["schedCount"] = s_snap.schedCount;
   doc["clockValid"] = s_snap.clockValid;
+  doc["hour12"] = s_snap.hour12; // v1.6.0: format "nextFeed"/last-feed for display
   doc["version"] = s_snap.version;
   doc["mqtt"] = s_snap.mqtt;
   doc["mqttState"] = s_snap.mqttState;

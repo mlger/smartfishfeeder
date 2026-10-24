@@ -147,6 +147,8 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 | Relay active level | Relay Unit `config.h` | board-dependent | `RELAY_ACTIVE_LEVEL` compile-time constant — set to match your relay board (many are ACTIVE-LOW), re-flash |
 | Timezone | Display Unit | Asia/Manila | POSIX TZ string `PHT-8` (UTC+8, no DST); schedule times are local |
 | NTP | Display Unit | pool servers | Synced periodically; UI shows synced time |
+| Battery clock | Display Unit | on (auto-detected) | PCF85063 + CR927 coin cell keeps time through power loss (v1.6.0) — see [Battery-backed RTC](#battery-backed-rtc-v160); status in Settings → System |
+| Clock format | Display Unit | 24-hour | Settings → Display → *12-hour clock* switch (v1.6.0, persisted). Presentation only — schedules, MQTT and the HTTP API stay 24-hour |
 | Backlight | Display Unit | on | Settings → Display → Backlight switch (persisted across reboots); screen auto-dims after 10 min idle and wakes on touch |
 | MQTT / Home Assistant | Display Unit | disabled | Settings → HOME ASSISTANT (MQTT) → *Configure*: broker, port, credentials, topic prefix — topic map and behaviour in [mqtt.md](mqtt.md) |
 | Feeding mechanism | Relay Unit | `motor` | Display UI: Settings → Relay Unit → *Mechanism* → *Configure* (motor / servo / stepper + servo angles / stepper rate), or `POST /config` with `{"mechanism":...}` — semantics and wiring in [api.md](api.md#feeding-mechanisms-v140). Stored in a separate EEPROM record; factory reset restores `motor` |
@@ -181,6 +183,19 @@ One display unit can drive up to **4 relay units** (one per tank). The relay fir
 - **Single-tank setups are unchanged**: with the count at 1 there are no chips, no checkboxes, and behavior is byte-for-byte the pre-v1.5.0 flow (the legacy `relayIp` NVS key is migrated to tank 1 on first boot).
 
 Multi-relay caveat: all relay units share the `catfish-relay` mDNS hostname, so UDP broadcast is the authoritative multi-relay discovery (mDNS remains a fallback candidate for single-tank setups). If two relays answer UDP from the same broadcast domain, each tank binds to a different one automatically.
+
+## Battery-backed RTC (v1.6.0)
+
+The display board carries an **NXP PCF85063** real-time clock backed by a **CR927 coin cell** (holder on the board rear). Before v1.6.0 the chip sat unused: after a power loss the device booted clock-less and stayed that way until NTP synced — schedules didn't fire and *last fed* was unknown on offline boots.
+
+What the firmware does now:
+
+- **Boot restore** — if the chip holds a plausible time (≥ 2024), it is applied via `settimeofday()` *before* the UI starts, so schedules and the clock are correct immediately, even with no WiFi/NTP.
+- **NTP write-back** — after the first real NTP sync each boot, the wall clock is written back into the chip (clears the oscillator-stop flag), keeping the CR927 time fresh.
+- **Status** — Settings → System shows the RTC state: `battery OK`, `battery dead/absent` (oscillator-stop flag latched → replace the CR927), `time never set` (chip alive but no valid time yet), or `not present`.
+- **Shared I2C bus** — the RTC, GT911 touch controller and CH422G expander share one I2C bus (SDA GPIO8 / SCL GPIO9). Arduino `Wire` owns the legacy I2C driver and the panel stack attaches to it (`ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST` / `ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST` = 1 in `include/esp_panel_board_custom_conf.h`). Do **not** set those flags back to 0 — the panel would try to re-install the driver Wire already owns and the touch/expander would fail.
+
+All stored/derived times are UTC internally; the `PHT-8` timezone applies at render time only.
 
 ## OTA updates
 

@@ -19,6 +19,7 @@
 #include <time.h>
 #include <catfish_protocol.h>
 #include <catfish_mech.h>
+#include <catfish_time.h>
 #include "../feed_scheduler.h"
 #include "../prefs.h"
 
@@ -84,6 +85,8 @@ lv_obj_t *s_ed_tank_cb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr}
 // Settings
 lv_obj_t *s_sb_pulse = nullptr;
 lv_obj_t *s_sw_bl = nullptr;
+lv_obj_t *s_sw_h12 = nullptr; // v1.6.0: 12-hour clock switch
+lv_obj_t *s_lbl_rtc = nullptr; // v1.6.0: Settings > System RTC status line
 lv_obj_t *s_lbl_ssid = nullptr;
 lv_obj_t *s_lbl_ip = nullptr;
 lv_obj_t *s_lbl_rssi = nullptr;
@@ -141,6 +144,7 @@ lv_timer_t *s_toast_tmr = nullptr;
 void (*s_bl_cb)(bool) = nullptr;
 bool s_bl_on = true;   // user preference (persisted via UI_EVT_SET_BL)
 bool s_dimmed = false; // transient: screen auto-dimmed after idle timeout
+bool s_hour12 = false; // v1.6.0: clock presentation (persisted via UI_EVT_SET_FMT12)
 bool s_relay_online = false;
 bool s_relay_feeding = false;
 bool s_dot_blink = false;
@@ -150,9 +154,9 @@ int s_next_hour = 0;
 int s_next_minute = 0;
 
 char s_relay_ip_cache[16] = "";
-char s_hour_opts[96] = "";
+char s_hour_opts[168] = ""; // 24h "00".."23" or 12h "12 AM".."11 PM" (v1.6.0)
 char s_min_opts[216] = "";
-char s_clock_cache[8] = "";
+char s_clock_cache[12] = ""; // "07:30" or "11:59 PM"
 char s_val_cache[24] = "";
 char s_sub_cache[28] = "";
 
@@ -188,6 +192,7 @@ void editorSaveCb(lv_event_t *e);
 void editorCancelCb(lv_event_t *e);
 void pulseSpinCb(lv_event_t *e);
 void blSwitchCb(lv_event_t *e);
+void h12SwitchCb(lv_event_t *e);
 void relayTestCb(lv_event_t *e);
 void rebootCb(lv_event_t *e);
 void toastTimerCb(lv_timer_t *t);
@@ -317,10 +322,18 @@ lv_obj_t *makeSpinRow(lv_obj_t *parent, int32_t mn, int32_t mx, int32_t val,
 }
 
 void buildRollerOptions() {
+  // Hour options: the roller's SELECTED INDEX is always the 24-hour hour
+  // value (editorSaveCb uses it directly) — only the LABELS change per format.
   s_hour_opts[0] = '\0';
+  char b[12];
   for (int i = 0; i < 24; i++) {
-    char b[4];
-    snprintf(b, sizeof(b), "%02d", i);
+    if (s_hour12) {
+      int h12 = i % 12;
+      if (h12 == 0) h12 = 12;
+      snprintf(b, sizeof(b), "%d %s", h12, i < 12 ? "AM" : "PM");
+    } else {
+      snprintf(b, sizeof(b), "%02d", i);
+    }
     strcat(s_hour_opts, b);
     if (i < 23) strcat(s_hour_opts, "\n");
   }
@@ -512,6 +525,16 @@ void blSwitchCb(lv_event_t *e) {
   ev.flag = on;
   uiEventSend(ev); // loop() persists the preference
   Serial.printf("[UI] backlight %s\n", on ? "ON" : "OFF");
+}
+
+void h12SwitchCb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  const bool h12 = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  UiEvent ev;
+  ev.type = UI_EVT_SET_FMT12;
+  ev.flag = h12;
+  uiEventSend(ev); // loop() persists + re-renders dependent labels
+  Serial.printf("[UI] clock format -> %s\n", h12 ? "12-hour" : "24-hour");
 }
 
 void relayTestCb(lv_event_t *e) {
@@ -707,6 +730,8 @@ void rebuildScheduleList() {
                           LV_FLEX_ALIGN_CENTER);
 
     char buf[40];
+    char hm[12];
+    catfishFormatHm(hm, sizeof(hm), en.hour, en.minute, s_hour12);
     if (s_tank_count > 1) {
       // P5: append the target-tank tag, e.g. "07:30 • 3 s • T1+T3"
       char tag[16] = {0};
@@ -717,12 +742,11 @@ void rebuildScheduleList() {
                          (unsigned)(b + 1));
         }
       }
-      snprintf(buf, sizeof(buf), "%02u:%02u  \xE2\x80\xA2  %u s  \xE2\x80\xA2  T%s",
-               (unsigned)en.hour, (unsigned)en.minute, (unsigned)en.seconds,
-               tag[0] ? tag : "1");
+      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  T%s",
+               hm, (unsigned)en.seconds, tag[0] ? tag : "1");
     } else {
-      snprintf(buf, sizeof(buf), "%02u:%02u  \xE2\x80\xA2  %u s",
-               (unsigned)en.hour, (unsigned)en.minute, (unsigned)en.seconds);
+      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s", hm,
+               (unsigned)en.seconds);
     }
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, buf);
@@ -1064,21 +1088,48 @@ void buildSettings() {
   lv_obj_set_flex_grow(lbl_p, 1);
   s_sb_pulse = makeSpinRow(card_feed, 1, 30, prefs::getDefaultPulse(), pulseSpinCb);
 
-  // -- Display card
-  lv_obj_t *card_disp = makeCard(list, lv_pct(100), 100);
-  lv_obj_set_flex_flow(card_disp, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(card_disp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+  // -- Display card (backlight + clock format rows)
+  lv_obj_t *card_disp = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_disp, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_disp, 10, 0);
+
+  lv_obj_t *row_bl = lv_obj_create(card_disp);
+  lv_obj_remove_style_all(row_bl);
+  lv_obj_set_width(row_bl, lv_pct(100));
+  lv_obj_set_height(row_bl, 44);
+  lv_obj_set_flex_flow(row_bl, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row_bl, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_column(card_disp, 12, 0);
-  lv_obj_t *lbl_d = lv_label_create(card_disp);
+  lv_obj_set_style_pad_column(row_bl, 12, 0);
+  lv_obj_clear_flag(row_bl, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *lbl_d = lv_label_create(row_bl);
   lv_label_set_text(lbl_d, "Backlight");
   lv_obj_set_style_text_font(lbl_d, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(lbl_d, lv_color_hex(C_TEXT), 0);
   lv_obj_set_flex_grow(lbl_d, 1);
-  s_sw_bl = lv_switch_create(card_disp);
+  s_sw_bl = lv_switch_create(row_bl);
   lv_obj_set_size(s_sw_bl, 72, 36);
   if (s_bl_on) lv_obj_add_state(s_sw_bl, LV_STATE_CHECKED);
   lv_obj_add_event_cb(s_sw_bl, blSwitchCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *row_h12 = lv_obj_create(card_disp);
+  lv_obj_remove_style_all(row_h12);
+  lv_obj_set_width(row_h12, lv_pct(100));
+  lv_obj_set_height(row_h12, 44);
+  lv_obj_set_flex_flow(row_h12, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row_h12, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row_h12, 12, 0);
+  lv_obj_clear_flag(row_h12, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *lbl_h12 = lv_label_create(row_h12);
+  lv_label_set_text(lbl_h12, "12-hour clock");
+  lv_obj_set_style_text_font(lbl_h12, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_h12, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(lbl_h12, 1);
+  s_sw_h12 = lv_switch_create(row_h12);
+  lv_obj_set_size(s_sw_h12, 72, 36);
+  if (s_hour12) lv_obj_add_state(s_sw_h12, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(s_sw_h12, h12SwitchCb, LV_EVENT_VALUE_CHANGED, nullptr);
 
   // -- Network card
   lv_obj_t *card_net = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
@@ -1237,6 +1288,10 @@ void buildSettings() {
   lv_label_set_text(ver, "Firmware v" CATFISH_APP_VERSION "  (display-unit)");
   lv_obj_set_style_text_font(ver, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(ver, lv_color_hex(C_MUTED), 0);
+  s_lbl_rtc = lv_label_create(card_sys);
+  lv_label_set_text(s_lbl_rtc, "RTC: checking...");
+  lv_obj_set_style_text_font(s_lbl_rtc, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_lbl_rtc, lv_color_hex(C_MUTED), 0);
   lv_obj_t *rb = makeBtn(card_sys, LV_SYMBOL_POWER "  Reboot", 0x7E352F,
                          C_TEXT, 0x652A25, lv_pct(100), 64);
   lv_obj_add_event_cb(rb, rebootCb, LV_EVENT_CLICKED, nullptr);
@@ -1278,10 +1333,13 @@ void updateNextFeedUi() {
     snprintf(sub, sizeof(sub), "in <1 m");
 
   char val[24];
-  if (s_next_tomorrow)
-    snprintf(val, sizeof(val), "Tmrw %02d:%02d", s_next_hour, s_next_minute);
-  else
-    snprintf(val, sizeof(val), "%02d:%02d", s_next_hour, s_next_minute);
+  if (s_next_tomorrow) {
+    char hm[12];
+    catfishFormatHm(hm, sizeof(hm), s_next_hour, s_next_minute, s_hour12);
+    snprintf(val, sizeof(val), "Tmrw %s", hm);
+  } else {
+    catfishFormatHm(val, sizeof(val), s_next_hour, s_next_minute, s_hour12);
+  }
 
   if (strcmp(val, s_val_cache) != 0) {
     strlcpy(s_val_cache, val, sizeof(s_val_cache));
@@ -2018,12 +2076,12 @@ void ui_tick() {
     Serial.println("[UI] backlight wake (touch)");
   }
 
-  // clock (all status bars)
+  // clock (all status bars) — 12/24h per the user preference (v1.6.0)
   const time_t now = time(nullptr);
   struct tm lt;
-  char hhmm[8];
+  char hhmm[12];
   if (localtime_r(&now, &lt) && lt.tm_year >= (2025 - 1900))
-    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
+    catfishFormatHm(hhmm, sizeof(hhmm), lt.tm_hour, lt.tm_min, s_hour12);
   else
     snprintf(hhmm, sizeof(hhmm), "--:--");
 
@@ -2249,6 +2307,33 @@ void ui_set_mqtt_broker(const String &text) {
 
 void ui_set_pulse(uint8_t seconds) {
   if (s_sb_pulse) lv_spinbox_set_value(s_sb_pulse, seconds);
+}
+
+void ui_set_hour12(bool h12) {
+  s_hour12 = h12;
+  buildRollerOptions();
+  if (s_r_hour) {
+    // the roller's selected INDEX is the 24-hour value — preserve it across
+    // the relabel (index semantics are format-independent)
+    const uint16_t sel = (uint16_t)lv_roller_get_selected(s_r_hour);
+    lv_roller_set_options(s_r_hour, s_hour_opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_selected(s_r_hour, sel, LV_ANIM_OFF);
+  }
+  if (s_sw_h12) {
+    if (h12)
+      lv_obj_add_state(s_sw_h12, LV_STATE_CHECKED);
+    else
+      lv_obj_clear_state(s_sw_h12, LV_STATE_CHECKED);
+  }
+  // force cached clock/countdown/labels to repaint on the next tick
+  s_clock_cache[0] = '\0';
+  s_val_cache[0] = '\0';
+  s_sub_cache[0] = '\0';
+  rebuildScheduleList(); // schedule card labels carry the format too
+}
+
+void ui_set_rtc(const String &text) {
+  if (s_lbl_rtc) lv_label_set_text_fmt(s_lbl_rtc, "RTC: %s", text.c_str());
 }
 
 void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz) {
