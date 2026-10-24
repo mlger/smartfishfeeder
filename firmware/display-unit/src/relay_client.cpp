@@ -1,6 +1,9 @@
 /**
  * @file relay_client.cpp
  * @brief LAN HTTP + mDNS + UDP-broadcast client for the ESP8266 relay unit.
+ *
+ * NOT thread-safe by design: all calls happen from the net worker task
+ * (net_worker.cpp), which serializes every request.
  */
 #include "relay_client.h"
 #include <Arduino.h>
@@ -10,6 +13,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiUdp.h>
+#include <catfish_protocol.h>
 #include "net_wifi.h"
 #include "prefs.h"
 
@@ -47,8 +51,27 @@ int httpReq(const String &url, bool post, const String &body,
 
 bool healthCheck(const String &ip, int timeout_ms) {
   String resp;
-  int code = httpReq("http://" + ip + "/health", false, "", timeout_ms, resp);
+  int code = httpReq("http://" + ip + CATFISH_EP_HEALTH, false, "", timeout_ms, resp);
   return (code >= 200 && code < 300);
+}
+
+/** Map an error HTTP response body ({"ok":false,"error":"..."}) to friendly text. */
+String describeError(int code, const String &body) {
+  String err;
+  JsonDocument doc;
+  if (deserializeJson(doc, body) == DeserializationError::Ok) {
+    err = String((const char *)(doc["error"] | ""));
+  }
+  if (err == "auth") return "Token mismatch";
+  if (err == "busy") return "Relay busy";
+  if (err == "bad_seconds") return "Invalid duration";
+  if (err == "bad_json") return "Bad request";
+  if (err.length()) return err; // relay-defined error string, pass through
+  // No parsable body: fall back to the status code.
+  if (code == 401 || code == 403) return "Token mismatch";
+  if (code == 409) return "Relay busy";
+  if (code < 0) return "No response";
+  return "HTTP " + String(code);
 }
 
 } // anonymous namespace
@@ -86,12 +109,13 @@ Result discover() {
     Serial.printf("[NET] saved relay IP %s not responding\n", s_ip.c_str());
   }
 
-  // (2) mDNS query for "catfish-relay" (we advertise as "catfishfeeder")
-  IPAddress resolved = MDNS.queryHost("catfish-relay", 2000);
+  // (2) mDNS query for the relay hostname (we advertise as catfishfeeder)
+  IPAddress resolved = MDNS.queryHost(CATFISH_RELAY_HOSTNAME, 2000);
   if (resolved != IPAddress(0, 0, 0, 0)) {
     String mIp = resolved.toString();
     if (validIpString(mIp)) {
-      Serial.printf("[NET] mDNS resolved catfish-relay -> %s\n", mIp.c_str());
+      Serial.printf("[NET] mDNS resolved %s -> %s\n", CATFISH_RELAY_HOSTNAME,
+                    mIp.c_str());
       s_ip = mIp;
       prefs::setRelayIp(mIp);
       r.ok = true;
@@ -100,12 +124,25 @@ Result discover() {
     }
   }
 
-  // (3) UDP broadcast discovery on port 5050
+  // (3) UDP broadcast discovery. Some APs filter 255.255.255.255, so we send
+  // to both the global and the subnet-directed broadcast address.
+  const uint32_t lip = (uint32_t)WiFi.localIP();
+  const uint32_t mask = (uint32_t)WiFi.subnetMask();
+  const IPAddress subnetBc((lip & mask) | (~mask));
   WiFiUDP udp;
-  if (udp.begin(5051)) { // local (source) port; relay replies here
-    udp.beginPacket(IPAddress(255, 255, 255, 255), 5050);
-    udp.print("CATFISH_DISCOVER\n");
+  bool bound = false;
+  for (uint16_t port = 5051; port <= 5055 && !bound; port++) {
+    bound = udp.begin(port); // local (source) port; relay replies here
+  }
+  if (bound) {
+    udp.beginPacket(IPAddress(255, 255, 255, 255), CATFISH_DISCOVERY_UDP_PORT);
+    udp.print(CATFISH_DISCOVERY_REQ "\n");
     udp.endPacket();
+    if (subnetBc != IPAddress(255, 255, 255, 255)) {
+      udp.beginPacket(subnetBc, CATFISH_DISCOVERY_UDP_PORT);
+      udp.print(CATFISH_DISCOVERY_REQ "\n");
+      udp.endPacket();
+    }
 
     const uint32_t t0 = millis();
     while (millis() - t0 < 1500) {
@@ -116,8 +153,8 @@ Result discover() {
         String line(buf);
         line.trim();
         Serial.printf("[NET] discovery reply: '%s'\n", line.c_str());
-        if (line.startsWith("CATFISH_RELAY|")) {
-          String found = line.substring(14);
+        if (line.startsWith(CATFISH_DISCOVERY_RSP_PREFIX)) {
+          String found = line.substring(strlen(CATFISH_DISCOVERY_RSP_PREFIX));
           int nl = found.indexOf('\n');
           if (nl >= 0) found = found.substring(0, nl);
           found.trim();
@@ -135,6 +172,8 @@ Result discover() {
       delay(10);
     }
     udp.stop();
+  } else {
+    Serial.println("[NET] discovery UDP bind failed (ports 5051-5055)");
   }
 
   // (4) fail
@@ -165,14 +204,14 @@ Result feed(uint8_t seconds) {
   String body;
   serializeJson(doc, body);
 
-  const String url = "http://" + s_ip + "/feed";
+  const String url = "http://" + s_ip + CATFISH_EP_FEED;
   Serial.printf("[FEED] POST %s (%u bytes)\n", url.c_str(),
                 (unsigned)body.length());
 
   String resp;
   const int code = httpReq(url, true, body, 6000, resp);
   if (code != 200) {
-    r.error = "HTTP " + String(code);
+    r.error = describeError(code, resp);
     return r;
   }
 
@@ -182,7 +221,7 @@ Result feed(uint8_t seconds) {
     return r;
   }
   if (!(rd["ok"] | false)) {
-    r.error = "Relay refused";
+    r.error = describeError(code, resp);
     return r;
   }
 
@@ -204,9 +243,9 @@ Status fetchStatus() {
   }
 
   String resp;
-  const int code = httpReq("http://" + s_ip + "/status", false, "", 3000, resp);
+  const int code = httpReq("http://" + s_ip + CATFISH_EP_STATUS, false, "", 3000, resp);
   if (code != 200) {
-    st.error = "HTTP " + String(code);
+    st.error = describeError(code, resp);
     return st;
   }
 

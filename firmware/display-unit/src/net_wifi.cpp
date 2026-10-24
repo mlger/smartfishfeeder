@@ -23,6 +23,7 @@ volatile bool s_connected = false;
 char s_ip[16] = {0};
 char s_ssid[33] = {0};
 volatile int s_rssi = 0;
+bool s_mdns_started = false;
 
 void publish() {
   strlcpy(s_ip, WiFi.localIP().toString().c_str(), sizeof(s_ip));
@@ -30,16 +31,22 @@ void publish() {
   s_rssi = WiFi.RSSI();
 }
 
-/** Called on every (re)connect: sleep off, mDNS, NTP Asia/Manila (UTC+8). */
+/** Called on every (re)connect: sleep off, mDNS (once), NTP Asia/Manila (UTC+8). */
 void applyConnectedState() {
   WiFi.setSleep(false);
-  if (MDNS.begin(WIFI_HOSTNAME)) {
-    Serial.println("[NET] mDNS started as 'catfishfeeder'");
+  if (!s_mdns_started) {
+    // MDNS.begin() fails when already started; guard so reconnect logs stay honest.
+    if (MDNS.begin(WIFI_HOSTNAME)) {
+      s_mdns_started = true;
+      Serial.println("[NET] mDNS started as 'catfishfeeder'");
+    }
   }
   configTzTime("PHT-8", "pool.ntp.org", "time.nist.gov"); // Asia/Manila UTC+8
 }
 
 void wifiTask(void * /*param*/) {
+  // Don't mirror credentials into NVS on every connect (NVS wear).
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(WIFI_HOSTNAME);
   WiFi.setAutoReconnect(true);

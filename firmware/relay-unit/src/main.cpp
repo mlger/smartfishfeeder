@@ -394,7 +394,7 @@ static void handleFeedGet() {
 }
 
 static void handleRoot() {
-  char page[640];
+  char page[768];  // literals ~380 B + values; snprintf truncates safely anyway
   const char* state = g_feeding ? "FEEDING" : "ready";
   char lastFeed[24];
   snprintf(lastFeed, sizeof(lastFeed), "%u", (unsigned)g_cfg.lastFeedEpoch);

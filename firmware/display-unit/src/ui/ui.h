@@ -6,8 +6,9 @@
  *  - Every ui_* function must be called while the caller holds
  *    lvgl_port_lock() (main loop does; LVGL callbacks run inside the LVGL
  *    task which already owns the mutex).
- *  - Event callbacks NEVER do blocking network I/O; they only set the
- *    volatile request flags below, which loop() consumes.
+ *  - Event callbacks NEVER do blocking network I/O, flash writes, or
+ *    scheduler mutations. They only enqueue a UiEvent (FreeRTOS queue),
+ *    which loop() consumes.
  */
 #ifndef CATFISH_UI_H
 #define CATFISH_UI_H
@@ -15,14 +16,32 @@
 #include <Arduino.h>
 #include <stdint.h>
 
-#define CATFISH_APP_VERSION "0.1.0"
+// Single source of truth is platformio.ini (-DCATFISH_APP_VERSION="1.0.0");
+// this fallback keeps IDE tooling happy and avoids macro redefinition.
+#ifndef CATFISH_APP_VERSION
+#define CATFISH_APP_VERSION "1.0.0"
+#endif
 
-// ---- Cross-thread request flags (written by LVGL callbacks, consumed by loop()) ----
-extern volatile bool   g_feed_request;      // manual FEED NOW pressed
-extern volatile uint8_t g_feed_seconds;     // requested pulse seconds
-extern volatile bool   g_relay_test_request; // Settings "Test connection" pressed
-extern volatile bool   g_reboot_request;     // Settings "Reboot" pressed
-extern volatile bool   g_schedule_dirty;     // schedule CRUD happened; loop() refreshes next-feed
+// ---- Events: LVGL callbacks -> loop() (payload-bearing, race-free) ----
+enum UiEventType : uint8_t {
+  UI_EVT_FEED = 0,      // FEED NOW pressed      (a=seconds, flag=manual)
+  UI_EVT_RELAY_TEST,    // "Test connection" pressed
+  UI_EVT_REBOOT,        // "Reboot" pressed
+  UI_EVT_SET_PULSE,     // default pulse changed (a=seconds)
+  UI_EVT_SET_TOKEN,     // pairing token saved   (token=new token)
+  UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s)
+  UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
+  UI_EVT_SCHED_PERSIST, // enable switch flipped (loop flushes NVS)
+};
+
+struct UiEvent {
+  UiEventType type;
+  uint8_t a = 0;
+  uint8_t b = 0;
+  uint8_t c = 0;
+  bool flag = false;
+  char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
+};
 
 namespace ui {
 
@@ -32,14 +51,17 @@ void ui_init();
 /** 1 Hz housekeeping: clock, next-feed countdown, relay dot pulse. Caller holds lock. */
 void ui_tick();
 
-/** WiFi state for the status-bar symbol and Settings > Network card. */
-void ui_set_wifi(bool connected, String ssid, String ip, int rssi);
+/** Non-blocking event drain for loop(). @return false when the queue is empty. */
+bool ui_event_receive(UiEvent &out);
 
-/** Relay unit state for Home card and Settings card. */
-void ui_set_relay(bool online, String ip);
+/** WiFi state for the status-bar symbol and Settings > Network card. */
+void ui_set_wifi(bool connected, const String &ssid, const String &ip, int rssi);
+
+/** Relay unit state for Home card and Settings card (feeding shows on Home). */
+void ui_set_relay(bool online, const String &ip, bool feeding = false);
 
 /** Free-text next-feed line (also clears the structured countdown target). */
-void ui_set_next_feed(String text);
+void ui_set_next_feed(const String &text);
 
 /**
  * Structured next-feed target so ui_tick() can render a live countdown
@@ -48,16 +70,25 @@ void ui_set_next_feed(String text);
 void ui_set_next_feed_time(int hour, int minute, bool tomorrow, bool valid);
 
 /** "Last fed" card text, e.g. "Today 07:30". */
-void ui_set_last_feed(String text);
+void ui_set_last_feed(const String &text);
 
 /** Transient toast message (auto-hides after ~2.2 s). */
-void ui_toast(String msg);
+void ui_toast(const String &msg);
 
 /** Register the backlight on/off handler (no PWM on this board) + initial state. */
 void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on);
 
 /** Request a manual feed (safe to call from LVGL callbacks). */
 void ui_request_feed(uint8_t seconds);
+
+/** Disable/re-enable FEED NOW while a feed request is in flight. */
+void ui_set_feed_busy(bool busy);
+
+/** Rebuild the schedule list from feed_scheduler (caller holds the lock). */
+void ui_schedule_refresh();
+
+/** Close the schedule editor overlay (e.g. after a successful add). */
+void ui_editor_close();
 
 } // namespace ui
 

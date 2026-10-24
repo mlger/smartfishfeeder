@@ -13,6 +13,7 @@ FeedTime s_entries[feed_scheduler::MAX_FEED_TIMES];
 // minute-of-day when each entry last fired (0xFFFF = never this minute)
 uint16_t s_last_fired[feed_scheduler::MAX_FEED_TIMES];
 int s_count = 0;
+bool s_dirty = false;
 
 void resetFireTracking() {
   for (int i = 0; i < feed_scheduler::MAX_FEED_TIMES; i++) s_last_fired[i] = 0xFFFF;
@@ -25,7 +26,8 @@ void clampEntry(FeedTime &t) {
   if (t.seconds > 30) t.seconds = 30;
 }
 
-bool persist() {
+/** Serialize + write to NVS now (call only from loop()/init context). */
+bool persistNow() {
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   for (int i = 0; i < s_count; i++) {
@@ -37,8 +39,8 @@ bool persist() {
   }
   String out;
   serializeJson(doc, out);
-  prefs::setScheduleJson(out);
-  return true;
+  s_dirty = false;
+  return prefs::setScheduleJson(out);
 }
 
 void seedDefaults() {
@@ -46,7 +48,7 @@ void seedDefaults() {
   s_entries[0] = FeedTime{7, 30, true, 3};   // 07:30, 3 s
   s_entries[1] = FeedTime{17, 30, true, 3};  // 17:30, 3 s
   resetFireTracking();
-  persist();
+  s_dirty = true;
   Serial.println("[FEED] first boot: seeded default schedule 07:30 + 17:30 (3 s)");
 }
 
@@ -88,6 +90,11 @@ bool init() {
   return true;
 }
 
+bool flushIfDirty() {
+  if (!s_dirty) return false;
+  return persistNow();
+}
+
 int getCount() { return s_count; }
 
 const FeedTime *getAll() { return s_entries; }
@@ -102,9 +109,13 @@ bool add(const FeedTime &ft) {
   if (s_count >= MAX_FEED_TIMES) return false;
   FeedTime t = ft;
   clampEntry(t);
+  // reject duplicate HH:MM (UI surfaces a clearer message than "full")
+  for (int i = 0; i < s_count; i++) {
+    if (s_entries[i].hour == t.hour && s_entries[i].minute == t.minute) return false;
+  }
   s_last_fired[s_count] = 0xFFFF;
   s_entries[s_count++] = t;
-  persist();
+  s_dirty = true;
   return true;
 }
 
@@ -115,21 +126,31 @@ bool remove(int index) {
     s_last_fired[i] = s_last_fired[i + 1];
   }
   s_count--;
-  persist();
+  s_dirty = true;
   return true;
+}
+
+bool removeByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds) {
+  for (int i = 0; i < s_count; i++) {
+    if (s_entries[i].hour == hour && s_entries[i].minute == minute &&
+        s_entries[i].seconds == seconds) {
+      return remove(i);
+    }
+  }
+  return false;
 }
 
 bool setEnabled(int index, bool enabled) {
   if (index < 0 || index >= s_count) return false;
   s_entries[index].enabled = enabled;
-  persist();
+  s_dirty = true;
   return true;
 }
 
 bool toggle(int index) {
   if (index < 0 || index >= s_count) return false;
   s_entries[index].enabled = !s_entries[index].enabled;
-  persist();
+  s_dirty = true;
   return true;
 }
 
@@ -185,7 +206,7 @@ NextFeed nextOccurrence() {
   const int now_min = lt.tm_hour * 60 + lt.tm_min;
 
   int best_today = -1, best_tomorrow = -1;
-  uint8_t th = 0, tm_ = 0, wh = 0, wm = 0, ws = 0;
+  uint8_t th = 0, tm_ = 0, ws = 0, wh = 0, wm = 0, ws2 = 0;
 
   for (int i = 0; i < s_count; i++) {
     const FeedTime &e = s_entries[i];
@@ -201,6 +222,7 @@ NextFeed nextOccurrence() {
       best_tomorrow = em;
       wh = e.hour;
       wm = e.minute;
+      ws2 = e.seconds;
     }
   }
 
@@ -215,7 +237,7 @@ NextFeed nextOccurrence() {
     out.tomorrow = true;
     out.hour = wh;
     out.minute = wm;
-    out.seconds = 0;
+    out.seconds = ws2;
   }
   return out;
 }

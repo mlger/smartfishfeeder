@@ -6,6 +6,10 @@
  * (via prefs). tick() is called ~1 Hz from loop() and returns the entry
  * due at the current (NTP-synced) local HH:MM, firing each entry at most
  * once per calendar minute.
+ *
+ * Persistence is DEFERRED: mutations only mark a dirty flag (cheap, safe to
+ * call from the LVGL task); loop() calls flushIfDirty() ~1 Hz to serialize +
+ * write NVS. This keeps flash writes out of UI callbacks.
  */
 #ifndef CATFISH_FEED_SCHEDULER_H
 #define CATFISH_FEED_SCHEDULER_H
@@ -34,20 +38,34 @@ const FeedTime *getAll();
 
 bool getEntry(int index, FeedTime &out);
 
-/** Append an entry (clamped/validated). Returns false when full. Persists. */
+/**
+ * Append an entry (clamped/validated).
+ * @return false when full OR an entry with the same HH:MM already exists.
+ */
 bool add(const FeedTime &ft);
 
-/** Remove entry at index (shifts the rest). Persists. */
+/** Remove entry at index (shifts the rest). Marks persistence dirty. */
 bool remove(int index);
 
-/** Enable/disable an entry. Persists. */
+/** Remove the first entry matching h:m:s (identity-safe vs index shifts).
+ *  @return false when not found. */
+bool removeByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds);
+
+/** Enable/disable an entry. Marks persistence dirty. */
 bool setEnabled(int index, bool enabled);
 
-/** Flip an entry's enabled flag. Persists. */
+/** Flip an entry's enabled flag. Marks persistence dirty. */
 bool toggle(int index);
 
 /** true when local time looks NTP-synced (struct tm year >= 2025). */
 bool timeValid();
+
+/**
+ * Serialize the schedule and write it to NVS when dirty.
+ * Call ~1 Hz from loop().
+ * @return true when a flush actually happened.
+ */
+bool flushIfDirty();
 
 /**
  * Call ~every second from loop().
