@@ -47,6 +47,7 @@ enum UiEventType : uint8_t {
   UI_EVT_TANK_COUNT,    // P5: tank count changed (a=new count 1..4)
   UI_EVT_TANK_CFG,      // P5: tank saved (a=tank id 1-based, tankName/tankToken valid)
   UI_EVT_SCAN_TANKS,    // P5: "Scan for relays" pressed
+  UI_EVT_RF_FEED,       // v1.8.0: wireless node feed (a=seconds, 0 = default pulse; tankMask; from net_espnow/net_rf24 tasks)
 };
 
 struct UiEvent {
@@ -166,6 +167,9 @@ void ui_set_rtc(const String &text);
 
 /** v1.7.0: Settings > STORAGE card SD-card summary ("no card", "1.9 GB free"). */
 void ui_set_sd(const String &text);
+
+/** v1.8.0: Settings > RADIOS card status lines (ESP-NOW + nRF24L01). */
+void ui_set_radios(const String &espnow, const String &rf24);
 
 /** Request a manual feed (safe to call from LVGL callbacks). */
 void ui_request_feed(uint8_t seconds);

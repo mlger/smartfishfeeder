@@ -34,6 +34,8 @@
 #include "ui/ui.h"
 #include "pcf85063.h"
 #include "sd_log.h"
+#include "net_espnow.h"
+#include "net_rf24.h"
 #include <catfish_protocol.h>
 #include <catfish_mech.h>
 #include <catfish_time.h>
@@ -273,6 +275,39 @@ static void mqttSyncUi() {
   ui_set_mqtt_status(String(txt), state);
   ui_set_mqtt_broker(mqttBrokerSummary());
   lvgl_port_unlock();
+}
+
+// ---------------------------------------------------------------------------
+// Wireless feed nodes (v1.8.0): ESP-NOW + nRF24L01 status line + helpers
+// ---------------------------------------------------------------------------
+static uint8_t s_espnow_ui = 0xFF; // last ESP-NOW state painted on the card
+
+static void radiosUiSync() {
+  const uint8_t es = (uint8_t)net_espnow::state();
+  if (es == s_espnow_ui) return;
+  s_espnow_ui = es;
+  const char *et = "off";
+  switch ((net_espnow::State)es) {
+    case net_espnow::State::Disabled:   et = "disabled";          break;
+    case net_espnow::State::WaitingWifi: et = "waiting for WiFi"; break;
+    case net_espnow::State::Listening:  et = "listening";         break;
+    case net_espnow::State::Error:      et = "error";             break;
+  }
+  const char *rt = "off";
+  switch (net_rf24::state()) {
+    case net_rf24::State::Disabled:  rt = "disabled"; break;
+    case net_rf24::State::Listening: rt = "listening"; break;
+    case net_rf24::State::Error:     rt = "not found"; break;
+  }
+  lvgl_port_lock(-1);
+  ui_set_radios(String(et), String(rt));
+  lvgl_port_unlock();
+}
+
+/** Node keys derive from the GLOBAL pairing token — refresh on rotation. */
+static void rfNodeTokenChanged() {
+  net_espnow::onTokenChanged();
+  net_rf24::onTokenChanged();
 }
 
 /** "HH:MM" of the next enabled feeding ("none"/"" per scheduler state). */
@@ -541,6 +576,7 @@ static void handleUiEvent(const UiEvent &ev) {
       } else {
         prefs::setRelayToken(String(ev.token));
         relay_client::applyTankTokens(); // tanks without override inherit it
+        rfNodeTokenChanged(); // node packets re-key against the global token
         uiToast("Pairing token updated");
       }
       Serial.println("[NET] pairing token update requested");
@@ -672,6 +708,21 @@ static void handleUiEvent(const UiEvent &ev) {
       }
       break;
 
+    case UI_EVT_RF_FEED: {
+      // v1.8.0: wireless node (ESP-NOW / nRF24) pressed its feed button.
+      // Routes through the same manual-feed pipeline as touch/MQTT/dashboard.
+      const uint8_t mask =
+          ev.tankMask ? ev.tankMask
+                      : (s_selected_tank == 0xFE
+                             ? configuredTankMask()
+                             : (uint8_t)(1u << s_selected_tank));
+      const uint8_t seconds = ev.a ? ev.a : prefs::getDefaultPulse();
+      Serial.printf("[RF] node feed %u s (mask 0x%X)\n", (unsigned)seconds,
+                    (unsigned)mask);
+      requestFeed(seconds, true, 0, 0, false, mask);
+      break;
+    }
+
     default:
       break;
   }
@@ -684,6 +735,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
   if (r.kind == net_worker::Result::RES_TOKEN) {
     if (r.ok) {
       prefs::setRelayToken(String(r.token));
+      rfNodeTokenChanged(); // rotation changed the global token -> re-key nodes
       uiToast("Relay token updated");
       Serial.printf("[NET] relay token rotated OK (ip %s)\n", r.ip);
     } else {
@@ -891,6 +943,11 @@ void setup() {
   sd_log::begin(s_board->getIO_Expander() ? s_board->getIO_Expander()->getBase()
                                           : nullptr);
 
+  // --- optional wireless feed nodes (v1.8.0) ---
+  // nRF24 polls on its own task (SPI shared with the SD card via the bus
+  // guard); ESP-NOW starts lazily once WiFi is up (loop()).
+  net_rf24::begin();
+
   if (!lvgl_port_init(s_board->getLCD(), s_board->getTouch())) {
     Serial.println("[SYS] ERROR: LVGL port init failed");
   }
@@ -902,6 +959,7 @@ void setup() {
   ui_set_hour12(prefs::getHour12());
   ui_set_rtc(s_rtc_status);
   ui_set_sd(sd_log::summary());
+  radiosUiSync();
   ui_set_relay(false, prefs::getTankIp(1));
   ui_set_last_feed(formatLastFed(prefs::getLastFedEpoch()));
   {
@@ -935,6 +993,12 @@ void loop() {
   // OTA updater: begin lazily once WiFi/mDNS is up, then serve every pass.
   beginOtaOnce();
   if (s_ota_ready) ArduinoOTA.handle();
+
+  // ESP-NOW: start listening once the STA has a channel (v1.8.0)
+  if (net_espnow::state() == net_espnow::State::WaitingWifi &&
+      net_wifi::wifi_is_connected()) {
+    net_espnow::beginOnce();
+  }
 
   // ---- drain UI events + worker results (every pass, ~50 ms latency) ----
   UiEvent ev;
@@ -1029,6 +1093,7 @@ void loop() {
     // MQTT reconnect pump + Settings-card status sync
     mqtt_mgr::retryIfDue(now);
     mqttSyncUi();
+    radiosUiSync();
 
     // web dashboard state cache (~1 Hz; plain-field reads for the web task)
     webPublishSnapshot();

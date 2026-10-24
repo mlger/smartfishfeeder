@@ -17,6 +17,7 @@
 #include <chip/esp_expander_base.hpp>
 
 #include "mqtt_payloads.h"
+#include "spi_bus_guard.h"
 
 namespace {
 
@@ -81,8 +82,10 @@ bool begin(esp_expander::Base *expander) {
     Serial.println("[SD] WARN: no IO expander — TF card unusable");
     return false;
   }
+  spi_bus_guard::take();
   s_exp->pinMode(SD_EXPANDER_CS_PIN, OUTPUT);
   if (!csSelect()) {
+    spi_bus_guard::give();
     s_state = State::NoCard;
     return false;
   }
@@ -90,6 +93,7 @@ bool begin(esp_expander::Base *expander) {
   const bool ok = SD.begin(SD_PIN_DUMMY_CS, SPI, SD_SPI_HZ);
   csDeselect();
   if (!ok) {
+    spi_bus_guard::give();
     s_state = State::NoCard;
     Serial.println("[SD] no card mounted (slot empty or wiring issue)");
     return false;
@@ -97,9 +101,10 @@ bool begin(esp_expander::Base *expander) {
   s_state = State::Mounted;
   s_bytes_since_rotate = 0;
   writeHeaderIfEmpty();
+  const uint64_t tot = SD.totalBytes(), used = SD.usedBytes();
+  spi_bus_guard::give();
   Serial.printf("[SD] mounted: %llu MB total, %llu MB used\n",
-                (unsigned long long)(SD.totalBytes() >> 20),
-                (unsigned long long)(SD.usedBytes() >> 20));
+                (unsigned long long)(tot >> 20), (unsigned long long)(used >> 20));
   return true;
 #else
   (void)expander;
@@ -117,9 +122,14 @@ String summary() {
     case State::NoCard:
       return String("no card");
     case State::Mounted: {
-      if (!csSelect()) return String("error");
+      spi_bus_guard::take();
+      if (!csSelect()) {
+        spi_bus_guard::give();
+        return String("error");
+      }
       const uint64_t freeB = SD.totalBytes() - SD.usedBytes();
       csDeselect();
+      spi_bus_guard::give();
       char buf[24];
       if (freeB >= (1024ULL * 1024ULL * 1024ULL))
         snprintf(buf, sizeof(buf), "%.1f GB free",
@@ -134,13 +144,16 @@ String summary() {
 
 void logFeed(uint32_t epoch, uint8_t tankMask, uint8_t seconds, bool ok) {
   if (s_state != State::Mounted) return;
+  spi_bus_guard::take();
   if (!csSelect()) {
+    spi_bus_guard::give();
     Serial.println("[SD] WARN: expander CS write failed, row dropped");
     return;
   }
   File f = SD.open(LOG_PATH, FILE_APPEND);
   if (!f) {
     csDeselect();
+    spi_bus_guard::give();
     Serial.println("[SD] WARN: open failed, row dropped");
     return;
   }
@@ -152,6 +165,7 @@ void logFeed(uint32_t epoch, uint8_t tankMask, uint8_t seconds, bool ok) {
   csDeselect();
   if (n > 0) s_bytes_since_rotate += (uint32_t)n;
   rotateIfDue();
+  spi_bus_guard::give();
 }
 
 } // namespace sd_log
