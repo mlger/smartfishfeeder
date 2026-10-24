@@ -149,11 +149,24 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 | NTP | Display Unit | pool servers | Synced periodically; UI shows synced time |
 | Backlight | Display Unit | on | Settings → Display → Backlight switch (persisted across reboots); screen auto-dims after 10 min idle and wakes on touch |
 | MQTT / Home Assistant | Display Unit | disabled | Settings → HOME ASSISTANT (MQTT) → *Configure*: broker, port, credentials, topic prefix — topic map and behaviour in [mqtt.md](mqtt.md) |
-| Factory reset | Relay Unit | — | Hold the **FLASH** button ~5 s while running: EEPROM config (token, pulse caps) is wiped to defaults and the unit reboots. Refused while a pulse is running |
+| Feeding mechanism | Relay Unit | `motor` | Display UI: Settings → Relay Unit → *Mechanism* → *Configure* (motor / servo / stepper + servo angles / stepper rate), or `POST /config` with `{"mechanism":...}` — semantics and wiring in [api.md](api.md#feeding-mechanisms-v140). Stored in a separate EEPROM record; factory reset restores `motor` |
+| Factory reset | Relay Unit | — | Hold the **FLASH** button ~5 s while running: EEPROM config (token, pulse caps, mechanism) is wiped to defaults and the unit reboots. Refused while a pulse is running |
 
 **Timezone note:** the firmware uses the POSIX form `PHT-8` — a positive UTC offset is written with a minus sign in POSIX. Schedule entries entered on the Schedule screen are interpreted in this timezone.
 
 **Token note:** `catfish` is a default, not a feature. Change it before going live — the easiest way is the display unit itself (Settings → Relay Unit → *Pairing token*, tick **"Also update the relay unit"**): it rotates the relay token via `POST /config` and only saves the new token locally after the relay accepted it. To rotate without the display: `curl -X POST http://catfish-relay.local/config -H 'Content-Type: application/json' -d '{"token":"your-current-token","newToken":"your-new-token"}'`, then update the display's token in Settings. Token changes take effect immediately and survive reboots.
+
+## Feeding mechanisms (v1.4.0+)
+
+The relay unit ships with the classic **motor** mechanism (D1 relay/FET energizes a DC auger/roller motor for the pulse). Two alternative mechanisms reuse the *same* "feed for N seconds" API — only what the ESP8266 does during those seconds differs:
+
+| Mechanism | Relay-unit pins | Notes |
+|-----------|-----------------|-------|
+| `motor` (default) | D1 → relay module input | unchanged behaviour; 1N4007 flyback diode across the motor |
+| `servo` | **D5** (GPIO14) → servo signal; servo +5 V / GND | SG90-class. Sweeps rest ↔ feed angle every 0.5 s during the pulse, parks at rest and detaches after each feed |
+| `stepper` | **D2** (GPIO4) → driver STEP; **D6** (GPIO12) → driver DIR | A4988/DRV8825-class. STEP pulses at the configured rate (default 400 steps/s); DIR is driven low (or high when enabled) for the pulse. Tie `/ENABLE`+`/RESET`+`/SLEEP` per the driver datasheet, set MS1-MS3 for microstepping, and fit a ≥100 µF decoupling cap on VMOT |
+
+Switch mechanisms on the display unit (Settings → Relay Unit → *Mechanism*) or via `POST /config` (see [api.md](api.md)). The choice + parameters persist in a second additive EEPROM record; upgrading the firmware never touches the token/pulse blob. The STEP/DIR pins are driven low from the first boot microseconds, so a partially-wired stepper driver stays idle until you deliberately switch mechanisms.
 
 ## OTA updates
 

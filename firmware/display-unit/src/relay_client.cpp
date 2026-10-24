@@ -14,6 +14,7 @@
 #include <WiFiClient.h>
 #include <WiFiUdp.h>
 #include <catfish_protocol.h>
+#include <catfish_mech.h>
 #include "net_wifi.h"
 #include "prefs.h"
 
@@ -346,6 +347,10 @@ Status fetchStatus() {
   st.version = String((const char *)(doc["version"] | "unknown"));
   st.state = String((const char *)(doc["state"] | ""));
   st.protocolVersion = (int)(doc["proto"] | -1);
+  st.mechanism = String((const char *)(doc["mechanism"] | "")); // "" = pre-P4 relay
+  st.servoRest = (int)(doc["servoRestDeg"] | -1);
+  st.servoFeed = (int)(doc["servoFeedDeg"] | -1);
+  st.stepHz = (int)(doc["stepHz"] | -1);
 
   if (st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION &&
       !s_proto_warned) {
@@ -380,6 +385,63 @@ Result rotateToken(const String &newToken) {
   JsonDocument doc;
   doc["token"] = prefs::getRelayToken(); // current credential
   doc["newToken"] = newToken;
+  String body;
+  serializeJson(doc, body);
+
+  String resp;
+  const int code =
+      httpReq("http://" + s_ip + CATFISH_EP_CONFIG, true, body, 4000, resp);
+  if (code > 0) noteTransportSuccess();
+  if (code <= 0) {
+    noteTransportFailure();
+    r.error = describeError(code, resp);
+    return r;
+  }
+  if (code != 200) {
+    r.error = describeError(code, resp);
+    return r;
+  }
+
+  JsonDocument rd;
+  if (deserializeJson(rd, resp) != DeserializationError::Ok ||
+      !(rd["ok"] | false)) {
+    r.error = describeError(code, resp);
+    return r;
+  }
+
+  r.ok = true;
+  r.ip = s_ip;
+  return r;
+}
+
+Result configureMech(uint8_t mech, uint8_t restDeg, uint8_t feedDeg,
+                     uint16_t stepHz, uint8_t stepDir) {
+  Result r;
+
+  if (!net_wifi::wifi_is_connected()) {
+    r.error = "WiFi down";
+    return r;
+  }
+  if (mech >= CATFISH_MECH_COUNT) {
+    r.error = "Bad mechanism";
+    return r;
+  }
+  if (!s_ip.length()) {
+    Result d = discover();
+    if (!d.ok) {
+      r.error = "No relay (" + d.error + ")";
+      return r;
+    }
+  }
+
+  // Pre-clamp here too: the relay clamps again (shared catfish_mech.h helpers).
+  JsonDocument doc;
+  doc["token"] = prefs::getRelayToken(); // current credential
+  doc["mechanism"] = catfishMechName(mech);
+  doc["servoRestDeg"] = (int)catfishClampServoDeg(restDeg);
+  doc["servoFeedDeg"] = (int)catfishClampServoDeg(feedDeg);
+  doc["stepHz"] = (int)catfishClampStepHz(stepHz);
+  doc["stepDir"] = (int)catfishClampStepDir(stepDir);
   String body;
   serializeJson(doc, body);
 

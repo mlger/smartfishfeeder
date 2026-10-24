@@ -41,6 +41,7 @@ enum UiEventType : uint8_t {
   UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
   UI_EVT_SCHED_PERSIST, // enable switch flipped (a=index, flag=enabled — loop applies + flushes)
   UI_EVT_MQTT_CFG,      // MQTT settings saved   (mqtt* fields valid — loop persists + applies)
+  UI_EVT_MECH_CFG,      // P4: mechanism saved   (mech* fields valid — loop POSTs /config)
 };
 
 struct UiEvent {
@@ -57,6 +58,12 @@ struct UiEvent {
   char mqttUser[CATFISH_MQTT_USER_LEN] = {0};
   char mqttPass[CATFISH_MQTT_PASS_LEN] = {0};
   char mqttPrefix[CATFISH_MQTT_PREFIX_LEN] = {0};
+  // Feeding mechanism (UI_EVT_MECH_CFG, P4); pre-clamped by the UI
+  uint8_t mechId = 0;   // CATFISH_MECH_*
+  uint8_t mechRest = 0; // servo rest angle
+  uint8_t mechFeed = 0; // servo feed angle
+  uint16_t mechHz = 0;  // stepper step rate
+  uint8_t mechDir = 0;  // stepper DIR level during feed
 };
 
 namespace ui {
@@ -84,6 +91,13 @@ void ui_set_mqtt_broker(const String &text);
 
 /** Reflect externally changed default pulse (Home Assistant) in the spinbox. */
 void ui_set_pulse(uint8_t seconds);
+
+/**
+ * P4: Settings > Relay card "Mechanism" line + overlay prefill cache.
+ * mechName "" = pre-P4 relay firmware (shown as "not reported").
+ * Angles/rate -1 = unknown; used to prefill the mechanism editor.
+ */
+void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz);
 
 /** WiFi state for the status-bar symbol and Settings > Network card. */
 void ui_set_wifi(bool connected, const String &ssid, const String &ip, int rssi);
