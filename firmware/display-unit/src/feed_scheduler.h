@@ -28,7 +28,22 @@ struct FeedTime {
   uint8_t minute;  // 0..59
   bool enabled;    // entry participates in scheduling when true
   uint8_t seconds; // feed pulse duration 1..30 s
+  uint8_t tanks;   // P5: target-tank bitmask (bit 0 = tank 1). 0 loads as 1
+                   // (legacy blobs) and is clamped back to 1 when stored.
 };
+
+/**
+ * P5: restrict an entry's tank mask to the configured tanks.
+ * Pure helper (host-tested): bits beyond tankCount are dropped, and an
+ * empty result (e.g. entry for tanks 3-4 while only 1 is configured)
+ * falls back to tank 1 so a feed can never address "no tank".
+ */
+inline uint8_t effectiveTankMask(const FeedTime &e, uint8_t tankCount) {
+  if (tankCount > 4) tankCount = 4;
+  const uint8_t allowed = (tankCount == 0) ? 0 : (uint8_t)((1u << tankCount) - 1u);
+  const uint8_t m = e.tanks & allowed;
+  return m ? m : (uint8_t)0x01;
+}
 
 namespace feed_scheduler {
 

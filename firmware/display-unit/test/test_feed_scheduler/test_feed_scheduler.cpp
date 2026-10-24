@@ -289,6 +289,78 @@ void test_replace_all_accepts_empty_array_and_clamps(void) {
   TEST_ASSERT_EQUAL_UINT8(30, e0.seconds);
 }
 
+// ---------------------------------------------------------------------------
+// Tank masks (Phase 5)
+// ---------------------------------------------------------------------------
+void test_legacy_blob_defaults_to_tank1(void) {
+  // entries persisted before Phase 5 have no "t" key -> tank 1
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3}])");
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x01, out.tanks);
+}
+
+void test_add_persists_and_roundtrips_tank_mask(void) {
+  loadSchedule("[]");
+  TEST_ASSERT_TRUE(feed_scheduler::add(FeedTime{6, 15, true, 4, 0x05}));
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x05, out.tanks);
+
+  TEST_ASSERT_TRUE(feed_scheduler::flushIfDirty());
+  TEST_ASSERT_NOT_NULL(strstr(prefs::g_sched.c_str(), "\"t\":5"));
+
+  const std::string blob = prefs::g_sched;
+  loadSchedule(blob.c_str());
+  FeedTime rt{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, rt));
+  TEST_ASSERT_EQUAL_UINT8(0x05, rt.tanks);
+}
+
+void test_add_clamps_tank_mask(void) {
+  loadSchedule("[]");
+  TEST_ASSERT_TRUE(feed_scheduler::add(FeedTime{6, 15, true, 4, 0}));
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x01, out.tanks); // 0 -> tank 1
+
+  TEST_ASSERT_TRUE(feed_scheduler::add(FeedTime{6, 16, true, 4, 0xF0}));
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(1, out));
+  TEST_ASSERT_EQUAL_UINT8(0x01, out.tanks); // 0xF0 & 0x0F == 0 -> tank 1
+}
+
+void test_replace_all_parses_tank_mask(void) {
+  TEST_ASSERT_TRUE(feed_scheduler::replaceAll(
+      R"([{"h":6,"m":15,"e":true,"s":5,"t":3},{"h":18,"m":45,"e":true,"s":5}])"));
+  FeedTime e0{}, e1{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, e0));
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(1, e1));
+  TEST_ASSERT_EQUAL_UINT8(0x03, e0.tanks); // tanks 1+2
+  TEST_ASSERT_EQUAL_UINT8(0x01, e1.tanks); // missing "t" -> tank 1
+}
+
+void test_effective_tank_mask_clamps_to_configured(void) {
+  FeedTime e{7, 30, true, 3, 0x0F};
+  TEST_ASSERT_EQUAL_UINT8(0x0F, effectiveTankMask(e, 4));
+  TEST_ASSERT_EQUAL_UINT8(0x03, effectiveTankMask(e, 2));
+  TEST_ASSERT_EQUAL_UINT8(0x01, effectiveTankMask(e, 1));
+  FeedTime z{7, 30, true, 3, 0};
+  TEST_ASSERT_EQUAL_UINT8(0x01, effectiveTankMask(z, 4)); // empty -> tank 1
+  FeedTime hi{7, 30, true, 3, 0xF0};
+  TEST_ASSERT_EQUAL_UINT8(0x01, effectiveTankMask(hi, 4)); // bits dropped -> tank 1
+  // out-of-range counts are clamped defensively
+  TEST_ASSERT_EQUAL_UINT8(0x0F, effectiveTankMask(e, 9));
+  TEST_ASSERT_EQUAL_UINT8(0x01, effectiveTankMask(e, 0));
+}
+
+void test_tick_preserves_tank_mask(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3,"t":5}])");
+  g_now = makeLocalTime(2025, 6, 15, 7, 30, 0);
+  const FeedTime due = feed_scheduler::tick();
+  TEST_ASSERT_TRUE(due.enabled);
+  TEST_ASSERT_EQUAL_UINT8(0x05, due.tanks);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_add_clamps_out_of_range_entry);
@@ -309,5 +381,11 @@ int main(void) {
   RUN_TEST(test_replace_all_rejects_duplicates_and_keeps_state);
   RUN_TEST(test_replace_all_rejects_oversize_and_keeps_state);
   RUN_TEST(test_replace_all_accepts_empty_array_and_clamps);
+  RUN_TEST(test_legacy_blob_defaults_to_tank1);
+  RUN_TEST(test_add_persists_and_roundtrips_tank_mask);
+  RUN_TEST(test_add_clamps_tank_mask);
+  RUN_TEST(test_replace_all_parses_tank_mask);
+  RUN_TEST(test_effective_tank_mask_clamps_to_configured);
+  RUN_TEST(test_tick_preserves_tank_mask);
   return UNITY_END();
 }

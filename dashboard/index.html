@@ -78,6 +78,7 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
 
 <div class="card">
   <h2>FEED NOW</h2>
+  <div id="tankChips" style="display:none;margin-bottom:12px;flex-wrap:wrap;gap:6px" class="row"></div>
   <div class="row" style="margin-bottom:12px">
     <div class="grow mut">Pulse duration</div>
     <div class="spin">
@@ -93,6 +94,7 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   <div class="addrow">
     <input type="time" id="addTime">
     <input type="number" id="addSec" min="1" max="30" value="3" title="seconds">
+    <span id="addTankBoxes" style="display:none;align-items:center;gap:6px" class="mut"></span>
     <button class="mini ghost" id="addBtn">Add</button>
     <button class="mini" id="saveBtn" disabled>Save</button>
   </div>
@@ -129,11 +131,14 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
 const $=id=>document.getElementById(id);
 let token=localStorage.catfishToken||"";
 let pulse=3, schedule=[], dirty=false, feedBusy=false;
+let tanks=[], selTank=0; // selTank: 0-based index or "all"
 
 function toast(m,ms=2200){const t=$("toast");t.textContent=m;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms)}
 function iso(s){if(!s)return"never";const d=new Date(s*1000);const p=n=>String(n).padStart(2,"0");const now=new Date();
   const sameDay=d.toDateString()===now.toDateString();
   return(sameDay?"Today ":"")+p(d.getHours())+":"+p(d.getMinutes())}
+function maskOf(sel,n){return sel==="all"?((1<<n)-1):(1<<sel)}
+function maskTag(m){const p=[];for(let i=0;i<4;i++)if(m&(1<<i))p.push(i+1);return p.length?"T"+p.join("+"):""}
 
 async function api(path,opt={}){
   const r=await fetch(path,{...opt,headers:{...(opt.headers||{}),"X-Catfish-Token":token}});
@@ -146,6 +151,32 @@ function mut(path,method,body){
 }
 
 /* ---------- status ---------- */
+function renderTanks(){
+  const box=$("tankChips");box.innerHTML="";
+  if(!tanks.length||tanks.length<2){box.style.display="none";return}
+  box.style.display="flex";
+  tanks.forEach((t,i)=>{
+    const b=document.createElement("button");b.className="mini";
+    b.style.border="2px solid "+(selTank===i?"var(--amber)":"var(--hi)");
+    b.textContent=(t.online?"\u25CF ":"\u25CB ")+t.name;
+    b.onclick=()=>{selTank=i;renderTanks()};
+    box.appendChild(b);
+  });
+  const all=document.createElement("button");all.className="mini";
+  all.style.border="2px solid "+(selTank==="all"?"var(--amber)":"var(--hi)");
+  all.textContent="All";all.onclick=()=>{selTank="all";renderTanks()};
+  box.appendChild(all);
+}
+function renderAddTanks(){
+  const box=$("addTankBoxes");box.innerHTML="";
+  if(tanks.length<2){box.style.display="none";return}
+  box.style.display="inline-flex";
+  tanks.forEach((t,i)=>{
+    const l=document.createElement("label");l.style.display="inline-flex";l.style.alignItems="center";l.style.gap="2px";l.style.fontSize="12px";
+    const cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.dataset.i=i;
+    l.append(cb,document.createTextNode(i+1));box.appendChild(l);
+  });
+}
 async function refresh(){
   if(document.hidden)return;
   try{
@@ -160,8 +191,11 @@ async function refresh(){
     $("dotMqtt").classList.toggle("on",s.mqttState===2);
     $("fwLine").textContent="Firmware v"+(s.version||"?")+"  \u00B7  "+(s.schedCount||0)+" scheduled feedings";
     $("wifiLine").textContent="WiFi: "+(s.wifiUp?s.wifiSsid+" ("+s.wifiIp+", "+s.rssi+" dBm)":"offline");
-    $("relayLine").textContent="Relay: "+(s.relayOnline?"online at "+s.relayIp:"offline");
+    const tl=(s.tanks||[]).map(t=>t.name+" "+(t.online?"\u25CF":"\u25CB")+(t.feeding?" (feeding)":""));
+    $("relayLine").textContent="Tanks: "+(tl.length?tl.join("  \u00B7  "):(s.relayOnline?"online at "+s.relayIp:"offline"));
     $("mqttLine").textContent="MQTT: "+(s.mqtt||"n/a");
+    if(JSON.stringify(s.tanks||[])!==JSON.stringify(tanks)){tanks=s.tanks||[];renderTanks();renderAddTanks();renderSched()}
+    else renderTanks();
     if(!dirty){pulse=s.pulse||3;renderPulse()}
   }catch(e){}
 }
@@ -173,7 +207,7 @@ $("pMinus").onclick=()=>{if(pulse>1){pulse--;renderPulse()}};
 $("pPlus").onclick=()=>{if(pulse<30){pulse++;renderPulse()}};
 $("feedBtn").onclick=async()=>{
   feedBusy=true;$("feedBtn").disabled=true;$("feedBtn").textContent="FEEDING...";
-  try{const r=await mut("/api/feed","POST",{seconds:pulse});
+  try{const r=await mut("/api/feed","POST",{seconds:pulse,tanks:maskOf(selTank,Math.max(tanks.length,1))});
     if(r.ok)toast("Feeding fish...");else toast(r.error||"Failed",3000)}
   catch(e){toast(e.message,3000)}
   feedBusy=false;setTimeout(refresh,800);
@@ -191,7 +225,8 @@ function renderSched(){
     sw.append(cb,sl);
     const t=document.createElement("span");t.className="time";
     t.textContent=String(e.h).padStart(2,"0")+":"+String(e.m).padStart(2,"0");
-    const s=document.createElement("span");s.className="sec";s.textContent=e.s+" s";
+    const tag=maskTag(e.t||1);
+    const s=document.createElement("span");s.className="sec";s.textContent=e.s+" s"+(tanks.length>1&&tag?" \u00B7 "+tag:"");
     const del=document.createElement("button");del.className="mini";del.textContent="\u2715";
     del.onclick=()=>{schedule.splice(i,1);dirty=true;$("saveBtn").disabled=false;renderSched()};
     li.append(sw,t,s,del);ul.appendChild(li);
@@ -209,7 +244,10 @@ $("addBtn").onclick=()=>{
   const s=Math.max(1,Math.min(30,parseInt($("addSec").value)||3));
   if(schedule.some(e=>e.h===h&&e.m===m))return toast("Time already scheduled");
   if(schedule.length>=8)return toast("Schedule full (max 8)");
-  schedule.push({h,m,e:true,s});dirty=true;$("saveBtn").disabled=false;renderSched();
+  let t=(1<<Math.max(tanks.length,1))-1; // default: all configured tanks
+  const boxes=$("addTankBoxes").querySelectorAll("input");
+  if(boxes.length){t=0;boxes.forEach(cb=>{if(cb.checked)t|=1<<(+cb.dataset.i)});if(!t)t=1}
+  schedule.push({h,m,e:true,s,t});dirty=true;$("saveBtn").disabled=false;renderSched();
 };
 $("saveBtn").onclick=async()=>{
   try{const r=await mut("/api/schedule","PUT",schedule);

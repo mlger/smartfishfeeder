@@ -23,6 +23,13 @@ uint8_t s_pulse = CATFISH_DEFAULT_PULSE_S;
 uint32_t s_last_fed = 0;
 bool s_bl_on = true;
 
+// Multi-tank (Phase 5): 1-based tank ids, indexes below are tank-1.
+uint8_t s_tank_count = 1;
+char s_tank_name[CATFISH_MAX_TANKS][CATFISH_TANK_NAME_LEN] = {
+    "Main", "Tank 2", "Tank 3", "Tank 4"};
+char s_tank_tok[CATFISH_MAX_TANKS][CATFISH_TOKEN_LEN] = {{0}, {0}, {0}, {0}};
+char s_tank_ip[CATFISH_MAX_TANKS][16] = {{0}, {0}, {0}, {0}};
+
 // MQTT / Home Assistant (loop-context only access; no guard needed)
 bool s_mq_en = false;
 char s_mq_host[CATFISH_MQTT_HOST_LEN] = {0};
@@ -78,8 +85,32 @@ bool begin() {
   strlcpy(s_mq_prefix, v.c_str(), sizeof(s_mq_prefix));
   if (!s_mq_prefix[0]) strlcpy(s_mq_prefix, CATFISH_MQTT_PREFIX, sizeof(s_mq_prefix));
 
+  // ---- multi-tank (Phase 5) ----
+  s_tank_count = s_nvs.getUChar("tankN", 1);
+  if (s_tank_count < 1 || s_tank_count > CATFISH_MAX_TANKS) s_tank_count = 1;
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "tName%d", i + 1);
+    v = s_nvs.getString(key, "");
+    if (v.length()) strlcpy(s_tank_name[i], v.c_str(), sizeof(s_tank_name[i]));
+    snprintf(key, sizeof(key), "tTok%d", i + 1);
+    v = s_nvs.getString(key, "");
+    strlcpy(s_tank_tok[i], v.c_str(), sizeof(s_tank_tok[i]));
+    snprintf(key, sizeof(key), "tIp%d", i + 1);
+    v = s_nvs.getString(key, "");
+    strlcpy(s_tank_ip[i], v.c_str(), sizeof(s_tank_ip[i]));
+  }
+  // Migration from single-relay installs: tank 1 inherits the legacy IP slot
+  // until its own key exists. (setTankIp(1) keeps "relayIp" mirrored, so this
+  // only fires once after the upgrade.)
+  if (!s_tank_ip[0][0] && s_relay_ip[0]) {
+    strlcpy(s_tank_ip[0], s_relay_ip, sizeof(s_tank_ip[0]));
+    if (s_nvs.putString("tIp1", s_tank_ip[0]) == 0) nvsLogFail("tIp1");
+  }
+
   s_loaded = true;
-  Serial.println("[SYS] prefs loaded from NVS (namespace 'catfish')");
+  Serial.printf("[SYS] prefs loaded from NVS (namespace 'catfish', %u tank%s)\n",
+                (unsigned)s_tank_count, (s_tank_count == 1) ? "" : "s");
   return true;
 }
 
@@ -114,11 +145,83 @@ void setRelayToken(const String &token) {
   if (s_loaded && s_nvs.putString("token", token) == 0) nvsLogFail("token");
 }
 
-String getRelayIp() { return String(s_relay_ip); }
+// ---- legacy single-relay IP slot: now an alias for tank 1 (multi-tank) ----
+String getRelayIp() { return getTankIp(1); }
 
-void setRelayIp(const String &ip) {
-  strlcpy(s_relay_ip, ip.c_str(), sizeof(s_relay_ip));
-  if (s_loaded && s_nvs.putString("relayIp", ip) == 0) nvsLogFail("relayIp");
+void setRelayIp(const String &ip) { setTankIp(1, ip); }
+
+// ---------------------------------------------------------- multi-tank (P5)
+uint8_t getTankCount() { return s_tank_count; }
+
+void setTankCount(uint8_t count) {
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  s_tank_count = count;
+  if (s_loaded && s_nvs.putUChar("tankN", s_tank_count) == 0) nvsLogFail("tankN");
+}
+
+static int tankIdx(uint8_t tank1) {
+  const int i = (int)tank1 - 1;
+  if (i < 0 || i >= CATFISH_MAX_TANKS) return -1;
+  return i;
+}
+
+String getTankName(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return String("");
+  return String(s_tank_name[i]);
+}
+
+void setTankName(uint8_t tank1, const String &name) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return;
+  strlcpy(s_tank_name[i], name.c_str(), sizeof(s_tank_name[i]));
+  if (!s_tank_name[i][0])
+    snprintf(s_tank_name[i], sizeof(s_tank_name[i]), "Tank %u", (unsigned)tank1);
+  char key[8];
+  snprintf(key, sizeof(key), "tName%d", i + 1);
+  if (s_loaded && s_nvs.putString(key, s_tank_name[i]) == 0) nvsLogFail(key);
+}
+
+String getTankToken(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return String("");
+  return String(s_tank_tok[i]);
+}
+
+void setTankToken(uint8_t tank1, const String &token) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return;
+  strlcpy(s_tank_tok[i], token.c_str(), sizeof(s_tank_tok[i]));
+  char key[8];
+  snprintf(key, sizeof(key), "tTok%d", i + 1);
+  if (s_loaded && s_nvs.putString(key, s_tank_tok[i]) == 0) nvsLogFail(key);
+}
+
+String getTankIp(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return String("");
+  return String(s_tank_ip[i]);
+}
+
+void setTankIp(uint8_t tank1, const String &ip) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return;
+  strlcpy(s_tank_ip[i], ip.c_str(), sizeof(s_tank_ip[i]));
+  char key[8];
+  snprintf(key, sizeof(key), "tIp%d", i + 1);
+  if (s_loaded && s_nvs.putString(key, s_tank_ip[i]) == 0) nvsLogFail(key);
+  if (i == 0) {
+    // keep the legacy slot mirrored for downgrade + older tooling
+    strlcpy(s_relay_ip, ip.c_str(), sizeof(s_relay_ip));
+    if (s_loaded && s_nvs.putString("relayIp", ip) == 0) nvsLogFail("relayIp");
+  }
+}
+
+String effectiveTankToken(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  if (i >= 0 && s_tank_tok[i][0]) return String(s_tank_tok[i]);
+  return getRelayToken(); // global pairing token
 }
 
 uint8_t getDefaultPulse() { return s_pulse; }

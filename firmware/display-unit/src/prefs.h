@@ -38,9 +38,29 @@ bool setScheduleJson(const String &json);
 String getRelayToken();
 /** Store a new pairing token (clamped to CATFISH_TOKEN_LEN-1 chars). */
 void setRelayToken(const String &token);
-/** Last known relay IP as dotted string, "" if never discovered. */
+/**
+ * Legacy single-relay IP slot — now an alias for tank 1's IP (multi-tank,
+ * Phase 5). Kept for dashboard/older callers; new code uses getTankIp(1).
+ */
 String getRelayIp();
 void setRelayIp(const String &ip);
+
+// ---- Multi-tank (Phase 5): up to CATFISH_MAX_TANKS relays per display ----
+// Tank ids are 1-based (tank 1 = the legacy relay). Per-tank token "" means
+// "inherit the global pairing token". All setters clamp + persist to NVS;
+// call them from loop() only (single-writer discipline).
+uint8_t getTankCount(); // 1..CATFISH_MAX_TANKS
+void setTankCount(uint8_t count);
+String getTankName(uint8_t tank1); // 1-based; never empty (defaults filled)
+void setTankName(uint8_t tank1, const String &name);
+/** Per-tank token override ("" = inherit global token). */
+String getTankToken(uint8_t tank1);
+void setTankToken(uint8_t tank1, const String &token);
+/** Last-known relay IP for that tank, "" = never discovered. */
+String getTankIp(uint8_t tank1);
+void setTankIp(uint8_t tank1, const String &ip);
+/** Effective credential for a tank: per-tank override or the global token. */
+String effectiveTankToken(uint8_t tank1);
 
 // ---- Feeding defaults ----
 /** Default manual-feed pulse in seconds (1..30). */

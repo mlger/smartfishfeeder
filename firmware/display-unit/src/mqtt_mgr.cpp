@@ -33,12 +33,18 @@ uint32_t s_backoff_ms = 5000;
 // onMessage callback only reads immutable buffers (changed while disconnected).
 char s_topic_feed_cmd[96] = {0};
 char s_topic_pulse_set[96] = {0};
+// Per-tank feed command topics (P5): always subscribed; commands for tanks
+// beyond the configured count are ignored at routing time.
+char s_topic_tank_cmd[CATFISH_MAX_TANKS][96] = {{0}, {0}, {0}, {0}};
 
 // ---------------------------------------------------------------- callbacks
 void onConnectCb(bool /*sessionPresent*/) {
   // AsyncTCP task: queueing is thread-safe; subscribing queues packets.
   s_client.subscribe(s_topic_feed_cmd, 1);
   s_client.subscribe(s_topic_pulse_set, 1);
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    if (s_topic_tank_cmd[i][0]) s_client.subscribe(s_topic_tank_cmd[i], 1);
+  }
   Serial.printf("[MQTT] connected as '%s'\n", CATFISH_DISPLAY_HOSTNAME);
   if (s_evtq) {
     const bool connected = true;
@@ -67,9 +73,30 @@ void onMessageCb(const espMqttClientTypes::MessageProperties & /*properties*/,
     ev.type = UI_EVT_FEED;
     ev.a = prefs::getDefaultPulse(); // benign snapshot read (single byte)
     ev.flag = true;                  // manual
+    ev.tankMask = 0;                 // 0 = tank 1 (legacy aggregate button)
     ui::ui_event_send(ev);
     Serial.println("[MQTT] feed command received");
     return;
+  }
+
+  // P5: per-tank feed buttons (subscribed unconditionally; commands for
+  // unconfigured tanks are ignored here)
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    if (s_topic_tank_cmd[i][0] && strcmp(topic, s_topic_tank_cmd[i]) == 0) {
+      if (strcmp(value, "ON") != 0) return;
+      if (i + 1 > (int)prefs::getTankCount()) {
+        Serial.printf("[MQTT] tank %d command ignored (not configured)\n", i + 1);
+        return;
+      }
+      UiEvent ev;
+      ev.type = UI_EVT_FEED;
+      ev.a = prefs::getDefaultPulse();
+      ev.flag = true; // manual
+      ev.tankMask = (uint8_t)(1u << i);
+      ui::ui_event_send(ev);
+      Serial.printf("[MQTT] tank %d feed command received\n", i + 1);
+      return;
+    }
   }
 
   if (strcmp(topic, s_topic_pulse_set) == 0) {
@@ -135,6 +162,11 @@ void applyConfig() {
           mqtt_payloads::feedCmdTopic(prefix).c_str(), sizeof(s_topic_feed_cmd));
   strlcpy(s_topic_pulse_set,
           mqtt_payloads::pulseSetTopic(prefix).c_str(), sizeof(s_topic_pulse_set));
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    strlcpy(s_topic_tank_cmd[i],
+            mqtt_payloads::tankFeedCmdTopic(prefix, i + 1).c_str(),
+            sizeof(s_topic_tank_cmd[i]));
+  }
 
   s_client.setServer(host.c_str(), port);
   if (user.length()) {
@@ -202,6 +234,17 @@ void publishDiscovery() {
   for (const Cfg &c : cfgs) {
     s_client.publish(c.path, 0, true, c.fn(p).c_str());
   }
+  // P5: per-tank entities follow the configured count (loop context -> prefs read ok)
+  uint8_t count = prefs::getTankCount();
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  for (uint8_t t = 1; t <= count; t++) {
+    const String name = prefs::getTankName(t);
+    s_client.publish(mqtt_payloads::tankDiscoveryPath("button", t).c_str(), 0, true,
+                     mqtt_payloads::discoveryTankFeedButton(p, t, name).c_str());
+    s_client.publish(mqtt_payloads::tankDiscoveryPath("binary_sensor", t).c_str(), 0,
+                     true, mqtt_payloads::discoveryTankOnline(p, t, name).c_str());
+  }
   Serial.println("[MQTT] discovery configs published (retained)");
 }
 
@@ -234,6 +277,25 @@ void publishFeeding(bool feeding) {
 void publishPulse(uint8_t seconds) {
   publishTopic(mqtt_payloads::pulseStateTopic(prefs::getMqttPrefix()).c_str(),
                String((unsigned)seconds), true);
+}
+
+void publishTankOnline(uint8_t tank1, bool online) {
+  if (tank1 < 1 || tank1 > CATFISH_MAX_TANKS) return;
+  publishTopic(mqtt_payloads::tankOnlineTopic(prefs::getMqttPrefix(), tank1).c_str(),
+               String(online ? "ON" : "OFF"), true);
+}
+
+void clearTankDiscovery(uint8_t prevCount, uint8_t newCount) {
+  if (!s_client.connected()) return;
+  if (newCount >= prevCount) return;
+  for (uint8_t t = newCount + 1; t <= prevCount && t <= CATFISH_MAX_TANKS; t++) {
+    // empty retained payload = HA removes the entity
+    s_client.publish(mqtt_payloads::tankDiscoveryPath("button", t).c_str(), 0, true, "");
+    s_client.publish(mqtt_payloads::tankDiscoveryPath("binary_sensor", t).c_str(), 0, true, "");
+    publishTankOnline(t, false);
+  }
+  Serial.printf("[MQTT] tank entities %u..%u removed\n", (unsigned)(newCount + 1),
+                (unsigned)prevCount);
 }
 
 } // namespace mqtt_mgr

@@ -62,19 +62,28 @@ struct SchedRetry {
   uint8_t hour = 0;
   uint8_t minute = 0;
   uint8_t seconds = 0;
+  uint8_t tankMask = 0; // P5: retry the same target tanks
   uint32_t dueMs = 0;
 };
 static SchedRetry s_retries[2];
 
-// Optimistic "Feeding..." on the Home card: set right after a successful feed
-// (the relay IS running its pulse then), expired after the pulse + 2 s, or
-// superseded early by the next real /status probe.
-static bool s_opt_feeding = false;
-static uint32_t s_opt_feeding_until = 0;
+// Optimistic "Feeding..." per tank: set right after a successful feed (the
+// relay IS running its pulse then), expired after the pulse + 2 s, or
+// superseded early by the next real /status probe. Index = tank-1.
+static bool s_opt_feeding[relay_client::MAX_TANKS] = {false, false, false, false};
+static uint32_t s_opt_feeding_until[relay_client::MAX_TANKS] = {0, 0, 0, 0};
 
-// Last relay state, mirrored to MQTT (retained) whenever it changes.
-static bool s_relay_online_cached = false;
-static bool s_feeding_cached = false;
+// Last relay state per tank (probe results + optimistic state merged).
+static bool s_tank_online[relay_client::MAX_TANKS] = {false, false, false, false};
+static bool s_tank_feeding[relay_client::MAX_TANKS] = {false, false, false, false};
+
+// Selected tank on the Home screen: 0-based index or 0xFE = "All".
+static uint8_t s_selected_tank = 0;
+
+// Aggregate state mirrored to MQTT (retained) whenever it changes:
+// relay_online = ANY configured tank online; feeding = ANY tank feeding.
+static bool s_agg_online_cached = false;
+static bool s_agg_feeding_cached = false;
 
 // MQTT status as last painted on the Settings card (0xFF = force first sync).
 static uint8_t s_mqtt_last_ui = 0xFF;
@@ -86,18 +95,83 @@ static void clearRetryFor(uint8_t hour, uint8_t minute) {
 }
 
 static bool armRetry(uint8_t hour, uint8_t minute, uint8_t seconds,
-                     uint32_t delay_ms) {
+                     uint32_t delay_ms, uint8_t tankMask) {
   for (SchedRetry &s : s_retries) {
     if (!s.pending) {
       s.pending = true;
       s.hour = hour;
       s.minute = minute;
       s.seconds = seconds;
+      s.tankMask = tankMask;
       s.dueMs = millis() + delay_ms;
       return true;
     }
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tank helpers (loop context)
+// ---------------------------------------------------------------------------
+static uint8_t tankCountClamped() {
+  uint8_t c = prefs::getTankCount();
+  if (c < 1) c = 1;
+  if (c > relay_client::MAX_TANKS) c = relay_client::MAX_TANKS;
+  return c;
+}
+
+static uint8_t configuredTankMask() {
+  const uint8_t c = tankCountClamped();
+  return (c >= 4) ? 0x0F : (uint8_t)((1u << c) - 1u);
+}
+
+/** Publish retained aggregate MQTT state only when it actually changed. */
+static void recomputeAggregates() {
+  bool anyOnline = false, anyFeeding = false;
+  const uint8_t count = tankCountClamped();
+  for (uint8_t i = 0; i < count; i++) {
+    anyOnline |= s_tank_online[i];
+    anyFeeding |= s_tank_feeding[i];
+  }
+  if (anyOnline != s_agg_online_cached) {
+    s_agg_online_cached = anyOnline;
+    mqtt_mgr::publishRelayOnline(anyOnline);
+  }
+  if (anyFeeding != s_agg_feeding_cached) {
+    s_agg_feeding_cached = anyFeeding;
+    mqtt_mgr::publishFeeding(anyFeeding);
+  }
+}
+
+/** Repaint the Home relay card for the selected tank (or the aggregate). */
+static void refreshSelectedTankCard() {
+  const uint8_t count = tankCountClamped();
+  if (s_selected_tank == 0xFE) {
+    uint8_t on = 0;
+    bool anyFeed = false;
+    for (uint8_t i = 0; i < count; i++) {
+      on += s_tank_online[i] ? 1 : 0;
+      anyFeed |= s_tank_feeding[i];
+    }
+    lvgl_port_lock(-1);
+    ui_set_relay(on == count, String(""), anyFeed);
+    lvgl_port_unlock();
+  } else {
+    const uint8_t i = (s_selected_tank < count) ? s_selected_tank : 0;
+    lvgl_port_lock(-1);
+    ui_set_relay(s_tank_online[i], relay_client::ip(i + 1), s_tank_feeding[i]);
+    lvgl_port_unlock();
+  }
+}
+
+/** Push prefs tank names into the UI (chips + rows + editor checkboxes). */
+static void syncTanksUi() {
+  String names[relay_client::MAX_TANKS];
+  for (uint8_t i = 0; i < relay_client::MAX_TANKS; i++)
+    names[i] = prefs::getTankName(i + 1);
+  lvgl_port_lock(-1);
+  ui_tanks_rebuild(tankCountClamped(), names, s_selected_tank);
+  lvgl_port_unlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -206,9 +280,13 @@ static String nextFeedHhmm() {
 static void mqttPublishAllState() {
   mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
   mqtt_mgr::publishNextFeed(nextFeedHhmm());
-  mqtt_mgr::publishRelayOnline(s_relay_online_cached);
-  mqtt_mgr::publishFeeding(s_feeding_cached);
+  mqtt_mgr::publishRelayOnline(s_agg_online_cached);
+  mqtt_mgr::publishFeeding(s_agg_feeding_cached);
   mqtt_mgr::publishPulse(prefs::getDefaultPulse());
+  const uint8_t count = tankCountClamped();
+  for (uint8_t t = 1; t <= count; t++) {
+    mqtt_mgr::publishTankOnline(t, s_tank_online[t - 1]);
+  }
 }
 
 /** Refresh the plain-field cache the web-task serves /api/status from. */
@@ -218,9 +296,18 @@ static void webPublishSnapshot() {
   strlcpy(s.wifiSsid, net_wifi::wifi_ssid().c_str(), sizeof(s.wifiSsid));
   strlcpy(s.wifiIp, net_wifi::wifi_ip().c_str(), sizeof(s.wifiIp));
   s.rssi = (int16_t)net_wifi::wifi_rssi();
-  s.relayOnline = s_relay_online_cached;
-  s.feeding = s_feeding_cached;
-  strlcpy(s.relayIp, relay_client::ip().c_str(), sizeof(s.relayIp));
+  const uint8_t count = tankCountClamped();
+  s.feeding = s_agg_feeding_cached;
+  if (s_selected_tank == 0xFE) {
+    bool allOnline = true;
+    for (uint8_t i = 0; i < count; i++) allOnline &= s_tank_online[i];
+    s.relayOnline = allOnline;
+    strlcpy(s.relayIp, "", sizeof(s.relayIp));
+  } else {
+    const uint8_t i = (s_selected_tank < count) ? s_selected_tank : 0;
+    s.relayOnline = s_tank_online[i];
+    strlcpy(s.relayIp, relay_client::ip(i + 1).c_str(), sizeof(s.relayIp));
+  }
   const String nf = nextFeedHhmm();
   strlcpy(s.nextFeed, nf.c_str(), sizeof(s.nextFeed));
   s.lastFedEpoch = prefs::getLastFedEpoch();
@@ -238,6 +325,16 @@ static void webPublishSnapshot() {
     case mqtt_mgr::Status::Disabled:   break;
   }
   strlcpy(s.mqtt, mtxt, sizeof(s.mqtt));
+  // multi-tank block
+  s.tankCount = count;
+  s.selectedTank = s_selected_tank;
+  for (uint8_t i = 0; i < relay_client::MAX_TANKS; i++) {
+    strlcpy(s.tankName[i], prefs::getTankName(i + 1).c_str(),
+            sizeof(s.tankName[i]));
+    s.tankOnline[i] = s_tank_online[i];
+    s.tankFeeding[i] = s_tank_feeding[i];
+    strlcpy(s.tankIp[i], relay_client::ip(i + 1).c_str(), sizeof(s.tankIp[i]));
+  }
   web_server::publishSnapshot(s);
 }
 
@@ -289,14 +386,14 @@ static void beginOtaOnce() {
 
 /** Route a feed request to the worker; manual feeds get immediate feedback. */
 static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
-                        uint8_t minute, bool retry) {
+                        uint8_t minute, bool retry, uint8_t tankMask) {
   if (!net_wifi::wifi_is_connected()) {
     if (manual) {
       uiToast("WiFi not connected");
     } else if (!retry) {
       // H2: a scheduled feed must survive a WiFi blip at fire time - arm a
       // delayed attempt instead of silently dropping it.
-      if (armRetry(hour, minute, seconds, 60000UL)) {
+      if (armRetry(hour, minute, seconds, 60000UL, tankMask)) {
         uiToast("No WiFi - feed will retry");
       } else {
         uiToast(String("Feed FAILED: no WiFi"));
@@ -307,7 +404,7 @@ static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
     Serial.println("[FEED] aborted: WiFi down");
     return;
   }
-  if (!net_worker::enqueueFeed(seconds, manual, hour, minute, retry)) {
+  if (!net_worker::enqueueFeed(seconds, manual, hour, minute, retry, tankMask)) {
     uiToast("Too busy, try again");
     Serial.println("[FEED] worker queue full, request dropped");
     return;
@@ -336,14 +433,24 @@ static void afterScheduleChange(bool removed) {
 // ---------------------------------------------------------------------------
 static void handleUiEvent(const UiEvent &ev) {
   switch (ev.type) {
-    case UI_EVT_FEED:
-      Serial.printf("[FEED] manual feed %u s\n", (unsigned)ev.a);
-      requestFeed(ev.a, true, 0, 0, false);
+    case UI_EVT_FEED: {
+      Serial.printf("[FEED] manual feed %u s (mask 0x%X)\n", (unsigned)ev.a,
+                    (unsigned)ev.tankMask);
+      // explicit mask (MQTT tank button / dashboard) or the Home selection
+      const uint8_t mask = ev.tankMask ? ev.tankMask
+                                       : (s_selected_tank == 0xFE
+                                              ? configuredTankMask()
+                                              : (uint8_t)(1u << s_selected_tank));
+      requestFeed(ev.a, true, 0, 0, false, mask);
       break;
+    }
 
-    case UI_EVT_RELAY_TEST:
+    case UI_EVT_RELAY_TEST: {
       Serial.println("[NET] relay test requested");
-      if (net_worker::enqueueProbe(true)) {
+      // Test the SELECTED tank (tank 1 when "All" is selected).
+      const uint8_t tank1 =
+          (s_selected_tank == 0xFE) ? 1 : (uint8_t)(s_selected_tank + 1);
+      if (net_worker::enqueueProbe(true, tank1)) {
         lvgl_port_lock(-1);
         ui_set_probe_busy(true);
         lvgl_port_unlock();
@@ -351,6 +458,7 @@ static void handleUiEvent(const UiEvent &ev) {
         uiToast("Too busy, try again");
       }
       break;
+    }
 
     case UI_EVT_REBOOT:
       Serial.println("[SYS] reboot requested");
@@ -368,15 +476,17 @@ static void handleUiEvent(const UiEvent &ev) {
 
     case UI_EVT_SET_TOKEN:
       if (ev.flag) {
-        // M4: rotate on the relay unit first (POST /config newToken); the new
-        // token is only persisted locally once the relay accepted it.
-        if (net_worker::enqueueTokenRotate(ev.token)) {
+        // M4: rotate the TANK 1 relay token first (POST /config newToken); the
+        // new token is only persisted locally once the relay accepted it.
+        // Per-tank token overrides are edited per tank (Settings > TANKS).
+        if (net_worker::enqueueTokenRotate(ev.token, 1)) {
           uiToast("Updating relay token...");
         } else {
           uiToast("Too busy - relay not updated");
         }
       } else {
         prefs::setRelayToken(String(ev.token));
+        relay_client::applyTankTokens(); // tanks without override inherit it
         uiToast("Pairing token updated");
       }
       Serial.println("[NET] pairing token update requested");
@@ -391,7 +501,7 @@ static void handleUiEvent(const UiEvent &ev) {
     case UI_EVT_SCHED_ADD: {
       const bool full =
           feed_scheduler::getCount() >= feed_scheduler::MAX_FEED_TIMES;
-      const FeedTime t{ev.a, ev.b, true, ev.c};
+      const FeedTime t{ev.a, ev.b, true, ev.c, ev.tankMask};
       if (feed_scheduler::add(t)) {
         afterScheduleChange(false);
       } else {
@@ -429,14 +539,69 @@ static void handleUiEvent(const UiEvent &ev) {
       mqttSyncUi();
       break;
 
-    case UI_EVT_MECH_CFG:
-      // P4: POST /config on the relay via the worker; RES_MECH reports back.
+    case UI_EVT_MECH_CFG: {
+      // P4: POST /config on the selected tank's relay; RES_MECH reports back.
+      const uint8_t tank1 =
+          (s_selected_tank == 0xFE) ? 1 : (uint8_t)(s_selected_tank + 1);
       if (net_worker::enqueueMech(ev.mechId, ev.mechRest, ev.mechFeed,
-                                  ev.mechHz, ev.mechDir)) {
-        Serial.printf("[SYS] mechanism change queued: %s\n",
-                      catfishMechName(ev.mechId));
+                                  ev.mechHz, ev.mechDir, tank1)) {
+        Serial.printf("[SYS] mechanism change queued: %s (tank %u)\n",
+                      catfishMechName(ev.mechId), (unsigned)tank1);
       } else {
         uiToast("Too busy - mechanism not changed");
+      }
+      break;
+    }
+
+    case UI_EVT_SELECT_TANK:
+      s_selected_tank = (ev.a == 0xFE) ? 0xFE : ev.a;
+      syncTanksUi(); // re-highlight the chips
+      refreshSelectedTankCard();
+      Serial.printf("[SYS] selected tank: %s\n",
+                    s_selected_tank == 0xFE ? "All"
+                                            : prefs::getTankName(s_selected_tank + 1).c_str());
+      break;
+
+    case UI_EVT_TANK_COUNT: {
+      const uint8_t prev = tankCountClamped();
+      prefs::setTankCount(ev.a);
+      const uint8_t nw = tankCountClamped();
+      if (nw < prev) {
+        // shrink: drop live state + HA entities for the removed tanks
+        for (uint8_t i = nw; i < relay_client::MAX_TANKS; i++) {
+          s_tank_online[i] = false;
+          s_tank_feeding[i] = false;
+          s_opt_feeding[i] = false;
+        }
+        mqtt_mgr::clearTankDiscovery(prev, nw);
+      }
+      if (s_selected_tank != 0xFE && s_selected_tank >= nw) s_selected_tank = 0;
+      syncTanksUi();
+      refreshSelectedTankCard();
+      recomputeAggregates();
+      uiToast(String("Tanks set to ") + nw);
+      Serial.printf("[SYS] tank count %u -> %u\n", (unsigned)prev, (unsigned)nw);
+      break;
+    }
+
+    case UI_EVT_TANK_CFG:
+      prefs::setTankName(ev.a, String(ev.tankName));
+      prefs::setTankToken(ev.a, String(ev.token));
+      relay_client::applyTankTokens(); // token override may have changed
+      syncTanksUi();
+      uiToast("Tank updated");
+      Serial.printf("[SYS] tank %u config saved (name '%s')\n", (unsigned)ev.a,
+                    ev.tankName);
+      break;
+
+    case UI_EVT_SCAN_TANKS:
+      if (net_worker::enqueueScanTanks()) {
+        lvgl_port_lock(-1);
+        ui_set_scan_busy(true);
+        lvgl_port_unlock();
+        uiToast("Scanning for relays...");
+      } else {
+        uiToast("Too busy, try again");
       }
       break;
 
@@ -465,7 +630,8 @@ static void handleWorkerResult(const net_worker::Result &r) {
     if (r.ok) {
       uiToast("Mechanism updated");
       Serial.printf("[NET] mechanism updated OK (ip %s) - re-probing\n", r.ip);
-      net_worker::enqueueProbe(true); // refresh the Settings mechanism line
+      // refresh the Settings mechanism line for the tank that was changed
+      net_worker::enqueueProbe(true, r.tankId ? r.tankId : 1);
     } else {
       uiToast(String("Mechanism update failed: ") + r.error);
       Serial.printf("[NET] mechanism update FAILED: %s\n", r.error);
@@ -487,29 +653,43 @@ static void handleWorkerResult(const net_worker::Result &r) {
                         : (String("Today ") + fmtHhmm(r.hour, r.minute));
       }
 
+      // Optimistic feeding state per successfully fed tank.
+      for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
+        if (r.tanksOk & (1u << (t - 1))) {
+          s_tank_feeding[t - 1] = true;
+          s_opt_feeding[t - 1] = true;
+          s_opt_feeding_until[t - 1] =
+              millis() + (uint32_t)r.seconds * 1000UL + 2000UL;
+        }
+      }
+
       lvgl_port_lock(-1);
       ui_set_feed_busy(false);
       if (clock_ok) ui_set_last_feed(when);
-      ui_set_relay(true, String(r.ip), true); // M2: optimistic feeding state
       if (r.manual) {
-        String t = String("Fed OK (") + r.seconds + " s)";
+        String t = String("Fed OK (") + r.seconds + " s";
+        if (r.tanksOk & (r.tanksOk - 1)) t += ", multiple tanks";
         if (r.clamped) t += " - clamped"; // M3: relay clamp surfaced
+        t += ")";
         ui_toast(t);
       } else {
-        ui_toast(String("Fed ") + fmtHhmm(r.hour, r.minute));
+        String t = String("Fed ") + fmtHhmm(r.hour, r.minute);
+        if (r.tanksFail) t += " (some tanks failed)";
+        ui_toast(t);
       }
       lvgl_port_unlock();
+      refreshSelectedTankCard();
 
       if (r.clamped)
         Serial.printf("[FEED] relay clamp note: %s\n", r.note);
-      s_opt_feeding = true;
-      s_opt_feeding_until = millis() + (uint32_t)r.seconds * 1000UL + 2000UL;
-      s_relay_online_cached = true;
-      s_feeding_cached = true;
+      if (r.tanksFail)
+        Serial.printf("[FEED] partial feed: ok=0x%X fail=0x%X (%s)\n",
+                      (unsigned)r.tanksOk, (unsigned)r.tanksFail, r.error);
       // Retained MQTT mirror: the relay IS pulsing now (M2-consistent).
-      mqtt_mgr::publishFeeding(true);
+      recomputeAggregates();
       if (clock_ok) mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
-      Serial.printf("[FEED] feed OK via %s (%u s)\n", r.ip, (unsigned)r.seconds);
+      Serial.printf("[FEED] feed OK via %s (%u s, tanks ok=0x%X)\n", r.ip,
+                    (unsigned)r.seconds, (unsigned)r.tanksOk);
       refreshNextFeedUi();
     } else if (r.manual) {
       lvgl_port_lock(-1);
@@ -518,12 +698,13 @@ static void handleWorkerResult(const net_worker::Result &r) {
       lvgl_port_unlock();
       Serial.printf("[FEED] manual feed FAILED: %s\n", r.error);
     } else {
-      // scheduled feed
+      // scheduled feed (all target tanks failed): retry the failed set
       if (r.retry) {
         uiToast(String("Feed FAILED: ") + r.error);
         Serial.printf("[FEED] scheduled feed FAILED (no more retries): %s\n",
                       r.error);
-      } else if (armRetry(r.hour, r.minute, r.seconds, 30000UL)) {
+      } else if (armRetry(r.hour, r.minute, r.seconds, 30000UL,
+                          r.tanksFail ? r.tanksFail : 0x01)) {
         uiToast("Feed failed - retrying in 30 s");
         Serial.printf("[FEED] scheduled feed failed (%s), retry armed\n",
                       r.error);
@@ -535,29 +716,63 @@ static void handleWorkerResult(const net_worker::Result &r) {
     return;
   }
 
-  // RES_PROBE
-  s_opt_feeding = false; // a real /status result supersedes the optimistic state
-  s_relay_online_cached = r.online;
-  s_feeding_cached = r.online && r.feeding;
-  lvgl_port_lock(-1);
-  ui_set_probe_busy(false);
-  ui_set_relay(r.online, r.ip, r.feeding);
-  ui_set_mech(String(r.mech), r.mechRest, r.mechFeed, r.mechHz);
-  lvgl_port_unlock();
-  // Retained MQTT mirror of the relay state (no-ops when disconnected).
-  mqtt_mgr::publishRelayOnline(r.online);
-  if (r.online) mqtt_mgr::publishFeeding(r.feeding);
-  if (r.report) {
-    if (!net_wifi::wifi_is_connected())
-      ui_toast("WiFi not connected");
-    else if (r.online) {
-      String t = String("Relay OK  v") + r.version;
-      if (r.protoMismatch) t += " (protocol mismatch!)";
-      ui_toast(t);
-    } else
-      ui_toast("Relay unreachable");
+  if (r.kind == net_worker::Result::RES_SCAN) {
+    lvgl_port_lock(-1);
+    ui_set_scan_busy(false);
+    lvgl_port_unlock();
+    if (r.ok) {
+      String ips[relay_client::MAX_TANKS];
+      for (uint8_t i = 0; i < relay_client::MAX_TANKS; i++)
+        ips[i] = relay_client::ip(i + 1);
+      lvgl_port_lock(-1);
+      ui_tanks_state(s_tank_online, s_tank_feeding, ips);
+      lvgl_port_unlock();
+      String t = String("Scan: ") + r.liveCount + " relay(s) live";
+      if (r.boundMask) t += ", " + String((int)__builtin_popcount(r.boundMask)) + " newly bound";
+      uiToast(t);
+      Serial.printf("[NET] tank scan done: live=%u bound=0x%X\n",
+                    (unsigned)r.liveCount, (unsigned)r.boundMask);
+      refreshSelectedTankCard();
+    } else {
+      uiToast(String("Scan failed: ") + r.error);
+      Serial.printf("[NET] tank scan FAILED: %s\n", r.error);
+    }
+    return;
   }
-  lvgl_port_unlock();
+
+  // RES_PROBE
+  {
+    const uint8_t i =
+        (r.tankId >= 1 && r.tankId <= relay_client::MAX_TANKS) ? r.tankId - 1 : 0;
+    s_tank_online[i] = r.online;
+    s_tank_feeding[i] = r.online && r.feeding;
+    s_opt_feeding[i] = false; // a real /status result supersedes the optimistic state
+    lvgl_port_lock(-1);
+    ui_set_probe_busy(false);
+    if (i == s_selected_tank) {
+      ui_set_relay(r.online, r.ip, r.feeding);
+      ui_set_mech(String(r.mech), r.mechRest, r.mechFeed, r.mechHz);
+    }
+    String ips[relay_client::MAX_TANKS];
+    for (uint8_t t = 0; t < relay_client::MAX_TANKS; t++)
+      ips[t] = relay_client::ip(t + 1);
+    ui_tanks_state(s_tank_online, s_tank_feeding, ips);
+    lvgl_port_unlock();
+    // Retained MQTT mirror of the relay state (no-ops when disconnected).
+    mqtt_mgr::publishTankOnline(r.tankId, r.online);
+    recomputeAggregates();
+    if (r.report) {
+      if (!net_wifi::wifi_is_connected())
+        ui_toast("WiFi not connected");
+      else if (r.online) {
+        String t = String("Tank ") + (int)r.tankId + " OK  v" + r.version;
+        if (r.protoMismatch) t += " (protocol mismatch!)";
+        ui_toast(t);
+      } else
+        ui_toast(String("Tank ") + (int)r.tankId + " unreachable");
+    }
+    return;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,8 +813,14 @@ void setup() {
   lvgl_port_lock(-1);
   ui_init();
   ui_set_backlight_cb(appSetBacklight, prefs::getBacklightOn());
-  ui_set_relay(false, prefs::getRelayIp());
+  ui_set_relay(false, prefs::getTankIp(1));
   ui_set_last_feed(formatLastFed(prefs::getLastFedEpoch()));
+  {
+    String names[relay_client::MAX_TANKS];
+    for (uint8_t i = 0; i < relay_client::MAX_TANKS; i++)
+      names[i] = prefs::getTankName(i + 1);
+    ui_tanks_rebuild(tankCountClamped(), names, 0);
+  }
   lvgl_port_unlock();
   refreshNextFeedUi();
 
@@ -668,36 +889,37 @@ void loop() {
     // catch-all persist flush (covers setEnabled-only edits)
     feed_scheduler::flushIfDirty();
 
-    // scheduled feeding
+    // scheduled feeding (targets restricted to the configured tanks)
     const FeedTime due = feed_scheduler::tick();
     if (due.enabled) {
-      Serial.printf("[FEED] scheduled feed %02u:%02u (%u s)\n",
+      const uint8_t mask = effectiveTankMask(due, tankCountClamped());
+      Serial.printf("[FEED] scheduled feed %02u:%02u (%u s, tanks 0x%X)\n",
                     (unsigned)due.hour, (unsigned)due.minute,
-                    (unsigned)due.seconds);
+                    (unsigned)due.seconds, (unsigned)mask);
       uiToast("Feeding time!");
-      requestFeed(due.seconds, false, due.hour, due.minute, false);
+      requestFeed(due.seconds, false, due.hour, due.minute, false, mask);
     }
 
     // armed retries for failed scheduled feeds (one delayed attempt each)
     for (SchedRetry &s : s_retries) {
       if (s.pending && (int32_t)(now - s.dueMs) >= 0) {
         s.pending = false;
-        Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u s)\n",
+        Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u s, tanks 0x%X)\n",
                       (unsigned)s.hour, (unsigned)s.minute,
-                      (unsigned)s.seconds);
-        requestFeed(s.seconds, false, s.hour, s.minute, true);
+                      (unsigned)s.seconds, (unsigned)s.tankMask);
+        requestFeed(s.seconds, false, s.hour, s.minute, true, s.tankMask);
       }
     }
 
-    // end of the optimistic feeding indicator (pulse + 2 s elapsed)
-    if (s_opt_feeding && (int32_t)(now - s_opt_feeding_until) >= 0) {
-      s_opt_feeding = false;
-      s_feeding_cached = false;
-      lvgl_port_lock(-1);
-      ui_set_relay(true, relay_client::ip(), false);
-      lvgl_port_unlock();
-      mqtt_mgr::publishFeeding(false);
+    // end of the per-tank optimistic feeding indicator (pulse + 2 s elapsed)
+    for (uint8_t i = 0; i < tankCountClamped(); i++) {
+      if (s_opt_feeding[i] && (int32_t)(now - s_opt_feeding_until[i]) >= 0) {
+        s_opt_feeding[i] = false;
+        s_tank_feeding[i] = false;
+        refreshSelectedTankCard();
+      }
     }
+    recomputeAggregates();
 
     // MQTT reconnect pump + Settings-card status sync
     mqtt_mgr::retryIfDue(now);
@@ -721,11 +943,14 @@ void loop() {
     lvgl_port_unlock();
   }
 
-  // ---------------- 60 s block: relay probe (via worker, only if WiFi up) ----
+  // ---------------- 60 s block: probe every configured tank (via worker) ----
   if ((now - s_t_60s) >= 60000) {
     s_t_60s = now;
     if (net_wifi::wifi_is_connected()) {
-      net_worker::enqueueProbe(false);
+      const uint8_t count = tankCountClamped();
+      for (uint8_t t = 1; t <= count; t++) {
+        net_worker::enqueueProbe(false, t);
+      }
     }
   }
 

@@ -18,8 +18,10 @@ All state topics are **retained**. The single availability topic uses a retained
 | `catfish/pulse/state` | pub | Default pulse seconds (1-30) |
 | `catfish/feed/cmd` | sub | `ON` → feed now with the default pulse |
 | `catfish/pulse/set` | sub | `1`…`30` → change the default pulse (clamped) |
+| `catfish/tank<i>/feed/cmd` | sub | `ON` → feed tank *i* only with the default pulse (one topic per tank, v1.5.0+) |
+| `catfish/tank<i>/online` | pub | `ON`/`OFF` — that tank's relay probe result (retained, v1.5.0+) |
 
-Replace `catfish` with your configured prefix. Discovery configs are published (retained) to the standard Home Assistant prefix, e.g. `homeassistant/button/catfish_feed_now/config`.
+Replace `catfish` with your configured prefix. Discovery configs are published (retained) to the standard Home Assistant prefix, e.g. `homeassistant/button/catfish_feed_now/config`. Per-tank configs live at `homeassistant/button/catfish_tank<i>/config` and `homeassistant/binary_sensor/catfish_tank<i>/config`; when a tank is removed from the configuration its discovery payload is cleared (empty retained message) so the HA entity disappears again.
 
 ## Home Assistant entities
 
@@ -27,10 +29,12 @@ Replace `catfish` with your configured prefix. Discovery configs are published (
 |--------|------|-------|
 | Feed now | `button` | Triggers a real feed through the same worker pipeline as the touchscreen |
 | Default pulse | `number` (1-30 s) | Two-way synced with the Settings spinbox |
-| Relay online | `binary_sensor` (`connectivity`) | Mirrors the relay probe result |
-| Feeding | `binary_sensor` | `on` for pulse + 2 s after each feed |
+| Relay online | `binary_sensor` (`connectivity`) | `on` when ANY configured tank's relay answers `/status` |
+| Feeding | `binary_sensor` | `on` while ANY configured tank's pulse runs (+2 s) |
 | Last feed | `sensor` (`timestamp`) | ISO-8601, usable in HA automations/dashboards |
 | Next feed | `sensor` | `"HH:MM"` string |
+| Feed <tank name> | `button` (per tank, v1.5.0+) | Feeds that single tank |
+| <tank name> online | `binary_sensor` (per tank, v1.5.0+) | That tank's relay probe result |
 
 After entering the broker settings, HA auto-discovers everything within a few seconds (Settings → Devices & services). The device appears as **Catfish Feeder** with the firmware version as `sw_version`.
 
@@ -48,8 +52,11 @@ After entering the broker settings, HA auto-discovers everything within a few se
 # watch everything
 mosquitto_sub -h <broker> -t 'catfish/#' -v
 
-# feed manually
+# feed manually (all tanks / tank 1 on single-tank setups)
 mosquitto_pub -h <broker> -t 'catfish/feed/cmd' -m 'ON'
+
+# feed only tank 2 (multi-tank, v1.5.0+)
+mosquitto_pub -h <broker> -t 'catfish/tank2/feed/cmd' -m 'ON'
 
 # change default pulse to 5 s
 mosquitto_pub -h <broker> -t 'catfish/pulse/set' -m '5'

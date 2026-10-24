@@ -29,6 +29,8 @@ void clampEntry(FeedTime &t) {
   if (t.minute > 59) t.minute = 59;
   if (t.seconds < 1) t.seconds = 1;
   if (t.seconds > 30) t.seconds = 30;
+  t.tanks &= 0x0F;      // P5: only tanks 1..4 exist
+  if (t.tanks == 0) t.tanks = 0x01;
 }
 
 /** Serialize + write to NVS now (call only from loop()/init context). */
@@ -41,6 +43,7 @@ bool persistNow() {
     o["m"] = s_entries[i].minute;
     o["e"] = s_entries[i].enabled;
     o["s"] = s_entries[i].seconds;
+    o["t"] = s_entries[i].tanks; // P5: target-tank bitmask
   }
   String out;
   serializeJson(doc, out);
@@ -50,8 +53,8 @@ bool persistNow() {
 
 void seedDefaults() {
   s_count = 2;
-  s_entries[0] = FeedTime{7, 30, true, 3};   // 07:30, 3 s
-  s_entries[1] = FeedTime{17, 30, true, 3};  // 17:30, 3 s
+  s_entries[0] = FeedTime{7, 30, true, 3, 0x01};   // 07:30, 3 s, tank 1
+  s_entries[1] = FeedTime{17, 30, true, 3, 0x01};  // 17:30, 3 s, tank 1
   resetFireTracking();
   s_dirty = true;
   Serial.println("[FEED] first boot: seeded default schedule 07:30 + 17:30 (3 s)");
@@ -85,6 +88,7 @@ bool init() {
     t.minute = (uint8_t)(v["m"] | 0);
     t.enabled = (bool)(v["e"] | true);
     t.seconds = (uint8_t)(v["s"] | 3);
+    t.tanks = (uint8_t)(v["t"] | 1); // P5: missing key = legacy blob = tank 1
     clampEntry(t);
     s_last_fired[s_count] = 0xFFFF;
     s_entries[s_count++] = t;
@@ -175,6 +179,7 @@ bool replaceAll(const String &json) {
     t.minute = (uint8_t)(v["m"] | 0);
     t.enabled = (bool)(v["e"] | true);
     t.seconds = (uint8_t)(v["s"] | 3);
+    t.tanks = (uint8_t)(v["t"] | 1); // P5
     clampEntry(t);
     for (int i = 0; i < n; i++) {
       if (tmp[i].hour == t.hour && tmp[i].minute == t.minute) return false;

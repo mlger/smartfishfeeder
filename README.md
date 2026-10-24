@@ -19,6 +19,7 @@ Catfish Feeder is a two-board, self-hosted fish feeder. The **Display Unit** (Wa
 - Relay discovery via mDNS (`catfish-relay.local`) and UDP broadcast on port 5050
 - Token-protected feed API (`POST /feed`, default token `catfish` — change it)
 - **Servo / stepper feeding mechanisms** (v1.4.0+): switch the relay unit between DC motor, SG90-class servo sweep or A4988/DRV8825 stepper — same "feed for N seconds" API, configurable on the display unit — see [docs/api.md](docs/api.md)
+- **Multi-tank / multi-relay** (v1.5.0+): one display unit drives up to 4 relay units — per-tank names/tokens, auto-binding UDP discovery, per-tank schedules, HA + dashboard entities — see [docs/firmware.md](docs/firmware.md)
 - MQTT hub on the display unit with **Home Assistant auto-discovery**: HA button/sensors drive real feeds, feeder state (last/next feed, relay online) streams back — see [docs/mqtt.md](docs/mqtt.md)
 - Built-in **web dashboard** on the display unit: feed, edit the schedule and update firmware from any phone browser — see [docs/dashboard.md](docs/dashboard.md)
 - Fully documented: wiring, build, API, UI design pipeline, AI tooling
@@ -129,7 +130,7 @@ CI builds both firmwares on every push (ESP32-S3 factory image pre-merged at boo
 - ~~Servo / stepper-based feeding mechanism option~~ — shipped in v1.4.0 (motor / servo sweep / stepper on the relay unit, additive EEPROM, editable from the display unit)
 - Camera snapshot on each feed event
 - ~~OTA updates for the display unit~~ — shipped in v1.1.0 (ArduinoOTA on both units, optional build-time password)
-- Multi-tank / multi-relay support (one display unit driving several relays)
+- ~~Multi-tank / multi-relay support (one display unit driving several relays)~~ — shipped in v1.5.0 (cap 4 tanks: per-tank IPs/tokens, tank-mask schedules, per-tank MQTT/dashboard entities)
 
 ## Credits
 
