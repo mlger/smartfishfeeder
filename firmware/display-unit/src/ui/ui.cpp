@@ -87,6 +87,7 @@ lv_obj_t *s_sb_pulse = nullptr;
 lv_obj_t *s_sw_bl = nullptr;
 lv_obj_t *s_sw_h12 = nullptr; // v1.6.0: 12-hour clock switch
 lv_obj_t *s_lbl_rtc = nullptr; // v1.6.0: Settings > System RTC status line
+lv_obj_t *s_lbl_sd = nullptr;  // v1.7.0: Settings > STORAGE card summary
 lv_obj_t *s_lbl_ssid = nullptr;
 lv_obj_t *s_lbl_ip = nullptr;
 lv_obj_t *s_lbl_rssi = nullptr;
@@ -1303,6 +1304,16 @@ void buildSettings() {
   lv_obj_set_flex_flow(s_tank_rows, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(s_tank_rows, 6, 0);
 
+  // -- STORAGE card (v1.7.0, optional SD feed log)
+  lv_obj_t *card_sd = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_sd, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_sd, 8, 0);
+  makeTitle(card_sd, "STORAGE");
+  s_lbl_sd = lv_label_create(card_sd);
+  lv_label_set_text(s_lbl_sd, "SD card: ...");
+  lv_obj_set_style_text_font(s_lbl_sd, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_lbl_sd, lv_color_hex(C_TEXT), 0);
+
   // -- Home Assistant / MQTT card
   lv_obj_t *card_mq = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(card_mq, LV_FLEX_FLOW_COLUMN);
@@ -2372,6 +2383,10 @@ void ui_set_hour12(bool h12) {
 
 void ui_set_rtc(const String &text) {
   if (s_lbl_rtc) lv_label_set_text_fmt(s_lbl_rtc, "RTC: %s", text.c_str());
+}
+
+void ui_set_sd(const String &text) {
+  if (s_lbl_sd) lv_label_set_text_fmt(s_lbl_sd, "SD card: %s", text.c_str());
 }
 
 void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz) {
