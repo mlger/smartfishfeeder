@@ -1,0 +1,1036 @@
+/**
+ * @file ui.cpp
+ * @brief LVGL v8.4 UI — Catfish Feeder display unit, 800x480, aquarium theme.
+ *
+ * Theme: deep teal/charcoal background (#10201F), warm amber accent (#F2A33C),
+ * white text, 12px-radius cards, 16-24px padding, touch targets >= 64 px.
+ *
+ * Threading: all ui_* entry points are called under lvgl_port_lock() by the
+ * main loop; LVGL event callbacks run inside the LVGL task (mutex owned).
+ * Callbacks never block: they set volatile request flags consumed by loop().
+ */
+#include "ui.h"
+#include <Arduino.h>
+#include <lvgl.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include "../feed_scheduler.h"
+#include "../prefs.h"
+
+// ---------------------------------------------------------------------------
+// Cross-thread request flags
+// ---------------------------------------------------------------------------
+volatile bool g_feed_request = false;
+volatile uint8_t g_feed_seconds = 3;
+volatile bool g_relay_test_request = false;
+volatile bool g_reboot_request = false;
+volatile bool g_schedule_dirty = false;
+
+namespace ui {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+constexpr uint32_t C_BG        = 0x10201F; // deep teal/charcoal background
+constexpr uint32_t C_BG_DARK   = 0x0B1615; // bars
+constexpr uint32_t C_CARD      = 0x1A2E2C; // card surface
+constexpr uint32_t C_CARD_HI   = 0x243F3B; // pressed card
+constexpr uint32_t C_AMBER     = 0xF2A33C; // warm amber accent
+constexpr uint32_t C_AMBER_HI  = 0xD98F2B; // amber pressed
+constexpr uint32_t C_TEXT      = 0xF2F7F6; // near-white
+constexpr uint32_t C_MUTED     = 0x8FA9A4; // muted gray-teal
+constexpr uint32_t C_GREEN     = 0x46D07E; // online
+constexpr uint32_t C_RED       = 0xD96459; // destructive/offline
+constexpr uint32_t C_INK       = 0x121E1C; // text on amber
+
+// ---------------------------------------------------------------------------
+// Widget handles
+// ---------------------------------------------------------------------------
+lv_obj_t *s_scr[3] = {nullptr, nullptr, nullptr};          // home, schedule, settings
+lv_obj_t *s_clock_lbl[3] = {nullptr, nullptr, nullptr};
+lv_obj_t *s_wifi_sym[3] = {nullptr, nullptr, nullptr};
+lv_obj_t *s_nav_btn[3][3] = {};
+
+// Home
+lv_obj_t *s_next_value = nullptr;
+lv_obj_t *s_next_sub = nullptr;
+lv_obj_t *s_last_value = nullptr;
+lv_obj_t *s_relay_dot = nullptr;
+lv_obj_t *s_relay_txt = nullptr;
+
+// Schedule
+lv_obj_t *s_sched_list = nullptr;
+lv_obj_t *s_editor = nullptr;
+lv_obj_t *s_r_hour = nullptr;
+lv_obj_t *s_r_min = nullptr;
+lv_obj_t *s_sb_sec = nullptr;
+
+// Settings
+lv_obj_t *s_sb_pulse = nullptr;
+lv_obj_t *s_sw_bl = nullptr;
+lv_obj_t *s_lbl_ssid = nullptr;
+lv_obj_t *s_lbl_ip = nullptr;
+lv_obj_t *s_lbl_rssi = nullptr;
+lv_obj_t *s_lbl_relay_ip = nullptr;
+
+// Toast
+lv_obj_t *s_toast_box = nullptr;
+lv_obj_t *s_toast_lbl = nullptr;
+lv_timer_t *s_toast_tmr = nullptr;
+
+// State
+void (*s_bl_cb)(bool) = nullptr;
+bool s_bl_on = true;
+bool s_relay_online = false;
+bool s_dot_blink = false;
+bool s_next_valid = false;
+bool s_next_tomorrow = false;
+int s_next_hour = 0;
+int s_next_minute = 0;
+
+char s_relay_ip_cache[16] = "";
+char s_hour_opts[96] = "";
+char s_min_opts[216] = "";
+char s_clock_cache[8] = "";
+char s_val_cache[24] = "";
+char s_sub_cache[28] = "";
+
+// ---------------------------------------------------------------------------
+// Internal prototypes (order-independent wiring)
+// ---------------------------------------------------------------------------
+void showScreen(int idx);
+void navCb(lv_event_t *e);
+void feedBtnCb(lv_event_t *e);
+void enableSwitchCb(lv_event_t *e);
+void trashCb(lv_event_t *e);
+void trashDeferredCb(void *param);
+void editorSaveCb(lv_event_t *e);
+void editorCancelCb(lv_event_t *e);
+void pulseSpinCb(lv_event_t *e);
+void blSwitchCb(lv_event_t *e);
+void relayTestCb(lv_event_t *e);
+void rebootCb(lv_event_t *e);
+void toastTimerCb(lv_timer_t *t);
+void spinMinusCb(lv_event_t *e);
+void spinPlusCb(lv_event_t *e);
+void rebuildScheduleList();
+void openEditor();
+void closeEditor();
+void addBtnCb(lv_event_t *e);
+void updateNextFeedUi();
+
+// ---------------------------------------------------------------------------
+// Small widget builders
+// ---------------------------------------------------------------------------
+lv_obj_t *makeCard(lv_obj_t *parent, lv_coord_t w, lv_coord_t h) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_set_size(card, w, h);
+  lv_obj_set_style_radius(card, 12, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD), 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(card, 0, 0);
+  lv_obj_set_style_pad_all(card, 16, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  return card;
+}
+
+lv_obj_t *makeTitle(lv_obj_t *parent, const char *txt) {
+  lv_obj_t *lbl = lv_label_create(parent);
+  lv_label_set_text(lbl, txt);
+  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lbl, lv_color_hex(C_MUTED), 0);
+  lv_obj_set_style_text_letter_space(lbl, 2, 0);
+  return lbl;
+}
+
+lv_obj_t *makeBtn(lv_obj_t *parent, const char *txt, uint32_t bg, uint32_t fg,
+                  uint32_t pressed, lv_coord_t w, lv_coord_t h) {
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_width(btn, (w > 0) ? w : LV_SIZE_CONTENT);
+  lv_obj_set_height(btn, h);
+  lv_obj_set_style_radius(btn, 12, 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(bg), 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(pressed), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_t *lbl = lv_label_create(btn);
+  lv_label_set_text(lbl, txt);
+  lv_obj_set_style_text_color(lbl, lv_color_hex(fg), 0);
+  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+  lv_obj_center(lbl);
+  return btn;
+}
+
+lv_obj_t *makeSpinbox(lv_obj_t *parent, int32_t mn, int32_t mx, int32_t val,
+                      lv_coord_t w, lv_coord_t h) {
+  lv_obj_t *sb = lv_spinbox_create(parent);
+  lv_spinbox_set_range(sb, mn, mx);
+  lv_spinbox_set_digit_format(sb, 2, 0);
+  lv_spinbox_set_value(sb, val);
+  lv_obj_set_size(sb, w, h);
+  lv_obj_set_style_bg_color(sb, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(sb, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(sb, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_font(sb, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_border_color(sb, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(sb, 1, 0);
+  lv_obj_set_style_radius(sb, 8, 0);
+  return sb;
+}
+
+/** Row of [-] [spinbox] [+] with big touch targets. Returns the spinbox. */
+lv_obj_t *makeSpinRow(lv_obj_t *parent, int32_t mn, int32_t mx, int32_t val,
+                      lv_event_cb_t on_change) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row, 8, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *sb = makeSpinbox(row, mn, mx, val, 110, 56);
+  if (on_change) lv_obj_add_event_cb(sb, on_change, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *minus = makeBtn(row, LV_SYMBOL_MINUS, C_CARD, C_TEXT, C_CARD_HI, 56, 56);
+  lv_obj_add_event_cb(minus, spinMinusCb, LV_EVENT_CLICKED, sb);
+
+  lv_obj_t *plus = makeBtn(row, LV_SYMBOL_PLUS, C_CARD, C_TEXT, C_CARD_HI, 56, 56);
+  lv_obj_add_event_cb(plus, spinPlusCb, LV_EVENT_CLICKED, sb);
+
+  return sb;
+}
+
+void buildRollerOptions() {
+  s_hour_opts[0] = '\0';
+  for (int i = 0; i < 24; i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02d", i);
+    strcat(s_hour_opts, b);
+    if (i < 23) strcat(s_hour_opts, "\n");
+  }
+  s_min_opts[0] = '\0';
+  for (int i = 0; i < 60; i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02d", i);
+    strcat(s_min_opts, b);
+    if (i < 59) strcat(s_min_opts, "\n");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome: status bar, nav bar, content area (per screen)
+// ---------------------------------------------------------------------------
+void addStatusBar(lv_obj_t *parent, int idx) {
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, lv_pct(100), 48);
+  lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(bar);
+  lv_label_set_text(title, "CATFISH FEEDER");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_letter_space(title, 3, 0);
+  lv_obj_align(title, LV_ALIGN_LEFT_MID, 16, 0);
+
+  lv_obj_t *wf = lv_label_create(bar);
+  lv_label_set_text(wf, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_font(wf, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(wf, lv_color_hex(C_MUTED), 0);
+  lv_obj_align(wf, LV_ALIGN_RIGHT_MID, -68, 0);
+  s_wifi_sym[idx] = wf;
+
+  lv_obj_t *ck = lv_label_create(bar);
+  lv_label_set_text(ck, "--:--");
+  lv_obj_set_style_text_font(ck, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(ck, lv_color_hex(C_TEXT), 0);
+  lv_obj_align(ck, LV_ALIGN_RIGHT_MID, -16, 0);
+  s_clock_lbl[idx] = ck;
+}
+
+void addNavBar(lv_obj_t *parent, int scr_idx) {
+  static const char *defs[3] = {
+      LV_SYMBOL_HOME "  Home",
+      LV_SYMBOL_LIST "  Schedule",
+      LV_SYMBOL_SETTINGS "  Settings"};
+
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, lv_pct(100), 72);
+  lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+  lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (int b = 0; b < 3; b++) {
+    lv_obj_t *btn = makeBtn(bar, defs[b], C_CARD, C_MUTED, C_CARD_HI, 244, 64);
+    lv_obj_add_event_cb(btn, navCb, LV_EVENT_CLICKED, (void *)(intptr_t)b);
+    s_nav_btn[scr_idx][b] = btn;
+  }
+}
+
+lv_obj_t *addContent(lv_obj_t *parent) {
+  lv_obj_t *c = lv_obj_create(parent);
+  lv_obj_remove_style_all(c);
+  lv_obj_set_size(c, lv_pct(100), 360); // 480 - 48 (status) - 72 (nav)
+  lv_obj_align(c, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_set_style_pad_all(c, 16, 0);
+  lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(c, 12, 0);
+  lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+  return c;
+}
+
+// ---------------------------------------------------------------------------
+// Callbacks
+// ---------------------------------------------------------------------------
+void showScreen(int idx) {
+  lv_scr_load(s_scr[idx]);
+  for (int s = 0; s < 3; s++) {
+    for (int b = 0; b < 3; b++) {
+      const bool act = (b == idx);
+      lv_obj_set_style_bg_color(s_nav_btn[s][b],
+                                lv_color_hex(act ? C_CARD_HI : C_CARD), 0);
+      lv_obj_set_style_text_color(s_nav_btn[s][b],
+                                  lv_color_hex(act ? C_AMBER : C_MUTED), 0);
+    }
+  }
+}
+
+void navCb(lv_event_t *e) {
+  showScreen((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+void feedBtnCb(lv_event_t *e) {
+  (void)e;
+  ui_request_feed(prefs::getDefaultPulse());
+}
+
+void enableSwitchCb(lv_event_t *e) {
+  const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  const bool en = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  feed_scheduler::setEnabled(idx, en);
+  g_schedule_dirty = true;
+  Serial.printf("[UI] schedule entry %d %s\n", idx, en ? "enabled" : "disabled");
+}
+
+void trashDeferredCb(void *param) {
+  const int idx = (int)(intptr_t)param;
+  if (feed_scheduler::remove(idx)) {
+    g_schedule_dirty = true;
+    rebuildScheduleList();
+    ui_toast("Feeding time removed");
+  }
+}
+
+void trashCb(lv_event_t *e) {
+  // defer: the trash button lives inside the container we are about to clean
+  lv_async_call(trashDeferredCb, lv_event_get_user_data(e));
+}
+
+void addBtnCb(lv_event_t *e) {
+  (void)e;
+  openEditor();
+}
+
+void editorSaveCb(lv_event_t *e) {
+  (void)e;
+  FeedTime t;
+  t.hour = (uint8_t)lv_roller_get_selected(s_r_hour);
+  t.minute = (uint8_t)lv_roller_get_selected(s_r_min);
+  t.seconds = (uint8_t)lv_spinbox_get_value(s_sb_sec);
+  t.enabled = true;
+
+  if (feed_scheduler::add(t)) {
+    g_schedule_dirty = true;
+    rebuildScheduleList();
+    ui_toast("Feeding time added");
+    closeEditor();
+  } else {
+    ui_toast("Schedule full (max 8)");
+  }
+}
+
+void editorCancelCb(lv_event_t *e) {
+  (void)e;
+  closeEditor();
+}
+
+void pulseSpinCb(lv_event_t *e) {
+  lv_obj_t *sb = (lv_obj_t *)lv_event_get_target(e);
+  const uint8_t v = (uint8_t)lv_spinbox_get_value(sb);
+  prefs::setDefaultPulse(v);
+  Serial.printf("[UI] default pulse set to %u s\n", (unsigned)v);
+}
+
+void blSwitchCb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  s_bl_on = on;
+  if (s_bl_cb) s_bl_cb(on);
+  Serial.printf("[UI] backlight %s\n", on ? "ON" : "OFF");
+}
+
+void relayTestCb(lv_event_t *e) {
+  (void)e;
+  g_relay_test_request = true; // loop() performs the (blocking) probe
+}
+
+void rebootCb(lv_event_t *e) {
+  (void)e;
+  g_reboot_request = true; // loop() performs the reboot
+}
+
+void toastTimerCb(lv_timer_t *t) {
+  (void)t;
+  if (s_toast_box) lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
+  if (s_toast_tmr) lv_timer_pause(s_toast_tmr);
+}
+
+void spinMinusCb(lv_event_t *e) {
+  lv_spinbox_decrement((lv_obj_t *)lv_event_get_user_data(e));
+}
+
+void spinPlusCb(lv_event_t *e) {
+  lv_spinbox_increment((lv_obj_t *)lv_event_get_user_data(e));
+}
+
+// ---------------------------------------------------------------------------
+// Schedule list + editor
+// ---------------------------------------------------------------------------
+void rebuildScheduleList() {
+  if (!s_sched_list) return;
+  lv_obj_clean(s_sched_list);
+
+  const int n = feed_scheduler::getCount();
+  if (n == 0) {
+    lv_obj_t *empty = lv_label_create(s_sched_list);
+    lv_label_set_text(empty, "No feeding times yet. Tap ADD FEEDING TIME below.");
+    lv_obj_set_style_text_color(empty, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+    return;
+  }
+
+  const FeedTime *all = feed_scheduler::getAll();
+  for (int i = 0; i < n; i++) {
+    const FeedTime &en = all[i];
+
+    lv_obj_t *card = lv_obj_create(s_sched_list);
+    lv_obj_set_size(card, lv_pct(100), 76);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_pad_ver(card, 6, 0);
+    lv_obj_set_style_pad_hor(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02u:%02u  \xE2\x80\xA2  %u s",
+             (unsigned)en.hour, (unsigned)en.minute, (unsigned)en.seconds);
+    lv_obj_t *tl = lv_label_create(card);
+    lv_label_set_text(tl, buf);
+    lv_obj_set_style_text_font(tl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(tl,
+                                lv_color_hex(en.enabled ? C_TEXT : C_MUTED), 0);
+    lv_obj_set_flex_grow(tl, 1);
+
+    lv_obj_t *sw = lv_switch_create(card);
+    lv_obj_set_size(sw, 72, 36);
+    if (en.enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, enableSwitchCb, LV_EVENT_VALUE_CHANGED,
+                        (void *)(intptr_t)i);
+
+    lv_obj_t *trash = lv_btn_create(card);
+    lv_obj_set_size(trash, 64, 64);
+    lv_obj_set_style_radius(trash, 12, 0);
+    lv_obj_set_style_bg_color(trash, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_bg_color(trash, lv_color_hex(C_CARD_HI), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(trash, 0, 0);
+    lv_obj_set_style_shadow_width(trash, 0, 0);
+    lv_obj_t *ti = lv_label_create(trash);
+    lv_label_set_text(ti, LV_SYMBOL_TRASH);
+    lv_obj_set_style_text_color(ti, lv_color_hex(C_RED), 0);
+    lv_obj_set_style_text_font(ti, &lv_font_montserrat_20, 0);
+    lv_obj_center(ti);
+    lv_obj_add_event_cb(trash, trashCb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+  }
+}
+
+void openEditor() {
+  if (!s_editor) return;
+  lv_roller_set_selected(s_r_hour, 7, LV_ANIM_OFF);
+  lv_roller_set_selected(s_r_min, 30, LV_ANIM_OFF);
+  lv_spinbox_set_value(s_sb_sec, prefs::getDefaultPulse());
+  lv_obj_clear_flag(s_editor, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_editor);
+}
+
+void closeEditor() {
+  if (s_editor) lv_obj_add_flag(s_editor, LV_OBJ_FLAG_HIDDEN);
+}
+
+lv_obj_t *makeRoller(lv_obj_t *parent, const char *opts, int sel) {
+  lv_obj_t *r = lv_roller_create(parent);
+  lv_roller_set_options(r, opts, LV_ROLLER_MODE_NORMAL);
+  lv_roller_set_visible_row_count(r, 4);
+  lv_roller_set_selected(r, sel, LV_ANIM_OFF);
+  lv_obj_set_width(r, 150);
+  lv_obj_set_style_bg_color(r, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(r, lv_color_hex(C_MUTED), 0);
+  lv_obj_set_style_text_color(r, lv_color_hex(C_INK), LV_PART_SELECTED);
+  lv_obj_set_style_bg_color(r, lv_color_hex(C_AMBER), LV_PART_SELECTED);
+  lv_obj_set_style_text_font(r, &lv_font_montserrat_20, LV_PART_SELECTED);
+  lv_obj_set_style_border_color(r, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(r, 1, 0);
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Screen builders
+// ---------------------------------------------------------------------------
+void buildHome() {
+  s_scr[0] = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(s_scr[0], lv_color_hex(C_BG), 0);
+  lv_obj_set_style_bg_opa(s_scr[0], LV_OPA_COVER, 0);
+  lv_obj_clear_flag(s_scr[0], LV_OBJ_FLAG_SCROLLABLE);
+
+  addStatusBar(s_scr[0], 0);
+  addNavBar(s_scr[0], 0);
+  lv_obj_t *c = addContent(s_scr[0]);
+  lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+
+  // FEED NOW — big amber action button
+  lv_obj_t *feed = lv_btn_create(c);
+  lv_obj_set_size(feed, 420, 120);
+  lv_obj_set_style_radius(feed, 24, 0);
+  lv_obj_set_style_bg_color(feed, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_bg_color(feed, lv_color_hex(C_AMBER_HI), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(feed, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(feed, 0, 0);
+  lv_obj_set_style_shadow_width(feed, 0, 0);
+  lv_obj_t *fl = lv_label_create(feed);
+  lv_label_set_text(fl, LV_SYMBOL_PLAY "  FEED NOW");
+  lv_obj_set_style_text_font(fl, &lv_font_montserrat_32, 0);
+  lv_obj_set_style_text_color(fl, lv_color_hex(C_INK), 0);
+  lv_obj_center(fl);
+  lv_obj_add_event_cb(feed, feedBtnCb, LV_EVENT_CLICKED, nullptr);
+
+  // info cards row: next feeding / last fed / relay unit
+  lv_obj_t *row = lv_obj_create(c);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, lv_pct(100), 170);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Next feeding card
+  lv_obj_t *card_next = makeCard(row, lv_pct(32), 170);
+  lv_obj_set_flex_flow(card_next, LV_FLEX_FLOW_COLUMN);
+  makeTitle(card_next, "NEXT FEEDING");
+  s_next_value = lv_label_create(card_next);
+  lv_label_set_text(s_next_value, "--:--");
+  lv_obj_set_style_text_font(s_next_value, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(s_next_value, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_width(s_next_value, lv_pct(100));
+  lv_label_set_long_mode(s_next_value, LV_LABEL_LONG_DOT);
+  s_next_sub = lv_label_create(card_next);
+  lv_label_set_text(s_next_sub, "");
+  lv_obj_set_style_text_font(s_next_sub, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_next_sub, lv_color_hex(C_MUTED), 0);
+  lv_obj_set_width(s_next_sub, lv_pct(100));
+  lv_label_set_long_mode(s_next_sub, LV_LABEL_LONG_DOT);
+
+  // Last fed card
+  lv_obj_t *card_last = makeCard(row, lv_pct(32), 170);
+  lv_obj_set_flex_flow(card_last, LV_FLEX_FLOW_COLUMN);
+  makeTitle(card_last, "LAST FED");
+  s_last_value = lv_label_create(card_last);
+  lv_label_set_text(s_last_value, "Never");
+  lv_obj_set_style_text_font(s_last_value, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(s_last_value, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_width(s_last_value, lv_pct(100));
+  lv_label_set_long_mode(s_last_value, LV_LABEL_LONG_DOT);
+
+  // Relay unit card
+  lv_obj_t *card_relay = makeCard(row, lv_pct(32), 170);
+  lv_obj_set_flex_flow(card_relay, LV_FLEX_FLOW_COLUMN);
+  makeTitle(card_relay, "RELAY UNIT");
+  lv_obj_t *rrow = lv_obj_create(card_relay);
+  lv_obj_remove_style_all(rrow);
+  lv_obj_set_size(rrow, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(rrow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(rrow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(rrow, 8, 0);
+  lv_obj_clear_flag(rrow, LV_OBJ_FLAG_SCROLLABLE);
+
+  s_relay_dot = lv_obj_create(rrow);
+  lv_obj_remove_style_all(s_relay_dot);
+  lv_obj_set_size(s_relay_dot, 14, 14);
+  lv_obj_set_style_radius(s_relay_dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(s_relay_dot, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_bg_opa(s_relay_dot, LV_OPA_COVER, 0);
+
+  s_relay_txt = lv_label_create(rrow);
+  lv_label_set_text(s_relay_txt, "Searching...");
+  lv_obj_set_style_text_font(s_relay_txt, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_relay_txt, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(s_relay_txt, 1);
+  lv_label_set_long_mode(s_relay_txt, LV_LABEL_LONG_WRAP);
+}
+
+void buildSchedule() {
+  s_scr[1] = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(s_scr[1], lv_color_hex(C_BG), 0);
+  lv_obj_set_style_bg_opa(s_scr[1], LV_OPA_COVER, 0);
+  lv_obj_clear_flag(s_scr[1], LV_OBJ_FLAG_SCROLLABLE);
+
+  addStatusBar(s_scr[1], 1);
+  addNavBar(s_scr[1], 1);
+  lv_obj_t *c = addContent(s_scr[1]);
+
+  // scrollable list of feed-time cards (grows to fill remaining height)
+  s_sched_list = lv_obj_create(c);
+  lv_obj_remove_style_all(s_sched_list);
+  lv_obj_set_flex_grow(s_sched_list, 1);
+  lv_obj_set_width(s_sched_list, lv_pct(100));
+  lv_obj_set_flex_flow(s_sched_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_sched_list, 12, 0);
+
+  // ADD FEEDING TIME button (pinned below the list)
+  lv_obj_t *add = makeBtn(c, LV_SYMBOL_PLUS "  ADD FEEDING TIME", C_CARD,
+                          C_AMBER, C_CARD_HI, lv_pct(100), 64);
+  lv_obj_set_style_border_color(add, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(add, 2, 0);
+  lv_obj_add_event_cb(add, addBtnCb, LV_EVENT_CLICKED, nullptr);
+
+  rebuildScheduleList();
+
+  // --- editor overlay (hidden) ---
+  s_editor = lv_obj_create(s_scr[1]);
+  lv_obj_remove_style_all(s_editor);
+  lv_obj_set_size(s_editor, lv_pct(100), 360);
+  lv_obj_align(s_editor, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_set_style_bg_color(s_editor, lv_color_hex(C_BG), 0);
+  lv_obj_set_style_bg_opa(s_editor, LV_OPA_90, 0);
+  lv_obj_add_flag(s_editor, LV_OBJ_FLAG_CLICKABLE); // swallow clicks behind
+  lv_obj_add_flag(s_editor, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *card = makeCard(s_editor, 720, 330);
+  lv_obj_center(card);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 12, 0);
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, "NEW FEEDING TIME");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  lv_obj_t *editors = lv_obj_create(card);
+  lv_obj_remove_style_all(editors);
+  lv_obj_set_width(editors, lv_pct(100));
+  lv_obj_set_height(editors, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(editors, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(editors, LV_FLEX_ALIGN_SPACE_EVENLY,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(editors, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *col_h = lv_obj_create(editors);
+  lv_obj_remove_style_all(col_h);
+  lv_obj_set_size(col_h, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(col_h, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(col_h, 6, 0);
+  lv_obj_t *lh = lv_label_create(col_h);
+  lv_label_set_text(lh, "HOUR");
+  lv_obj_set_style_text_font(lh, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lh, lv_color_hex(C_MUTED), 0);
+  s_r_hour = makeRoller(col_h, s_hour_opts, 7);
+
+  lv_obj_t *col_m = lv_obj_create(editors);
+  lv_obj_remove_style_all(col_m);
+  lv_obj_set_size(col_m, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(col_m, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(col_m, 6, 0);
+  lv_obj_t *lm = lv_label_create(col_m);
+  lv_label_set_text(lm, "MINUTE");
+  lv_obj_set_style_text_font(lm, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lm, lv_color_hex(C_MUTED), 0);
+  s_r_min = makeRoller(col_m, s_min_opts, 30);
+
+  lv_obj_t *col_s = lv_obj_create(editors);
+  lv_obj_remove_style_all(col_s);
+  lv_obj_set_size(col_s, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(col_s, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(col_s, 6, 0);
+  lv_obj_t *ls = lv_label_create(col_s);
+  lv_label_set_text(ls, "SECONDS");
+  lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(ls, lv_color_hex(C_MUTED), 0);
+  s_sb_sec = makeSpinRow(col_s, 1, 30, prefs::getDefaultPulse(), nullptr);
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *save = makeBtn(btns, LV_SYMBOL_OK "  Save", C_AMBER, C_INK,
+                           C_AMBER_HI, 100, 64);
+  lv_obj_set_flex_grow(save, 1);
+  lv_obj_add_event_cb(save, editorSaveCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *cancel = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                             C_CARD_HI, 100, 64);
+  lv_obj_set_flex_grow(cancel, 1);
+  lv_obj_add_event_cb(cancel, editorCancelCb, LV_EVENT_CLICKED, nullptr);
+}
+
+void buildSettings() {
+  s_scr[2] = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(s_scr[2], lv_color_hex(C_BG), 0);
+  lv_obj_set_style_bg_opa(s_scr[2], LV_OPA_COVER, 0);
+  lv_obj_clear_flag(s_scr[2], LV_OBJ_FLAG_SCROLLABLE);
+
+  addStatusBar(s_scr[2], 2);
+  addNavBar(s_scr[2], 2);
+  lv_obj_t *c = addContent(s_scr[2]);
+
+  // scrollable stack of setting cards
+  lv_obj_t *list = lv_obj_create(c);
+  lv_obj_remove_style_all(list);
+  lv_obj_set_flex_grow(list, 1);
+  lv_obj_set_width(list, lv_pct(100));
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(list, 12, 0);
+
+  // -- Feeding card
+  lv_obj_t *card_feed = makeCard(list, lv_pct(100), 100);
+  lv_obj_set_flex_flow(card_feed, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(card_feed, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(card_feed, 12, 0);
+  lv_obj_t *lbl_p = lv_label_create(card_feed);
+  lv_label_set_text(lbl_p, "Default pulse seconds");
+  lv_obj_set_style_text_font(lbl_p, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_p, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(lbl_p, 1);
+  s_sb_pulse = makeSpinRow(card_feed, 1, 30, prefs::getDefaultPulse(), pulseSpinCb);
+
+  // -- Display card
+  lv_obj_t *card_disp = makeCard(list, lv_pct(100), 100);
+  lv_obj_set_flex_flow(card_disp, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(card_disp, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(card_disp, 12, 0);
+  lv_obj_t *lbl_d = lv_label_create(card_disp);
+  lv_label_set_text(lbl_d, "Backlight");
+  lv_obj_set_style_text_font(lbl_d, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_d, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(lbl_d, 1);
+  s_sw_bl = lv_switch_create(card_disp);
+  lv_obj_set_size(s_sw_bl, 72, 36);
+  if (s_bl_on) lv_obj_add_state(s_sw_bl, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(s_sw_bl, blSwitchCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  // -- Network card
+  lv_obj_t *card_net = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_net, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_net, 4, 0);
+  makeTitle(card_net, "NETWORK");
+  s_lbl_ssid = lv_label_create(card_net);
+  lv_label_set_text(s_lbl_ssid, "SSID:  not connected");
+  s_lbl_ip = lv_label_create(card_net);
+  lv_label_set_text(s_lbl_ip, "IP:  --");
+  s_lbl_rssi = lv_label_create(card_net);
+  lv_label_set_text(s_lbl_rssi, "RSSI:  --");
+  for (lv_obj_t *l : {s_lbl_ssid, s_lbl_ip, s_lbl_rssi}) {
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
+  }
+
+  // -- Relay card
+  lv_obj_t *card_relay = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_relay, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_relay, 8, 0);
+  makeTitle(card_relay, "RELAY UNIT");
+  s_lbl_relay_ip = lv_label_create(card_relay);
+  lv_label_set_text(s_lbl_relay_ip, "Relay IP: not found");
+  lv_obj_set_style_text_font(s_lbl_relay_ip, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_lbl_relay_ip, lv_color_hex(C_TEXT), 0);
+  lv_obj_t *test = makeBtn(card_relay, LV_SYMBOL_REFRESH "  Test connection",
+                           C_CARD, C_AMBER, C_CARD_HI, lv_pct(100), 64);
+  lv_obj_set_style_border_color(test, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(test, 2, 0);
+  lv_obj_add_event_cb(test, relayTestCb, LV_EVENT_CLICKED, nullptr);
+
+  // -- System card
+  lv_obj_t *card_sys = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_sys, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_sys, 8, 0);
+  lv_obj_t *ver = lv_label_create(card_sys);
+  lv_label_set_text(ver, "Firmware v" CATFISH_APP_VERSION "  (display-unit)");
+  lv_obj_set_style_text_font(ver, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ver, lv_color_hex(C_MUTED), 0);
+  lv_obj_t *rb = makeBtn(card_sys, LV_SYMBOL_POWER "  Reboot", 0x7E352F,
+                         C_TEXT, 0x652A25, lv_pct(100), 64);
+  lv_obj_add_event_cb(rb, rebootCb, LV_EVENT_CLICKED, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Housekeeping helpers
+// ---------------------------------------------------------------------------
+void updateNextFeedUi() {
+  if (!s_next_valid) return;
+
+  const time_t now = time(nullptr);
+  struct tm lt;
+  if (!localtime_r(&now, &lt)) return;
+  if (lt.tm_year < (2025 - 1900)) return; // no NTP yet
+
+  struct tm tgt = lt;
+  tgt.tm_hour = s_next_hour;
+  tgt.tm_min = s_next_minute;
+  tgt.tm_sec = 0;
+  if (s_next_tomorrow) tgt.tm_mday += 1;
+  const time_t tt = mktime(&tgt);
+
+  long diff = (long)difftime(tt, now);
+  if (diff < 0) diff = 0;
+
+  const long days = diff / 86400L;
+  const long hrs = (diff % 86400L) / 3600L;
+  const long mins = (diff % 3600L) / 60L;
+
+  char sub[28];
+  if (days > 0)
+    snprintf(sub, sizeof(sub), "in %ld d %ld h", days, hrs);
+  else if (hrs > 0)
+    snprintf(sub, sizeof(sub), "in %ld h %ld m", hrs, mins);
+  else if (mins > 0)
+    snprintf(sub, sizeof(sub), "in %ld m", mins);
+  else
+    snprintf(sub, sizeof(sub), "in <1 m");
+
+  char val[24];
+  if (s_next_tomorrow)
+    snprintf(val, sizeof(val), "Tmrw %02d:%02d", s_next_hour, s_next_minute);
+  else
+    snprintf(val, sizeof(val), "%02d:%02d", s_next_hour, s_next_minute);
+
+  if (strcmp(val, s_val_cache) != 0) {
+    strlcpy(s_val_cache, val, sizeof(s_val_cache));
+    if (s_next_value) lv_label_set_text(s_next_value, val);
+  }
+  if (strcmp(sub, s_sub_cache) != 0) {
+    strlcpy(s_sub_cache, sub, sizeof(s_sub_cache));
+    if (s_next_sub) lv_label_set_text(s_next_sub, sub);
+  }
+}
+
+void toastTimerInit() {
+  s_toast_box = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_toast_box);
+  lv_obj_set_size(s_toast_box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(s_toast_box, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_bg_opa(s_toast_box, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(s_toast_box, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(s_toast_box, 2, 0);
+  lv_obj_set_style_radius(s_toast_box, 12, 0);
+  lv_obj_set_style_pad_hor(s_toast_box, 24, 0);
+  lv_obj_set_style_pad_ver(s_toast_box, 14, 0);
+  lv_obj_clear_flag(s_toast_box, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_align(s_toast_box, LV_ALIGN_TOP_MID, 0, 64);
+
+  s_toast_lbl = lv_label_create(s_toast_box);
+  lv_label_set_text(s_toast_lbl, "");
+  lv_obj_set_style_text_font(s_toast_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_toast_lbl, lv_color_hex(C_TEXT), 0);
+
+  s_toast_tmr = lv_timer_create(toastTimerCb, 2200, nullptr);
+  lv_timer_pause(s_toast_tmr);
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Public API (caller holds lvgl_port_lock unless running inside LVGL task)
+// ---------------------------------------------------------------------------
+void ui_init() {
+  buildRollerOptions();
+  buildHome();
+  buildSchedule();
+  buildSettings();
+  toastTimerInit();
+
+  showScreen(0);
+  ui_set_next_feed("Waiting for time sync...");
+  ui_set_last_feed("Never");
+  Serial.println("[UI] screens built (home, schedule, settings)");
+}
+
+void ui_tick() {
+  // clock (all status bars)
+  const time_t now = time(nullptr);
+  struct tm lt;
+  char hhmm[8];
+  if (localtime_r(&now, &lt) && lt.tm_year >= (2025 - 1900))
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
+  else
+    snprintf(hhmm, sizeof(hhmm), "--:--");
+
+  if (strcmp(hhmm, s_clock_cache) != 0) {
+    strlcpy(s_clock_cache, hhmm, sizeof(s_clock_cache));
+    for (int i = 0; i < 3; i++) {
+      if (s_clock_lbl[i]) lv_label_set_text(s_clock_lbl[i], hhmm);
+    }
+  }
+
+  // next-feed countdown
+  updateNextFeedUi();
+
+  // relay dot pulse while relay not confirmed online
+  if (s_relay_dot) {
+    if (!s_relay_online) {
+      s_dot_blink = !s_dot_blink;
+      lv_obj_set_style_bg_opa(s_relay_dot, s_dot_blink ? LV_OPA_COVER : LV_OPA_30, 0);
+    } else {
+      lv_obj_set_style_bg_opa(s_relay_dot, LV_OPA_COVER, 0);
+    }
+  }
+}
+
+void ui_set_wifi(bool connected, String ssid, String ip, int rssi) {
+  for (int i = 0; i < 3; i++) {
+    if (s_wifi_sym[i]) {
+      lv_obj_set_style_text_color(s_wifi_sym[i],
+                                  lv_color_hex(connected ? C_TEXT : C_MUTED), 0);
+    }
+  }
+  if (s_lbl_ssid) {
+    if (connected && ssid.length())
+      lv_label_set_text_fmt(s_lbl_ssid, "SSID:  %s", ssid.c_str());
+    else
+      lv_label_set_text(s_lbl_ssid, "SSID:  not connected");
+  }
+  if (s_lbl_ip) {
+    if (connected && ip.length())
+      lv_label_set_text_fmt(s_lbl_ip, "IP:  %s", ip.c_str());
+    else
+      lv_label_set_text(s_lbl_ip, "IP:  --");
+  }
+  if (s_lbl_rssi) {
+    if (connected)
+      lv_label_set_text_fmt(s_lbl_rssi, "RSSI:  %d dBm", rssi);
+    else
+      lv_label_set_text(s_lbl_rssi, "RSSI:  --");
+  }
+}
+
+void ui_set_relay(bool online, String ip) {
+  s_relay_online = online;
+  strlcpy(s_relay_ip_cache, ip.c_str(), sizeof(s_relay_ip_cache));
+
+  if (s_relay_dot) {
+    lv_obj_set_style_bg_color(s_relay_dot,
+                              lv_color_hex(online ? C_GREEN : C_AMBER), 0);
+    lv_obj_set_style_bg_opa(s_relay_dot, LV_OPA_COVER, 0);
+  }
+  if (s_relay_txt) {
+    if (online && s_relay_ip_cache[0])
+      lv_label_set_text_fmt(s_relay_txt, "Online  \xE2\x80\xA2  %s",
+                            s_relay_ip_cache);
+    else if (s_relay_ip_cache[0])
+      lv_label_set_text_fmt(s_relay_txt, "Offline  \xE2\x80\xA2  %s",
+                            s_relay_ip_cache);
+    else
+      lv_label_set_text(s_relay_txt, "Searching...");
+  }
+  if (s_lbl_relay_ip) {
+    lv_label_set_text_fmt(s_lbl_relay_ip, "Relay IP: %s",
+                          s_relay_ip_cache[0] ? s_relay_ip_cache : "not found");
+  }
+}
+
+void ui_set_next_feed(String text) {
+  s_next_valid = false;
+  s_val_cache[0] = '\0';
+  s_sub_cache[0] = '\0';
+  if (s_next_value) lv_label_set_text(s_next_value, text.c_str());
+  if (s_next_sub) lv_label_set_text(s_next_sub, "");
+}
+
+void ui_set_next_feed_time(int hour, int minute, bool tomorrow, bool valid) {
+  s_next_valid = valid;
+  s_next_tomorrow = tomorrow;
+  s_next_hour = hour;
+  s_next_minute = minute;
+  s_val_cache[0] = '\0';
+  s_sub_cache[0] = '\0';
+  if (!valid) {
+    if (s_next_value) lv_label_set_text(s_next_value, "--:--");
+    if (s_next_sub) lv_label_set_text(s_next_sub, "");
+  }
+}
+
+void ui_set_last_feed(String text) {
+  if (s_last_value) lv_label_set_text(s_last_value, text.c_str());
+}
+
+void ui_toast(String msg) {
+  if (!s_toast_box) return;
+  lv_label_set_text(s_toast_lbl, msg.c_str());
+  lv_obj_clear_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_toast_box);
+  lv_obj_fade_in(s_toast_box, 200, 0);
+  lv_timer_reset(s_toast_tmr);
+  lv_timer_resume(s_toast_tmr);
+}
+
+void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on) {
+  s_bl_cb = cb;
+  s_bl_on = initial_on;
+  if (s_sw_bl) {
+    if (initial_on)
+      lv_obj_add_state(s_sw_bl, LV_STATE_CHECKED);
+    else
+      lv_obj_clear_state(s_sw_bl, LV_STATE_CHECKED);
+  }
+}
+
+void ui_request_feed(uint8_t seconds) {
+  if (seconds >= 1 && seconds <= 30) {
+    g_feed_seconds = seconds;
+  } else {
+    uint8_t d = prefs::getDefaultPulse();
+    g_feed_seconds = (d >= 1 && d <= 30) ? d : 3;
+  }
+  g_feed_request = true;
+  Serial.printf("[UI] feed requested: %u s\n", (unsigned)g_feed_seconds);
+}
+
+} // namespace ui

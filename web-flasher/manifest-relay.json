@@ -1,0 +1,13 @@
+{
+  "name": "Catfish Feeder — Relay Unit",
+  "version": "dev",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP8266",
+      "parts": [
+        { "path": "./fw/relay-unit-firmware.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

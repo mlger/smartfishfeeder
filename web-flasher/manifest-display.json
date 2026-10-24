@@ -1,0 +1,13 @@
+{
+  "name": "Catfish Feeder — Display Unit",
+  "version": "dev",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "./fw/display-unit-merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

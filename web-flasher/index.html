@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Catfish Feeder — Web Flasher</title>
+  <!-- ESP Web Tools v10 (verified: resolves to 10.4.0) — the ONLY external resource on this page -->
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root {
+      --pond: #0f2321;        /* deep teal pond */
+      --pond-card: #16302d;
+      --pond-card-edge: #1f403b;
+      --amber: #f2a33c;       /* catfish-belly amber accent */
+      --amber-dim: rgba(242, 163, 60, 0.35);
+      --text: #d9e6e2;
+      --muted: #8faba4;
+      --danger: #e07a5f;
+      /* ESP Web Tools default UI custom properties */
+      --esp-tools-button-color: #f2a33c;
+      --esp-tools-button-text-color: #10231f;
+      --esp-tools-button-border-radius: 10px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(1200px 500px at 80% -10%, rgba(242, 163, 60, 0.06), transparent 60%),
+        radial-gradient(900px 420px at 10% 110%, rgba(38, 84, 78, 0.5), transparent 65%),
+        var(--pond);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.55;
+    }
+
+    .wrap {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 3rem;
+    }
+
+    header.masthead { text-align: center; margin-bottom: 2.25rem; }
+
+    header.masthead .bubble {
+      display: inline-block;
+      font-size: 0.8rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--amber);
+      border: 1px solid var(--amber-dim);
+      border-radius: 999px;
+      padding: 0.25rem 0.9rem;
+      margin-bottom: 0.9rem;
+    }
+
+    h1 {
+      margin: 0 0 0.4rem;
+      font-size: clamp(1.6rem, 4vw, 2.3rem);
+      color: #f4f9f7;
+      font-weight: 700;
+    }
+
+    .tagline { margin: 0 auto; max-width: 620px; color: var(--muted); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2.25rem;
+    }
+
+    .device {
+      background: var(--pond-card);
+      border: 1px solid var(--pond-card-edge);
+      border-radius: 16px;
+      padding: 1.4rem 1.4rem 1.2rem;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+      display: flex;
+      flex-direction: column;
+      gap: 0.7rem;
+    }
+
+    .device h2 {
+      margin: 0;
+      font-size: 1.25rem;
+      color: #f4f9f7;
+    }
+
+    .device .chip {
+      display: inline-block;
+      align-self: flex-start;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--amber);
+      background: rgba(242, 163, 60, 0.1);
+      border: 1px solid var(--amber-dim);
+      border-radius: 8px;
+      padding: 0.15rem 0.55rem;
+    }
+
+    .device p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+
+    .device esp-web-install-button { margin: 0.4rem 0 0; }
+
+    .hint {
+      font-size: 0.85rem;
+      color: var(--muted);
+      border-top: 1px dashed var(--pond-card-edge);
+      padding-top: 0.7rem;
+    }
+
+    .hint strong { color: var(--text); font-weight: 600; }
+
+    .erase-note {
+      font-size: 0.85rem;
+      color: var(--text);
+      background: rgba(242, 163, 60, 0.07);
+      border-left: 3px solid var(--amber);
+      border-radius: 0 8px 8px 0;
+      padding: 0.55rem 0.75rem;
+    }
+
+    esp-web-install-button span[slot="unsupported"],
+    esp-web-install-button span[slot="not-allowed"] {
+      display: block;
+      font-size: 0.88rem;
+      color: var(--danger);
+    }
+
+    .panel {
+      background: var(--pond-card);
+      border: 1px solid var(--pond-card-edge);
+      border-radius: 16px;
+      padding: 1.4rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .panel h2 { margin: 0 0 0.8rem; font-size: 1.2rem; color: #f4f9f7; }
+    .panel h3 { margin: 1.1rem 0 0.3rem; font-size: 0.98rem; color: var(--amber); }
+    .panel p, .panel li { color: var(--muted); font-size: 0.92rem; }
+    .panel ul { margin: 0.3rem 0 0; padding-left: 1.2rem; }
+    .panel li + li { margin-top: 0.35rem; }
+    .panel code {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--pond-card-edge);
+      border-radius: 5px;
+      padding: 0.05rem 0.35rem;
+      font-size: 0.85em;
+      color: var(--text);
+    }
+
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--pond-card-edge);
+      padding-top: 1.3rem;
+    }
+    footer a { color: var(--amber); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="masthead">
+      <span class="bubble">Catfish Pond &middot; Firmware Installer</span>
+      <h1>Catfish Feeder — Web Flasher</h1>
+      <p class="tagline">
+        Install the latest Catfish Feeder firmware straight from your browser — no
+        toolchain, no drivers to hunt down, no command line. Everything is served
+        from this page.
+      </p>
+    </header>
+
+    <main>
+      <div class="grid">
+        <!-- ============ Display Unit ============ -->
+        <section class="device">
+          <h2>Display Unit</h2>
+          <span class="chip">ESP32-S3-Touch-LCD-4.3B (ESP32-S3-WROOM-1-N16R8)</span>
+          <p>
+            The 4.3&Prime; 800&times;480 touch panel: pond dashboard, feeding
+            schedule, manual feed trigger.
+          </p>
+          <esp-web-install-button manifest="manifest-display.json">
+            <button slot="activate">Install Display Unit firmware</button>
+            <span slot="unsupported">
+              Web Serial is not available in this browser. Use Chrome, Edge or
+              Opera on a desktop computer.
+            </span>
+            <span slot="not-allowed">
+              Flashing requires a secure context — open this page over HTTPS.
+            </span>
+          </esp-web-install-button>
+          <p class="hint">
+            <strong>Connect via USB</strong>, then click Install and pick the
+            board&rsquo;s serial port when the browser asks. Works in
+            <strong>Chrome, Edge or Opera</strong> on desktop (Web Serial);
+            Firefox and Safari are not supported.
+          </p>
+          <p class="erase-note">
+            First install or switching firmware? Tick
+            <strong>&ldquo;Erase device&rdquo;</strong> in the install dialog —
+            this wipes old settings and filesystem cleanly.
+          </p>
+        </section>
+
+        <!-- ============ Relay Unit ============ -->
+        <section class="device">
+          <h2>Relay Unit</h2>
+          <span class="chip">ESP8266 NodeMCU V3</span>
+          <p>
+            The feeder motor driver: receives feed commands from the Display
+            Unit over Wi&#8209;Fi and pulses the relay.
+          </p>
+          <esp-web-install-button manifest="manifest-relay.json">
+            <button slot="activate">Install Relay Unit firmware</button>
+            <span slot="unsupported">
+              Web Serial is not available in this browser. Use Chrome, Edge or
+              Opera on a desktop computer.
+            </span>
+            <span slot="not-allowed">
+              Flashing requires a secure context — open this page over HTTPS.
+            </span>
+          </esp-web-install-button>
+          <p class="hint">
+            <strong>Connect via USB</strong> (micro&#8209;USB on the NodeMCU),
+            then click Install. Works in <strong>Chrome, Edge or Opera</strong>
+            on desktop (Web Serial).
+          </p>
+          <p class="erase-note">
+            Tick <strong>&ldquo;Erase device&rdquo;</strong> in the install
+            dialog when prompted to clear saved Wi&#8209;Fi credentials and old
+            firmware.
+          </p>
+        </section>
+      </div>
+
+      <!-- ============ Troubleshooting ============ -->
+      <section class="panel" id="troubleshooting">
+        <h2>Troubleshooting</h2>
+
+        <h3>Port never shows up (Display Unit, ESP32-S3)</h3>
+        <ul>
+          <li>
+            The 4.3B uses <strong>native USB</strong> (no UART bridge). Hold the
+            <strong>BOOT</strong> button on the board <em>while</em> plugging in
+            the USB cable, then release it — the ESP32-S3 then enumerates as a
+            serial device and flashing can start. Press <strong>RST</strong>
+            once the install finishes.
+          </li>
+          <li>
+            Use a <strong>data</strong> USB cable, not a charge-only cable —
+            this is the single most common cause of a missing port.
+          </li>
+        </ul>
+
+        <h3>Port never shows up (Relay Unit, NodeMCU)</h3>
+        <ul>
+          <li>
+            The NodeMCU uses a USB-to-serial bridge (CP2102 or CH340). If no
+            port appears, install the
+            <strong>CP210x</strong> or <strong>CH340</strong> driver for your OS.
+          </li>
+          <li>
+            On Linux the user needs <code>dialout</code> group membership to
+            open serial ports.
+          </li>
+        </ul>
+
+        <h3>Install starts but fails / times out</h3>
+        <ul>
+          <li>
+            Try a different USB port (direct on the computer, not through a
+            hub) and a short, known-good cable.
+          </li>
+          <li>
+            Close any other program that may hold the serial port open
+            (serial monitor, Arduino IDE, PlatformIO).
+          </li>
+          <li>
+            On the NodeMCU, if the board never enters the bootloader, hold the
+            <strong>FLASH</strong> button while the installer says
+            &ldquo;Connecting&hellip;&rdquo;, then release.
+          </li>
+          <li>
+            Tick <strong>&ldquo;Erase device&rdquo;</strong> and retry — a
+            corrupt previous flash or old filesystem can block installs.
+          </li>
+        </ul>
+
+        <h3>After a fresh install</h3>
+        <ul>
+          <li>
+            First boot starts a <strong>Wi&#8209;Fi setup access point</strong>
+            (captive portal) — join it with your phone or laptop to configure
+            the pond&rsquo;s Wi&#8209;Fi credentials.
+          </li>
+          <li>
+            The Display Unit may take ~10&ndash;20&nbsp;s to boot the first time
+            after an erase (filesystem formatting).
+          </li>
+        </ul>
+      </section>
+
+      <footer>
+        <p>
+          Source &amp; docs:
+          <a href="https://github.com/mlger/smartfishfeeder">github.com/mlger/smartfishfeeder</a>
+          &middot;
+          <a href="https://github.com/mlger/smartfishfeeder/tree/main/docs">docs/</a>
+          &middot;
+          <a href="https://github.com/mlger/smartfishfeeder/blob/main/docs/notes/hardware-4.3b.md">hardware notes (4.3B)</a>
+        </p>
+        <p>
+          Built with <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.
+          Firmware version in the manifests is set automatically by CI on every push to <code>main</code>.
+        </p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

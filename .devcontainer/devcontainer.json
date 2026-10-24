@@ -1,0 +1,21 @@
+{
+  "name": "Catfish Feeder",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.12"
+    }
+  },
+  "postCreateCommand": "python3 -m pip install --user --upgrade platformio && python3 -m platformio --version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "platformio.platformio-ide",
+        "ms-vscode.cpptools",
+        "figma.figma-vscode-extension"
+      ]
+    }
+  },
+  "remoteUser": "vscode",
+  "forwardPorts": []
+}

@@ -1,0 +1,253 @@
+# Catfish Feeder — firmware CI, GitHub Pages web flasher, releases
+#
+# - Builds both PlatformIO projects (display-unit ESP32-S3, relay-unit ESP8266)
+# - Merges the 4 ESP32-S3 binaries into one flashable image with esptool v5
+#   (`merge-bin` — v5 renamed `merge_bin` and `--flash_mode` -> `--flash-mode`)
+# - Serves web-flasher/ + fresh firmware manifests on GitHub Pages (build_type=workflow)
+# - Attaches firmware binaries to GitHub releases on v* tags
+#
+# NOTE: firmware/display-unit and firmware/relay-unit each need a runnable
+# src/main.cpp (Tasks 4-a / 4-b); CI fails fast until those exist.
+
+name: Firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-display-unit:
+    name: Build Display Unit (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO and esptool
+        run: pip install platformio esptool
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-display-unit-${{ runner.os }}-${{ hashFiles('firmware/display-unit/platformio.ini') }}
+          restore-keys: |
+            pio-display-unit-${{ runner.os }}-
+
+      - name: Build firmware
+        run: pio run -d firmware/display-unit
+
+      - name: Stage binaries
+        run: |
+          mkdir -p staging
+          cp firmware/display-unit/.pio/build/display-unit/firmware.bin staging/
+          cp firmware/display-unit/.pio/build/display-unit/bootloader.bin staging/
+          cp firmware/display-unit/.pio/build/display-unit/partitions.bin staging/
+          cp firmware/display-unit/.pio/build/display-unit/boot_app0.bin staging/
+
+      # esptool v5 syntax (verified against esptool 5.6.0):
+      # subcommand and options use hyphens; -o/--output is required.
+      # DIO is used for maximum compatibility when flashing via the browser;
+      # the board itself is QIO-capable (N16R8) and DIO works on QIO hardware.
+      - name: Merge ESP32-S3 firmware image
+        working-directory: staging
+        run: |
+          esptool --chip esp32s3 merge-bin \
+            --output merged-firmware.bin \
+            --flash-mode dio \
+            --flash-size 16MB \
+            0x0 bootloader.bin \
+            0x8000 partitions.bin \
+            0xe000 boot_app0.bin \
+            0x10000 firmware.bin
+
+      - name: Upload display-unit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-display-unit-${{ github.sha }}
+          path: staging/*
+          if-no-files-found: error
+
+  build-relay-unit:
+    name: Build Relay Unit (ESP8266)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO
+        run: pip install platformio esptool
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-relay-unit-${{ runner.os }}-${{ hashFiles('firmware/relay-unit/platformio.ini') }}
+          restore-keys: |
+            pio-relay-unit-${{ runner.os }}-
+
+      - name: Build firmware
+        run: pio run -d firmware/relay-unit
+
+      # espressif8266 uploads a self-contained firmware.bin at offset 0x0,
+      # so the web flasher needs a single part at 0.
+      - name: Stage binaries
+        run: |
+          mkdir -p staging
+          cp firmware/relay-unit/.pio/build/relay-unit/firmware.bin staging/relay-unit-firmware.bin
+
+      - name: Upload relay-unit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fw-relay-unit-${{ github.sha }}
+          path: staging/*
+          if-no-files-found: error
+
+  deploy-pages:
+    name: Deploy web flasher to GitHub Pages
+    needs: [build-display-unit, build-relay-unit]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download display-unit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fw-display-unit-${{ github.sha }}
+          path: dist/display-unit
+
+      - name: Download relay-unit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fw-relay-unit-${{ github.sha }}
+          path: dist/relay-unit
+
+      - name: Assemble site
+        run: |
+          mkdir -p site/fw
+          cp web-flasher/* site/
+          cp dist/display-unit/merged-firmware.bin site/fw/display-unit-merged.bin
+          cp dist/relay-unit/relay-unit-firmware.bin site/fw/relay-unit-firmware.bin
+
+      - name: Generate firmware manifests (version = short commit SHA)
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          sha = os.environ.get("GITHUB_SHA", "")
+          version = sha[:7] if sha else "dev"
+
+          def manifest(name: str, chip_family: str, part_path: str) -> dict:
+              return {
+                  "name": name,
+                  "version": version,
+                  # Show the "Erase device" checkbox in the install dialog
+                  # (ESP Web Tools documented manifest key).
+                  "new_install_prompt_erase": True,
+                  "builds": [
+                      {
+                          "chipFamily": chip_family,
+                          "parts": [{"path": part_path, "offset": 0}],
+                      }
+                  ],
+              }
+
+          with open("site/manifest-display.json", "w", encoding="utf-8") as f:
+              json.dump(
+                  manifest(
+                      "Catfish Feeder \u2014 Display Unit",
+                      "ESP32-S3",
+                      "./fw/display-unit-merged.bin",
+                  ),
+                  f,
+                  indent=2,
+              )
+              f.write("\n")
+
+          with open("site/manifest-relay.json", "w", encoding="utf-8") as f:
+              json.dump(
+                  manifest(
+                      "Catfish Feeder \u2014 Relay Unit",
+                      "ESP8266",
+                      "./fw/relay-unit-firmware.bin",
+                  ),
+                  f,
+                  indent=2,
+              )
+              f.write("\n")
+
+          print("wrote manifests with version", version)
+          PY
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  release:
+    name: Attach firmware to GitHub release
+    needs: [build-display-unit, build-relay-unit]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download display-unit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fw-display-unit-${{ github.sha }}
+          path: dist/display-unit
+
+      - name: Download relay-unit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fw-relay-unit-${{ github.sha }}
+          path: dist/relay-unit
+
+      - name: Collect release assets
+        run: |
+          mkdir -p assets
+          cp dist/display-unit/merged-firmware.bin assets/merged-firmware.bin
+          cp dist/display-unit/firmware.bin assets/display-unit-firmware.bin
+          cp dist/display-unit/bootloader.bin assets/display-unit-bootloader.bin
+          cp dist/display-unit/partitions.bin assets/display-unit-partitions.bin
+          cp dist/display-unit/boot_app0.bin assets/display-unit-boot_app0.bin
+          cp dist/relay-unit/relay-unit-firmware.bin assets/relay-unit-firmware.bin
+
+      - name: Attach assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
