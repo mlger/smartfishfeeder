@@ -72,6 +72,20 @@ void handleStatus() {
   doc["version"] = s_snap.version;
   doc["mqtt"] = s_snap.mqtt;
   doc["mqttState"] = s_snap.mqttState;
+  // P5: per-tank status array (first tankCount entries are valid)
+  uint8_t count = s_snap.tankCount;
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  doc["selectedTank"] = s_snap.selectedTank;
+  JsonArray tanks = doc["tanks"].to<JsonArray>();
+  for (uint8_t i = 0; i < count; i++) {
+    JsonObject t = tanks.add<JsonObject>();
+    t["id"] = i + 1;
+    t["name"] = s_snap.tankName[i];
+    t["online"] = s_snap.tankOnline[i];
+    t["feeding"] = s_snap.tankFeeding[i];
+    t["ip"] = s_snap.tankIp[i];
+  }
   String out;
   serializeJson(doc, out);
   s_srv.send(200, "application/json", out);
@@ -114,7 +128,8 @@ void handleSchedulePut() {
 
 void handleFeed() {
   if (!authOk()) return sendErr(403, "auth");
-  uint8_t secs = 0; // 0 -> device default pulse
+  uint8_t secs = 0;   // 0 -> device default pulse
+  long tankMask = -1; // -1 -> all configured tanks
   const String body = s_srv.arg("plain");
   if (body.length()) {
     JsonDocument doc;
@@ -125,11 +140,23 @@ void handleFeed() {
       if (v < 1 || v > (long)CATFISH_PULSE_S_LIMIT) return sendErr(400, "bad_seconds");
       secs = (uint8_t)v;
     }
+    if (!doc["tanks"].isNull()) {
+      tankMask = doc["tanks"] | 0L;
+      if (tankMask < 1 || tankMask > 15) return sendErr(400, "bad_tanks");
+    }
   }
+  // P5: default mask covers ALL configured tanks; an explicit "tanks" value
+  // narrows it. The dashboard always sends an explicit mask anyway.
+  uint8_t count = prefs::getTankCount();
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  uint8_t mask = (count >= 4) ? 0x0F : (uint8_t)((1u << count) - 1u);
+  if (tankMask > 0) mask = (uint8_t)tankMask;
   UiEvent ev;
   ev.type = UI_EVT_FEED;
   ev.flag = true; // manual (shows the on-device "Feeding fish..." toast too)
   ev.a = secs ? secs : prefs::getDefaultPulse();
+  ev.tankMask = mask;
   if (!ui::ui_event_send(ev)) return sendErr(503, "busy");
   s_srv.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }

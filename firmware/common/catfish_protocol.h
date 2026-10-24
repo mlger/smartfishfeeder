@@ -17,7 +17,7 @@
 // strings from this). The #ifndef guard lets an external -DCATFISH_APP_VERSION
 // override it without redefinition warnings.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.4.0"
+#define CATFISH_APP_VERSION "1.5.0"
 #endif
 
 // ------------------------------------------------------------ protocol version
@@ -59,6 +59,14 @@
 #define CATFISH_MAX_PULSE_LIMIT_S    60  // HARD cap, enforced on both units
 #define CATFISH_PULSE_S_LIMIT        30  // max editable default/entry pulse
 #define CATFISH_DEFAULT_PULSE_S      3   // factory default pulse
+
+// ------------------------------------------------------------ multi-tank (Phase 5)
+// One display unit can drive up to CATFISH_MAX_TANKS relay units. Each tank
+// has a display name and an optional token override ("" = inherit the global
+// pairing token). Schedules address tanks through a bitmask (bit 0 = tank 1).
+#define CATFISH_MAX_TANKS        4
+#define CATFISH_TANK_NAME_LEN    16 // storage capacity incl. NUL (15 chars)
+#define CATFISH_MASK_ALL_CONFIGURED 0 // special mask: "every configured tank"
 
 // ------------------------------------------------------------ HTTP endpoints (relay unit)
 #define CATFISH_EP_HEALTH            "/health"

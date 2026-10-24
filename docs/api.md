@@ -223,6 +223,17 @@ The display unit resolves the relay in this order:
 
 **Stale-IP self-heal:** a persisted IP that stops answering is not trusted forever. Three consecutive transport-level failures (timeouts/refusals — any HTTP response means the relay is alive and resets the counter) drop the cached IP, and a failed feed POST immediately re-discovers and retries **once** against the fresh IP. A relay that changes IP (DHCP) therefore self-heals within a couple of minutes without a reboot.
 
+## Multi-tank (v1.5.0+)
+
+One display unit can drive up to **4 relay units**. The relay-side API above is unchanged — every relay still answers discovery and serves the same endpoints; the display just keeps a per-tank IP/token table:
+
+- Tanks are configured on the display unit (Settings → TANKS): a count (1-4), a display name and an optional per-tank token override (empty = the shared pairing token) per tank.
+- **Discovery** sends one `CATFISH_DISCOVER` broadcast round, collects every `CATFISH_RELAY|<ip>` answer, and binds each tank without a live IP to the first relay **not already claimed by another tank** — so N relays answer and N tanks bind one-to-one automatically. The per-tank IPs are validated with `GET /health` and persisted.
+- **Schedules carry a target-tank bitmask** (`"t"` in the display's schedule JSON, bit 0 = tank 1; entries without the key load as tank 1 for backward compatibility). Feeding a mask fans out to one `POST /feed` per tank, sequentially, and surfaces per-tank failures ("Tank 2: Relay busy").
+- The **web dashboard** exposes the same model: `GET /api/status` returns a `tanks` array, `POST /api/feed` accepts a `"tanks"` bitmask, and MQTT gains `catfish/tank<i>/feed/cmd` + `catfish/tank<i>/online` with HA auto-discovery (see [dashboard.md](dashboard.md) / [mqtt.md](mqtt.md)).
+
+Single-tank setups keep the exact pre-v1.5.0 behavior — the legacy relay-IP storage migrates to tank 1 on the first boot of the new firmware.
+
 ## Security notes
 
 - **LAN-only by design.** There is no cloud relay, no inbound port mapping, no TLS (an ESP8266 serving TLS is out of scope here). Do not port-forward the relay unit to the internet.

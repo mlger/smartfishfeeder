@@ -46,6 +46,21 @@ String discoveryFeeding(const String &prefix);        // binary_sensor.feeding
 String discoveryLastFeed(const String &prefix);       // sensor.timestamp
 String discoveryNextFeed(const String &prefix);       // sensor (plain string)
 
+// ---- per-tank entities (Phase 5) -------------------------------------------
+String tankFeedCmdTopic(const String &prefix, uint8_t tank1);
+String tankOnlineTopic(const String &prefix, uint8_t tank1);
+/** HA discovery config for a per-tank feed button ("Feed <tankName>"). */
+String discoveryTankFeedButton(const String &prefix, uint8_t tank1,
+                               const String &tankName);
+/** HA discovery config for a per-tank online binary_sensor. */
+String discoveryTankOnline(const String &prefix, uint8_t tank1,
+                           const String &tankName);
+/**
+ * HA discovery config topic for a tank entity — publishing an EMPTY retained
+ * payload to this path removes the entity from Home Assistant again.
+ */
+String tankDiscoveryPath(const char *component, uint8_t tank1);
+
 // ---- payload helpers -------------------------------------------------------
 /** Unix epoch -> "YYYY-MM-DDTHH:MM:SSZ" (HA device_class timestamp); 0 -> "unknown". */
 String epochToIso8601(uint32_t epoch);

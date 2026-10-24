@@ -31,17 +31,21 @@
 // The queue is also written from the MQTT manager's async task (incoming
 // Home Assistant commands), which is why ui_event_send() is public.
 enum UiEventType : uint8_t {
-  UI_EVT_FEED = 0,      // FEED NOW pressed      (a=seconds, flag=manual)
+  UI_EVT_FEED = 0,      // FEED NOW pressed      (a=seconds, flag=manual, tankMask targets)
   UI_EVT_RELAY_TEST,    // "Test connection" pressed
   UI_EVT_REBOOT,        // "Reboot" pressed
   UI_EVT_SET_PULSE,     // default pulse changed (a=seconds)
   UI_EVT_SET_TOKEN,     // pairing token saved   (token=new, flag=also rotate relay)
   UI_EVT_SET_BL,        // backlight switch flipped (flag=on; loop persists)
-  UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s)
+  UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s, tankMask=target tanks)
   UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
   UI_EVT_SCHED_PERSIST, // enable switch flipped (a=index, flag=enabled — loop applies + flushes)
   UI_EVT_MQTT_CFG,      // MQTT settings saved   (mqtt* fields valid — loop persists + applies)
   UI_EVT_MECH_CFG,      // P4: mechanism saved   (mech* fields valid — loop POSTs /config)
+  UI_EVT_SELECT_TANK,   // P5: tank chip tapped  (a=tank index 0..3, 0xFE = All)
+  UI_EVT_TANK_COUNT,    // P5: tank count changed (a=new count 1..4)
+  UI_EVT_TANK_CFG,      // P5: tank saved (a=tank id 1-based, tankName/tankToken valid)
+  UI_EVT_SCAN_TANKS,    // P5: "Scan for relays" pressed
 };
 
 struct UiEvent {
@@ -51,6 +55,7 @@ struct UiEvent {
   uint8_t c = 0;
   bool flag = false;
   char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
+  uint8_t tankMask = 0; // FEED/SCHED_ADD: target tanks (bit i = tank i+1); 0 = tank 1
   // MQTT settings (UI_EVT_MQTT_CFG); sizes == prefs/catfish_protocol caps
   bool mqttEnable = false;
   uint16_t mqttPort = 0;
@@ -64,6 +69,8 @@ struct UiEvent {
   uint8_t mechFeed = 0; // servo feed angle
   uint16_t mechHz = 0;  // stepper step rate
   uint8_t mechDir = 0;  // stepper DIR level during feed
+  // Tank editor (UI_EVT_TANK_CFG, P5)
+  char tankName[CATFISH_TANK_NAME_LEN] = {0}; // == 16 (15 chars + NUL)
 };
 
 namespace ui {
@@ -98,6 +105,29 @@ void ui_set_pulse(uint8_t seconds);
  * Angles/rate -1 = unknown; used to prefill the mechanism editor.
  */
 void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz);
+
+// ---- multi-tank (Phase 5) ---------------------------------------------------
+/**
+ * Rebuild the tank-dependent UI from source data: Home tank chips
+ * (incl. "All" chip when count >= 2), Settings > TANKS rows and the
+ * schedule editor's tank checkboxes. Caller holds the lock.
+ * @param count    configured tank count 1..CATFISH_MAX_TANKS
+ * @param names    per-tank display names (indexes 0..3)
+ * @param selected currently selected tank (0-based index, or 0xFE = All)
+ */
+void ui_tanks_rebuild(uint8_t count, const String names[CATFISH_MAX_TANKS],
+                      uint8_t selected);
+
+/**
+ * Refresh live state on the already-built tank widgets (chip + row colors,
+ * per-tank IP labels). Cheap; safe to call every probe. Caller holds lock.
+ */
+void ui_tanks_state(const bool online[CATFISH_MAX_TANKS],
+                    const bool feeding[CATFISH_MAX_TANKS],
+                    const String ips[CATFISH_MAX_TANKS]);
+
+/** Disable/re-enable "Scan for relays" while a scan is in flight. */
+void ui_set_scan_busy(bool busy);
 
 /** WiFi state for the status-bar symbol and Settings > Network card. */
 void ui_set_wifi(bool connected, const String &ssid, const String &ip, int rssi);

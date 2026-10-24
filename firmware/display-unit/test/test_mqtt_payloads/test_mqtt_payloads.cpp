@@ -98,6 +98,52 @@ void test_discovery_next_feed_config(void) {
 }
 
 // ---------------------------------------------------------------------------
+// per-tank entities (Phase 5)
+// ---------------------------------------------------------------------------
+void test_tank_topics(void) {
+  TEST_ASSERT_EQUAL_STRING("catfish/tank2/feed/cmd",
+                           mqtt_payloads::tankFeedCmdTopic("catfish", 2).c_str());
+  TEST_ASSERT_EQUAL_STRING("catfish/tank3/online",
+                           mqtt_payloads::tankOnlineTopic("catfish", 3).c_str());
+  // empty prefix falls back to the default like the shared builders
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/feed/cmd",
+                           mqtt_payloads::tankFeedCmdTopic("", 1).c_str());
+}
+
+void test_tank_discovery_paths(void) {
+  TEST_ASSERT_EQUAL_STRING("homeassistant/button/catfish_tank1/config",
+                           mqtt_payloads::tankDiscoveryPath("button", 1).c_str());
+  TEST_ASSERT_EQUAL_STRING(
+      "homeassistant/binary_sensor/catfish_tank4/config",
+      mqtt_payloads::tankDiscoveryPath("binary_sensor", 4).c_str());
+}
+
+void test_tank_feed_button_config(void) {
+  const String j = mqtt_payloads::discoveryTankFeedButton("catfish", 2, "Pond");
+  TEST_ASSERT_NOT_NULL(strstr(j.c_str(), "\"name\":\"Feed Pond\""));
+  TEST_ASSERT_NOT_NULL(
+      strstr(j.c_str(), "\"command_topic\":\"catfish/tank2/feed/cmd\""));
+  TEST_ASSERT_NOT_NULL(strstr(j.c_str(), "\"payload_press\":\"ON\""));
+  TEST_ASSERT_NOT_NULL(strstr(j.c_str(), "\"uniq_id\":\"catfish_tank2_feed\""));
+  TEST_ASSERT_NOT_NULL(
+      strstr(j.c_str(), "\"availability_topic\":\"catfish/availability\""));
+  // empty name falls back to a generic label
+  const String j2 = mqtt_payloads::discoveryTankFeedButton("catfish", 1, "");
+  TEST_ASSERT_NOT_NULL(strstr(j2.c_str(), "\"name\":\"Feed tank 1\""));
+}
+
+void test_tank_online_config(void) {
+  const String j = mqtt_payloads::discoveryTankOnline("catfish", 1, "Main");
+  TEST_ASSERT_NOT_NULL(strstr(j.c_str(), "\"name\":\"Main online\""));
+  TEST_ASSERT_NOT_NULL(
+      strstr(j.c_str(), "\"state_topic\":\"catfish/tank1/online\""));
+  TEST_ASSERT_NOT_NULL(strstr(j.c_str(), "\"device_class\":\"connectivity\""));
+  TEST_ASSERT_NOT_NULL(strstr(j.c_str(), "\"uniq_id\":\"catfish_tank1_online\""));
+  const String j2 = mqtt_payloads::discoveryTankOnline("catfish", 3, "");
+  TEST_ASSERT_NOT_NULL(strstr(j2.c_str(), "\"name\":\"Tank 3 online\""));
+}
+
+// ---------------------------------------------------------------------------
 // payload helpers
 // ---------------------------------------------------------------------------
 void test_epoch_to_iso8601_utc(void) {
@@ -128,6 +174,10 @@ int main(void) {
   RUN_TEST(test_discovery_feeding_config);
   RUN_TEST(test_discovery_last_feed_is_timestamp_sensor);
   RUN_TEST(test_discovery_next_feed_config);
+  RUN_TEST(test_tank_topics);
+  RUN_TEST(test_tank_discovery_paths);
+  RUN_TEST(test_tank_feed_button_config);
+  RUN_TEST(test_tank_online_config);
   RUN_TEST(test_epoch_to_iso8601_utc);
   RUN_TEST(test_epoch_zero_means_never);
   RUN_TEST(test_clamp_pulse_matches_firmware_limits);

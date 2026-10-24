@@ -70,6 +70,7 @@ lv_obj_t *s_next_sub = nullptr;
 lv_obj_t *s_last_value = nullptr;
 lv_obj_t *s_relay_dot = nullptr;
 lv_obj_t *s_relay_txt = nullptr;
+lv_obj_t *s_tank_chips = nullptr; // P5: tank selection chip row (hidden at count 1)
 
 // Schedule
 lv_obj_t *s_sched_list = nullptr;
@@ -77,6 +78,8 @@ lv_obj_t *s_editor = nullptr;
 lv_obj_t *s_r_hour = nullptr;
 lv_obj_t *s_r_min = nullptr;
 lv_obj_t *s_sb_sec = nullptr;
+lv_obj_t *s_ed_tank_row = nullptr;  // P5: tank checkbox row inside the editor
+lv_obj_t *s_ed_tank_cb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 
 // Settings
 lv_obj_t *s_sb_pulse = nullptr;
@@ -87,6 +90,12 @@ lv_obj_t *s_lbl_rssi = nullptr;
 lv_obj_t *s_lbl_relay_ip = nullptr;
 lv_obj_t *s_lbl_mech = nullptr; // P4: "Mechanism: ..." line on the Relay card
 lv_obj_t *s_probe_btn = nullptr;
+lv_obj_t *s_tank_rows = nullptr;      // P5: TANKS card rows container
+lv_obj_t *s_tank_sb_count = nullptr;  // P5: tank count spinbox
+lv_obj_t *s_scan_btn = nullptr;       // P5: "Scan for relays"
+lv_obj_t *s_tank_row_name[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *s_tank_row_ip[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+lv_obj_t *s_tank_row_dot[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 
 // Settings > MQTT card + editor overlay (lv_layer_top)
 lv_obj_t *s_mq_status = nullptr;  // status line (color-coded)
@@ -115,6 +124,13 @@ lv_obj_t *s_mech_sb_rest = nullptr;
 lv_obj_t *s_mech_sb_feed = nullptr;
 lv_obj_t *s_mech_sb_hz = nullptr;
 lv_obj_t *s_mech_sw_dir = nullptr;
+
+// Tank editor overlay (P5, lv_layer_top: name + token override + keyboard)
+lv_obj_t *s_tank_overlay = nullptr;
+lv_obj_t *s_tank_ta_name = nullptr;
+lv_obj_t *s_tank_ta_tok = nullptr;
+lv_obj_t *s_tank_kb = nullptr;
+uint8_t s_tank_edit_id = 1; // tank being edited (1-based)
 
 // Toast
 lv_obj_t *s_toast_box = nullptr;
@@ -146,6 +162,14 @@ uint8_t s_mech_id = CATFISH_MECH_DEFAULT;
 int s_mech_rest = -1;
 int s_mech_feed = -1;
 int s_mech_hz = -1;
+
+// P5 multi-tank UI state
+uint8_t s_tank_count = 1;
+uint8_t s_sel_tank = 0; // 0-based index; 0xFE = All
+char s_tank_names[CATFISH_MAX_TANKS][CATFISH_TANK_NAME_LEN] = {
+    "Main", "Tank 2", "Tank 3", "Tank 4"};
+lv_obj_t *s_tank_chip_btns[CATFISH_MAX_TANKS + 1] = {nullptr, nullptr, nullptr,
+                                                     nullptr, nullptr}; // + "All"
 
 // Backlight idle timeout (M6): auto-dim after this much touch inactivity.
 // Touching the screen wakes it again; the user's on/off preference in
@@ -195,6 +219,18 @@ void mechSaveCb(lv_event_t *e);
 void mechCancelCb(lv_event_t *e);
 void mechRollerCb(lv_event_t *e);
 void mechSyncRows();
+void buildTankOverlay();
+void openTankOverlay(uint8_t tank1);
+void closeTankOverlay();
+void tankEditCb(lv_event_t *e);
+void tankSaveCb(lv_event_t *e);
+void tankCancelCb(lv_event_t *e);
+void tankTaFocusCb(lv_event_t *e);
+void tankCountSpinCb(lv_event_t *e);
+void scanTanksCb(lv_event_t *e);
+void tankChipCb(lv_event_t *e);
+void rebuildTankChips();
+void rebuildTankRows();
 
 // ---------------------------------------------------------------------------
 // Small widget builders
@@ -433,6 +469,15 @@ void editorSaveCb(lv_event_t *e) {
   ev.a = (uint8_t)lv_roller_get_selected(s_r_hour);
   ev.b = (uint8_t)lv_roller_get_selected(s_r_min);
   ev.c = (uint8_t)lv_spinbox_get_value(s_sb_sec);
+  // P5: pack target tanks from the editor checkboxes (missing checkboxes =
+  // single-tank setup = tank 1). Default: every checkbox unchecked row would
+  // mean "no tank" -> loop falls back to tank 1 via effectiveTankMask.
+  uint8_t mask = 0;
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    if (s_ed_tank_cb[i] && lv_obj_has_state(s_ed_tank_cb[i], LV_STATE_CHECKED))
+      mask |= (uint8_t)(1u << i);
+  }
+  ev.tankMask = mask;
   // loop() performs the add: on success it rebuilds the list, closes the
   // editor and toasts; on failure the editor stays open with the reason.
   uiEventSend(ev);
@@ -661,9 +706,24 @@ void rebuildScheduleList() {
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%02u:%02u  \xE2\x80\xA2  %u s",
-             (unsigned)en.hour, (unsigned)en.minute, (unsigned)en.seconds);
+    char buf[40];
+    if (s_tank_count > 1) {
+      // P5: append the target-tank tag, e.g. "07:30 • 3 s • T1+T3"
+      char tag[16] = {0};
+      int tl = 0;
+      for (uint8_t b = 0; b < s_tank_count && b < CATFISH_MAX_TANKS; b++) {
+        if (en.tanks & (1u << b)) {
+          tl += snprintf(tag + tl, sizeof(tag) - tl, "%s%u", tl ? "+" : "",
+                         (unsigned)(b + 1));
+        }
+      }
+      snprintf(buf, sizeof(buf), "%02u:%02u  \xE2\x80\xA2  %u s  \xE2\x80\xA2  T%s",
+               (unsigned)en.hour, (unsigned)en.minute, (unsigned)en.seconds,
+               tag[0] ? tag : "1");
+    } else {
+      snprintf(buf, sizeof(buf), "%02u:%02u  \xE2\x80\xA2  %u s",
+               (unsigned)en.hour, (unsigned)en.minute, (unsigned)en.seconds);
+    }
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, buf);
     lv_obj_set_style_text_font(tl, &lv_font_montserrat_20, 0);
@@ -700,6 +760,28 @@ void openEditor() {
   lv_roller_set_selected(s_r_hour, 7, LV_ANIM_OFF);
   lv_roller_set_selected(s_r_min, 30, LV_ANIM_OFF);
   lv_spinbox_set_value(s_sb_sec, prefs::getDefaultPulse());
+
+  // P5: rebuild the tank checkbox column for the current count (all checked
+  // = "feed every configured tank"; hidden entirely for a single tank).
+  if (s_ed_tank_row) {
+    lv_obj_clean(s_ed_tank_row);
+    for (int i = 0; i < CATFISH_MAX_TANKS; i++) s_ed_tank_cb[i] = nullptr;
+    if (s_tank_count > 1) {
+      lv_obj_t *lt = lv_label_create(s_ed_tank_row);
+      lv_label_set_text(lt, "TANKS");
+      lv_obj_set_style_text_font(lt, &lv_font_montserrat_12, 0);
+      lv_obj_set_style_text_color(lt, lv_color_hex(C_MUTED), 0);
+      for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+        lv_obj_t *cb = lv_checkbox_create(s_ed_tank_row);
+        lv_checkbox_set_text(cb, s_tank_names[i]);
+        lv_obj_add_state(cb, LV_STATE_CHECKED);
+        lv_obj_set_style_text_font(cb, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(cb, lv_color_hex(C_TEXT), 0);
+        s_ed_tank_cb[i] = cb;
+      }
+    }
+  }
+
   lv_obj_clear_flag(s_editor, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_editor);
 }
@@ -758,6 +840,17 @@ void buildHome() {
   lv_obj_set_style_text_color(fl, lv_color_hex(C_MUTED), LV_STATE_DISABLED);
   lv_obj_center(fl);
   lv_obj_add_event_cb(feed, feedBtnCb, LV_EVENT_CLICKED, nullptr);
+
+  // P5: tank selection chips (populated by ui_tanks_rebuild; hidden at count 1)
+  s_tank_chips = lv_obj_create(c);
+  lv_obj_remove_style_all(s_tank_chips);
+  lv_obj_set_size(s_tank_chips, 420, 56);
+  lv_obj_set_flex_flow(s_tank_chips, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(s_tank_chips, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(s_tank_chips, 8, 0);
+  lv_obj_clear_flag(s_tank_chips, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_tank_chips, LV_OBJ_FLAG_HIDDEN);
 
   // info cards row: next feeding / last fed / relay unit
   lv_obj_t *row = lv_obj_create(c);
@@ -914,6 +1007,13 @@ void buildSchedule() {
   lv_obj_set_style_text_color(ls, lv_color_hex(C_MUTED), 0);
   s_sb_sec = makeSpinRow(col_s, 1, 30, prefs::getDefaultPulse(), nullptr);
 
+  // P5: tank checkboxes column (rebuilt for the current count at openEditor)
+  s_ed_tank_row = lv_obj_create(editors);
+  lv_obj_remove_style_all(s_ed_tank_row);
+  lv_obj_set_size(s_ed_tank_row, 132, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(s_ed_tank_row, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_ed_tank_row, 4, 0);
+
   lv_obj_t *btns = lv_obj_create(card);
   lv_obj_remove_style_all(btns);
   lv_obj_set_width(btns, lv_pct(100));
@@ -1054,6 +1154,61 @@ void buildSettings() {
   lv_obj_set_style_text_color(test, lv_color_hex(C_MUTED), LV_STATE_DISABLED);
   lv_obj_add_event_cb(test, relayTestCb, LV_EVENT_CLICKED, nullptr);
   s_probe_btn = test;
+
+  // -- TANKS card (P5): count, scan, per-tank rows
+  lv_obj_t *card_tanks = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_tanks, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_tanks, 8, 0);
+  makeTitle(card_tanks, "TANKS");
+
+  lv_obj_t *cnt_row = lv_obj_create(card_tanks);
+  lv_obj_remove_style_all(cnt_row);
+  lv_obj_set_size(cnt_row, lv_pct(100), 56);
+  lv_obj_set_flex_flow(cnt_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(cnt_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(cnt_row, 12, 0);
+  lv_obj_clear_flag(cnt_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *cnt_lbl = lv_label_create(cnt_row);
+  lv_label_set_text(cnt_lbl, "Relay units (tanks)");
+  lv_obj_set_style_text_font(cnt_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(cnt_lbl, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(cnt_lbl, 1);
+  s_tank_sb_count = lv_spinbox_create(cnt_row);
+  lv_spinbox_set_range(s_tank_sb_count, 1, CATFISH_MAX_TANKS);
+  lv_spinbox_set_digit_format(s_tank_sb_count, 1, 0);
+  lv_spinbox_set_value(s_tank_sb_count, 1);
+  lv_obj_set_size(s_tank_sb_count, 72, 48);
+  lv_obj_set_style_bg_color(s_tank_sb_count, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_tank_sb_count, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(s_tank_sb_count, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_font(s_tank_sb_count, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_border_color(s_tank_sb_count, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(s_tank_sb_count, 1, 0);
+  lv_obj_set_style_radius(s_tank_sb_count, 8, 0);
+  lv_obj_add_event_cb(s_tank_sb_count, tankCountSpinCb, LV_EVENT_VALUE_CHANGED,
+                      nullptr);
+  lv_obj_t *cnt_minus = makeBtn(cnt_row, LV_SYMBOL_MINUS, C_CARD, C_TEXT,
+                                C_CARD_HI, 52, 48);
+  lv_obj_add_event_cb(cnt_minus, spinMinusCb, LV_EVENT_CLICKED, s_tank_sb_count);
+  lv_obj_t *cnt_plus = makeBtn(cnt_row, LV_SYMBOL_PLUS, C_CARD, C_TEXT,
+                               C_CARD_HI, 52, 48);
+  lv_obj_add_event_cb(cnt_plus, spinPlusCb, LV_EVENT_CLICKED, s_tank_sb_count);
+
+  s_scan_btn = makeBtn(card_tanks, LV_SYMBOL_WIFI "  Scan for relays", C_CARD,
+                       C_AMBER, C_CARD_HI, lv_pct(100), 60);
+  lv_obj_set_style_border_color(s_scan_btn, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(s_scan_btn, 2, 0);
+  lv_obj_set_style_bg_color(s_scan_btn, lv_color_hex(C_CARD), LV_STATE_DISABLED);
+  lv_obj_set_style_text_color(s_scan_btn, lv_color_hex(C_MUTED), LV_STATE_DISABLED);
+  lv_obj_add_event_cb(s_scan_btn, scanTanksCb, LV_EVENT_CLICKED, nullptr);
+
+  s_tank_rows = lv_obj_create(card_tanks);
+  lv_obj_remove_style_all(s_tank_rows);
+  lv_obj_set_width(s_tank_rows, lv_pct(100));
+  lv_obj_set_height(s_tank_rows, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(s_tank_rows, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_tank_rows, 6, 0);
 
   // -- Home Assistant / MQTT card
   lv_obj_t *card_mq = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
@@ -1562,6 +1717,259 @@ void closeMechOverlay() {
   if (s_mech_overlay) lv_obj_add_flag(s_mech_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-tank widgets (P5)
+// ---------------------------------------------------------------------------
+void tankChipCb(lv_event_t *e) {
+  // user_data: 0-based tank index, or 0xFE for the "All" chip
+  UiEvent ev;
+  ev.type = UI_EVT_SELECT_TANK;
+  ev.a = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+  uiEventSend(ev);
+}
+
+void tankCountSpinCb(lv_event_t *e) {
+  (void)e;
+  if (!s_tank_sb_count) return;
+  UiEvent ev;
+  ev.type = UI_EVT_TANK_COUNT;
+  ev.a = (uint8_t)lv_spinbox_get_value(s_tank_sb_count);
+  uiEventSend(ev); // loop persists + rebuilds everything
+}
+
+void scanTanksCb(lv_event_t *e) {
+  (void)e;
+  UiEvent ev;
+  ev.type = UI_EVT_SCAN_TANKS;
+  uiEventSend(ev); // loop disables the button via ui_set_scan_busy(true)
+}
+
+void tankEditCb(lv_event_t *e) {
+  openTankOverlay((uint8_t)(uintptr_t)lv_event_get_user_data(e));
+}
+
+void tankCancelCb(lv_event_t *e) {
+  (void)e;
+  closeTankOverlay();
+}
+
+void tankTaFocusCb(lv_event_t *e) {
+  lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
+  if (s_tank_kb) {
+    lv_keyboard_set_textarea(s_tank_kb, ta);
+    lv_obj_clear_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void tankSaveCb(lv_event_t *e) {
+  (void)e;
+  const char *name = lv_textarea_get_text(s_tank_ta_name);
+  if (!name || name[0] == '\0') {
+    ui_toast("Tank name required");
+    return;
+  }
+  UiEvent ev;
+  ev.type = UI_EVT_TANK_CFG;
+  ev.a = s_tank_edit_id; // 1-based tank id
+  strlcpy(ev.tankName, name, sizeof(ev.tankName));
+  strlcpy(ev.token, lv_textarea_get_text(s_tank_ta_tok), sizeof(ev.token));
+  if (uiEventSend(ev)) closeTankOverlay(); // loop persists + rebuilds
+}
+
+void buildTankOverlay() {
+  s_tank_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_tank_overlay);
+  lv_obj_set_size(s_tank_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_tank_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_tank_overlay, LV_OPA_70, 0);
+  lv_obj_add_flag(s_tank_overlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_tank_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *card = makeCard(s_tank_overlay, 720, LV_SIZE_CONTENT);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 56);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 12, 0);
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, "EDIT TANK");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  lv_obj_t *hint = lv_label_create(card);
+  lv_label_set_text(
+      hint, "Token override: leave empty to use the shared pairing token.");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
+
+  auto makeTa = [&](lv_obj_t *parent, const char *placeholder, bool secret,
+                    uint8_t max_len) {
+    lv_obj_t *ta = lv_textarea_create(parent);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_max_length(ta, max_len);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, lv_color_hex(C_BG_DARK), 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(C_CARD_HI), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 8, 0);
+    lv_obj_set_style_pad_all(ta, 10, 0);
+    if (secret) lv_textarea_set_password_mode(ta, true);
+    lv_obj_add_event_cb(ta, tankTaFocusCb, LV_EVENT_FOCUSED, nullptr);
+    return ta;
+  };
+  s_tank_ta_name = makeTa(card, "tank name (e.g. Living room)", false,
+                          CATFISH_TANK_NAME_LEN - 1);
+  s_tank_ta_tok = makeTa(card, "token override (optional)", true,
+                         CATFISH_TOKEN_LEN - 1);
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *save = makeBtn(btns, LV_SYMBOL_OK "  Save", C_AMBER, C_INK,
+                           C_AMBER_HI, 100, 64);
+  lv_obj_set_flex_grow(save, 1);
+  lv_obj_add_event_cb(save, tankSaveCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *cancel = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                             C_CARD_HI, 100, 64);
+  lv_obj_set_flex_grow(cancel, 1);
+  lv_obj_add_event_cb(cancel, tankCancelCb, LV_EVENT_CLICKED, nullptr);
+
+  s_tank_kb = lv_keyboard_create(s_tank_overlay);
+  lv_obj_set_size(s_tank_kb, lv_pct(100), 210);
+  lv_obj_align(s_tank_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(s_tank_kb, nullptr);
+  lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN); // appears on field focus
+  lv_obj_set_style_bg_color(s_tank_kb, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_tank_kb, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(s_tank_kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
+  lv_obj_set_style_text_color(s_tank_kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
+}
+
+void openTankOverlay(uint8_t tank1) {
+  if (!s_tank_overlay) return;
+  if (tank1 < 1 || tank1 > CATFISH_MAX_TANKS) return;
+  s_tank_edit_id = tank1;
+  lv_textarea_set_text(s_tank_ta_name, s_tank_names[tank1 - 1]);
+  lv_textarea_set_text(s_tank_ta_tok, prefs::getTankToken(tank1).c_str());
+  lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_tank_overlay);
+}
+
+void closeTankOverlay() {
+  if (s_tank_overlay) lv_obj_add_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
+  if (s_tank_kb) {
+    lv_keyboard_set_textarea(s_tank_kb, nullptr);
+    lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void rebuildTankChips() {
+  if (!s_tank_chips) return;
+  lv_obj_clean(s_tank_chips);
+  for (int i = 0; i <= CATFISH_MAX_TANKS; i++) s_tank_chip_btns[i] = nullptr;
+
+  if (s_tank_count <= 1) {
+    lv_obj_add_flag(s_tank_chips, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_clear_flag(s_tank_chips, LV_OBJ_FLAG_HIDDEN);
+
+  for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+    lv_obj_t *chip = makeBtn(s_tank_chips, s_tank_names[i], C_CARD, C_TEXT,
+                             C_CARD_HI, LV_SIZE_CONTENT, 52);
+    lv_obj_set_style_pad_hor(chip, 14, 0);
+    lv_obj_add_event_cb(chip, tankChipCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)i);
+    s_tank_chip_btns[i] = chip;
+  }
+  // "All" chip: feeds every configured tank (user_data 0xFE)
+  lv_obj_t *all = makeBtn(s_tank_chips, "All", C_CARD, C_TEXT, C_CARD_HI,
+                          LV_SIZE_CONTENT, 52);
+  lv_obj_set_style_pad_hor(all, 14, 0);
+  lv_obj_add_event_cb(all, tankChipCb, LV_EVENT_CLICKED,
+                      (void *)(uintptr_t)0xFE);
+  s_tank_chip_btns[CATFISH_MAX_TANKS] = all;
+
+  // selection highlight
+  for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+    const bool sel = (s_sel_tank == i);
+    lv_obj_set_style_bg_color(s_tank_chip_btns[i],
+                              lv_color_hex(sel ? C_AMBER : C_CARD), 0);
+    lv_obj_set_style_text_color(s_tank_chip_btns[i],
+                                lv_color_hex(sel ? C_INK : C_TEXT), 0);
+  }
+  if (s_tank_chip_btns[CATFISH_MAX_TANKS]) {
+    const bool sel = (s_sel_tank == 0xFE);
+    lv_obj_set_style_bg_color(s_tank_chip_btns[CATFISH_MAX_TANKS],
+                              lv_color_hex(sel ? C_AMBER : C_CARD), 0);
+    lv_obj_set_style_text_color(s_tank_chip_btns[CATFISH_MAX_TANKS],
+                                lv_color_hex(sel ? C_INK : C_TEXT), 0);
+  }
+}
+
+void rebuildTankRows() {
+  if (!s_tank_rows) return;
+  lv_obj_clean(s_tank_rows);
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    s_tank_row_name[i] = nullptr;
+    s_tank_row_ip[i] = nullptr;
+    s_tank_row_dot[i] = nullptr;
+  }
+
+  for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+    lv_obj_t *row = lv_obj_create(s_tank_rows);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 56);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dot = lv_obj_create(row);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 12, 12);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    s_tank_row_dot[i] = dot;
+
+    char head[40];
+    snprintf(head, sizeof(head), "%u \xE2\x80\xA2 %s", (unsigned)(i + 1),
+             s_tank_names[i]);
+    lv_obj_t *name = lv_label_create(row);
+    lv_label_set_text(name, head);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(C_TEXT), 0);
+    s_tank_row_name[i] = name;
+
+    lv_obj_t *ipLbl = lv_label_create(row);
+    lv_label_set_text(ipLbl, "—");
+    lv_obj_set_style_text_font(ipLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ipLbl, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_flex_grow(ipLbl, 1);
+    lv_label_set_long_mode(ipLbl, LV_LABEL_LONG_DOT);
+    s_tank_row_ip[i] = ipLbl;
+
+    lv_obj_t *edit = makeBtn(row, LV_SYMBOL_EDIT, C_CARD, C_AMBER, C_CARD_HI,
+                             56, 56);
+    lv_obj_add_event_cb(edit, tankEditCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)(i + 1));
+  }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +1985,11 @@ void ui_init() {
   buildTokenOverlay();
   buildMqttOverlay();
   buildMechOverlay();
+  buildTankOverlay();
+
+  // default tank state until main() calls ui_tanks_rebuild() with prefs data
+  String defNames[CATFISH_MAX_TANKS] = {"Main", "Tank 2", "Tank 3", "Tank 4"};
+  ui_tanks_rebuild(1, defNames, 0);
 
   showScreen(0);
   ui_set_next_feed("Waiting for time sync...");
@@ -1769,6 +2182,51 @@ void ui_set_probe_busy(bool busy) {
     else
       lv_obj_clear_state(s_probe_btn, LV_STATE_DISABLED);
   }
+}
+
+void ui_set_scan_busy(bool busy) {
+  if (s_scan_btn) {
+    if (busy)
+      lv_obj_add_state(s_scan_btn, LV_STATE_DISABLED);
+    else
+      lv_obj_clear_state(s_scan_btn, LV_STATE_DISABLED);
+  }
+}
+
+void ui_tanks_rebuild(uint8_t count, const String names[CATFISH_MAX_TANKS],
+                      uint8_t selected) {
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  s_tank_count = count;
+  s_sel_tank = (selected == 0xFE || selected < count) ? selected : 0;
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    strlcpy(s_tank_names[i], names[i].c_str(), sizeof(s_tank_names[i]));
+    if (!s_tank_names[i][0])
+      snprintf(s_tank_names[i], sizeof(s_tank_names[i]), "Tank %u",
+               (unsigned)(i + 1));
+  }
+  if (s_tank_sb_count) lv_spinbox_set_value(s_tank_sb_count, s_tank_count);
+  rebuildTankChips();
+  rebuildTankRows();
+  rebuildScheduleList(); // entry labels carry tank tags when count > 1
+}
+
+void ui_tanks_state(const bool online[CATFISH_MAX_TANKS],
+                    const bool feeding[CATFISH_MAX_TANKS],
+                    const String ips[CATFISH_MAX_TANKS]) {
+  for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+    if (s_tank_row_dot[i]) {
+      lv_obj_set_style_bg_color(s_tank_row_dot[i],
+                                lv_color_hex(online[i] ? C_GREEN : C_MUTED), 0);
+    }
+    if (s_tank_row_ip[i]) {
+      if (ips[i].length())
+        lv_label_set_text(s_tank_row_ip[i], ips[i].c_str());
+      else
+        lv_label_set_text(s_tank_row_ip[i], "not found");
+    }
+  }
+  (void)feeding; // chips stay name-only; feeding shows on the Home relay card
 }
 
 void ui_schedule_refresh() { rebuildScheduleList(); }

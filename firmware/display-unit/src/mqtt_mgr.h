@@ -63,6 +63,16 @@ void publishRelayOnline(bool online);
 void publishFeeding(bool feeding);
 void publishPulse(uint8_t seconds);
 
+// ---- per-tank entities (Phase 5) -------------------------------------------
+/** Retained per-tank online state ("ON"/"OFF") for tank @p tank1 (1-based). */
+void publishTankOnline(uint8_t tank1, bool online);
+/**
+ * After the configured tank count shrinks: remove the HA discovery configs
+ * (empty retained payloads) and clear state topics for tanks that no longer
+ * exist. No-op ranges are handled internally.
+ */
+void clearTankDiscovery(uint8_t prevCount, uint8_t newCount);
+
 } // namespace mqtt_mgr
 
 #endif // CATFISH_MQTT_MGR_H

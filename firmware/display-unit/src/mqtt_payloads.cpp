@@ -133,6 +133,71 @@ String discoveryNextFeed(const String &prefix) {
   return serialize(doc);
 }
 
+// ---------------------------------------------------------- per-tank (P5)
+// Numeric pieces go through snprintf: the native-test mock String
+// (std::string) has no operator+(int), and this keeps device + host identical.
+String tankFeedCmdTopic(const String &prefix, uint8_t tank1) {
+  String p = prefix.length() ? prefix : String(CATFISH_MQTT_PREFIX);
+  char leaf[24];
+  snprintf(leaf, sizeof(leaf), "/tank%u/feed/cmd", (unsigned)tank1);
+  return p + leaf;
+}
+
+String tankOnlineTopic(const String &prefix, uint8_t tank1) {
+  String p = prefix.length() ? prefix : String(CATFISH_MQTT_PREFIX);
+  char leaf[20];
+  snprintf(leaf, sizeof(leaf), "/tank%u/online", (unsigned)tank1);
+  return p + leaf;
+}
+
+String tankDiscoveryPath(const char *component, uint8_t tank1) {
+  char path[64];
+  snprintf(path, sizeof(path), "homeassistant/%s/catfish_tank%u/config",
+           component, (unsigned)tank1);
+  return String(path);
+}
+
+String discoveryTankFeedButton(const String &prefix, uint8_t tank1,
+                               const String &tankName) {
+  JsonDocument doc;
+  char name[40];
+  if (tankName.length())
+    snprintf(name, sizeof(name), "Feed %s", tankName.c_str());
+  else
+    snprintf(name, sizeof(name), "Feed tank %u", (unsigned)tank1);
+  doc["name"] = name;
+  doc["command_topic"] = tankFeedCmdTopic(prefix, tank1);
+  doc["payload_press"] = "ON";
+  doc["icon"] = "mdi:fish-food";
+  char uniq[24];
+  snprintf(uniq, sizeof(uniq), "catfish_tank%u_feed", (unsigned)tank1);
+  doc["uniq_id"] = uniq;
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
+String discoveryTankOnline(const String &prefix, uint8_t tank1,
+                           const String &tankName) {
+  JsonDocument doc;
+  char name[36];
+  if (tankName.length())
+    snprintf(name, sizeof(name), "%s online", tankName.c_str());
+  else
+    snprintf(name, sizeof(name), "Tank %u online", (unsigned)tank1);
+  doc["name"] = name;
+  doc["state_topic"] = tankOnlineTopic(prefix, tank1);
+  doc["payload_on"] = "ON";
+  doc["payload_off"] = "OFF";
+  doc["device_class"] = "connectivity";
+  char uniq[26];
+  snprintf(uniq, sizeof(uniq), "catfish_tank%u_online", (unsigned)tank1);
+  doc["uniq_id"] = uniq;
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
 // ---------------------------------------------------------------- payloads
 String epochToIso8601(uint32_t epoch) {
   if (epoch == 0) return String("unknown");

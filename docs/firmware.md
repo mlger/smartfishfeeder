@@ -150,6 +150,7 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 | Backlight | Display Unit | on | Settings → Display → Backlight switch (persisted across reboots); screen auto-dims after 10 min idle and wakes on touch |
 | MQTT / Home Assistant | Display Unit | disabled | Settings → HOME ASSISTANT (MQTT) → *Configure*: broker, port, credentials, topic prefix — topic map and behaviour in [mqtt.md](mqtt.md) |
 | Feeding mechanism | Relay Unit | `motor` | Display UI: Settings → Relay Unit → *Mechanism* → *Configure* (motor / servo / stepper + servo angles / stepper rate), or `POST /config` with `{"mechanism":...}` — semantics and wiring in [api.md](api.md#feeding-mechanisms-v140). Stored in a separate EEPROM record; factory reset restores `motor` |
+| Tanks (multi-relay) | Display Unit | 1 | Display UI: Settings → TANKS → count spinbox (1-4), *Scan for relays*, per-tank Edit (name + token override) — architecture and binding rules in [api.md](api.md#multi-tank-v150) |
 | Factory reset | Relay Unit | — | Hold the **FLASH** button ~5 s while running: EEPROM config (token, pulse caps, mechanism) is wiped to defaults and the unit reboots. Refused while a pulse is running |
 
 **Timezone note:** the firmware uses the POSIX form `PHT-8` — a positive UTC offset is written with a minus sign in POSIX. Schedule entries entered on the Schedule screen are interpreted in this timezone.
@@ -167,6 +168,19 @@ The relay unit ships with the classic **motor** mechanism (D1 relay/FET energize
 | `stepper` | **D2** (GPIO4) → driver STEP; **D6** (GPIO12) → driver DIR | A4988/DRV8825-class. STEP pulses at the configured rate (default 400 steps/s); DIR is driven low (or high when enabled) for the pulse. Tie `/ENABLE`+`/RESET`+`/SLEEP` per the driver datasheet, set MS1-MS3 for microstepping, and fit a ≥100 µF decoupling cap on VMOT |
 
 Switch mechanisms on the display unit (Settings → Relay Unit → *Mechanism*) or via `POST /config` (see [api.md](api.md)). The choice + parameters persist in a second additive EEPROM record; upgrading the firmware never touches the token/pulse blob. The STEP/DIR pins are driven low from the first boot microseconds, so a partially-wired stepper driver stays idle until you deliberately switch mechanisms.
+
+## Multi-tank / multi-relay (v1.5.0+)
+
+One display unit can drive up to **4 relay units** (one per tank). The relay firmware is unchanged — each relay stays a standalone device with its own token, and the display learns their IPs:
+
+- **Configuration**: Settings → TANKS. The count spinbox (1-4) controls how many tanks exist; each tank gets a display name and an optional per-tank **token override** (empty = inherit the shared pairing token).
+- **Binding**: every tank keeps its own last-known relay IP (persisted to NVS). *Scan for relays* sends one UDP broadcast round and binds every tank without a live IP to a relay not already claimed by another tank. Per-tank discovery (first feed/probe after an IP loss) reuses the same rule, so two tanks never auto-bind to the same relay.
+- **Schedules**: each entry carries a target-tank bitmask (default: every configured tank for new entries; pre-v1.5.0 entries load as tank 1). The editor shows tank checkboxes when 2+ tanks are configured.
+- **Feeding**: FEED NOW targets the selected tank chip (Home screen) or "All"; the worker feeds each target tank sequentially and toasts partial failures per tank.
+- **Sensors**: Home Assistant gains a feed button + online sensor per tank; the web dashboard shows per-tank chips and status.
+- **Single-tank setups are unchanged**: with the count at 1 there are no chips, no checkboxes, and behavior is byte-for-byte the pre-v1.5.0 flow (the legacy `relayIp` NVS key is migrated to tank 1 on first boot).
+
+Multi-relay caveat: all relay units share the `catfish-relay` mDNS hostname, so UDP broadcast is the authoritative multi-relay discovery (mDNS remains a fallback candidate for single-tank setups). If two relays answer UDP from the same broadcast domain, each tank binds to a different one automatically.
 
 ## OTA updates
 
