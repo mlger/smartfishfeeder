@@ -23,6 +23,10 @@ struct Result {
   bool ok = false;
   String ip = "";
   String error = "";
+  // FEED success extras: what the relay actually applied (it may clamp)
+  uint8_t seconds_applied = 0;
+  bool clamped = false;
+  String note = ""; // relay "note" text when the request was clamped
 };
 
 struct Status {
@@ -48,9 +52,19 @@ Result discover();
 
 /**
  * POST /feed with {"seconds":n,"token":...} (6 s timeout).
- * Auto-discovers first if no IP is cached. Blocking (call from loop()).
+ * Auto-discovers first if no IP is cached. A transport failure with a cached
+ * IP triggers one re-discovery + retry (stale-IP self-heal). Blocking — call
+ * from the net worker task only.
  */
 Result feed(uint8_t seconds);
+
+/**
+ * POST /config asking the relay to rotate its token to @p newToken.
+ * The relay authorizes with the CURRENT token (fetched from prefs), so this
+ * only succeeds while display and relay are still in sync. On success the
+ * caller must persist the new token locally (prefs::setRelayToken).
+ */
+Result rotateToken(const String &newToken);
 
 /** GET /status -> parse {"state","feeding","lastFeedEpoch","version",...}. */
 Status fetchStatus();

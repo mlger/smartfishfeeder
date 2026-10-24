@@ -21,6 +21,43 @@ namespace {
 
 String s_ip; // cached relay IP, dotted string ("" = unknown)
 
+// Consecutive transport-level failures against the CACHED IP. Any HTTP status
+// code (even 4xx/5xx) means the relay is ALIVE and resets the streak; only
+// connect timeouts / refusals count. After TRANSPORT_FAIL_LIMIT misses the
+// cache is dropped so the next feed/probe re-discovers instead of hammering
+// a dead address until reboot (stale-DHCP self-heal).
+constexpr uint8_t TRANSPORT_FAIL_LIMIT = 3;
+uint8_t s_transport_fail_streak = 0;
+
+void clearIpCache() {
+  s_ip = "";
+  prefs::setRelayIp("");
+  s_transport_fail_streak = 0;
+}
+
+void noteTransportFailure() {
+  if (!s_ip.length()) return;
+  s_transport_fail_streak++;
+  Serial.printf("[NET] relay transport failure #%u at %s\n",
+                (unsigned)s_transport_fail_streak, s_ip.c_str());
+  if (s_transport_fail_streak >= TRANSPORT_FAIL_LIMIT) {
+    Serial.println("[NET] relay unreachable - clearing cached IP for re-discovery");
+    clearIpCache();
+  }
+}
+
+void noteTransportSuccess() { s_transport_fail_streak = 0; }
+
+/** Build the /feed POST body (token read fresh from prefs each attempt). */
+String feedBody(uint8_t seconds) {
+  JsonDocument doc;
+  doc["seconds"] = (int)seconds;
+  doc["token"] = prefs::getRelayToken();
+  String body;
+  serializeJson(doc, body);
+  return body;
+}
+
 bool validIpString(const String &s) {
   IPAddress t;
   return t.fromString(s) && s != String("0.0.0.0");
@@ -101,6 +138,7 @@ Result discover() {
   // (1) Saved IP validated by GET /health (2 s timeout)
   if (s_ip.length()) {
     if (healthCheck(s_ip, 2000)) {
+      noteTransportSuccess();
       r.ok = true;
       r.ip = s_ip;
       Serial.printf("[NET] relay healthy at saved IP %s\n", s_ip.c_str());
@@ -118,6 +156,7 @@ Result discover() {
                     mIp.c_str());
       s_ip = mIp;
       prefs::setRelayIp(mIp);
+      noteTransportSuccess();
       r.ok = true;
       r.ip = mIp;
       return r;
@@ -161,6 +200,7 @@ Result discover() {
           if (validIpString(found)) {
             s_ip = found;
             prefs::setRelayIp(found);
+            noteTransportSuccess();
             r.ok = true;
             r.ip = found;
             udp.stop();
@@ -198,18 +238,48 @@ Result feed(uint8_t seconds) {
     }
   }
 
-  JsonDocument doc;
-  doc["seconds"] = (int)seconds;
-  doc["token"] = prefs::getRelayToken();
-  String body;
-  serializeJson(doc, body);
-
-  const String url = "http://" + s_ip + CATFISH_EP_FEED;
-  Serial.printf("[FEED] POST %s (%u bytes)\n", url.c_str(),
+  const String url0 = "http://" + s_ip + CATFISH_EP_FEED;
+  String body = feedBody(seconds);
+  Serial.printf("[FEED] POST %s (%u bytes)\n", url0.c_str(),
                 (unsigned)body.length());
 
   String resp;
-  const int code = httpReq(url, true, body, 6000, resp);
+  int code = httpReq(url0, true, body, 6000, resp);
+  if (code > 0) noteTransportSuccess();
+
+  if (code <= 0) {
+    // Transport failure: the cached IP may be stale (DHCP moved the relay).
+    // Self-heal: drop the cache, re-discover, retry ONCE against a new IP.
+    noteTransportFailure();
+    const String stale = s_ip;
+    if (stale.length()) {
+      Serial.printf("[FEED] no response from %s - re-discovering\n",
+                    stale.c_str());
+      clearIpCache();
+      const Result d = discover();
+      if (!d.ok) {
+        r.error = "No relay (" + d.error + ")";
+        return r;
+      }
+      if (d.ip != stale) {
+        body = feedBody(seconds);
+        code = httpReq("http://" + s_ip + CATFISH_EP_FEED, true, body, 6000,
+                       resp);
+        if (code > 0) noteTransportSuccess();
+        if (code <= 0) {
+          noteTransportFailure();
+          r.error = "No response";
+          return r;
+        }
+      }
+      // Same IP re-confirmed by discovery: fall through and report the
+      // original transport error.
+    } else {
+      r.error = "No response";
+      return r;
+    }
+  }
+
   if (code != 200) {
     r.error = describeError(code, resp);
     return r;
@@ -227,6 +297,10 @@ Result feed(uint8_t seconds) {
 
   r.ok = true;
   r.ip = s_ip;
+  // What the relay actually applied (it clamps to maxPulseS and reports a note)
+  r.seconds_applied = (uint8_t)(rd["seconds"] | (int)seconds);
+  r.clamped = rd["note"].is<const char*>();
+  if (r.clamped) r.note = String((const char *)(rd["note"] | ""));
   return r;
 }
 
@@ -243,7 +317,14 @@ Status fetchStatus() {
   }
 
   String resp;
-  const int code = httpReq("http://" + s_ip + CATFISH_EP_STATUS, false, "", 3000, resp);
+  const int code =
+      httpReq("http://" + s_ip + CATFISH_EP_STATUS, false, "", 3000, resp);
+  if (code <= 0) {
+    noteTransportFailure();
+    st.error = describeError(code, resp);
+    return st;
+  }
+  noteTransportSuccess();
   if (code != 200) {
     st.error = describeError(code, resp);
     return st;
@@ -261,6 +342,57 @@ Status fetchStatus() {
   st.version = String((const char *)(doc["version"] | "unknown"));
   st.state = String((const char *)(doc["state"] | ""));
   return st;
+}
+
+Result rotateToken(const String &newToken) {
+  Result r;
+
+  if (!net_wifi::wifi_is_connected()) {
+    r.error = "WiFi down";
+    return r;
+  }
+  if (!newToken.length() || newToken.length() >= CATFISH_TOKEN_LEN) {
+    r.error = "Bad token length";
+    return r;
+  }
+  if (!s_ip.length()) {
+    Result d = discover();
+    if (!d.ok) {
+      r.error = "No relay (" + d.error + ")";
+      return r;
+    }
+  }
+
+  JsonDocument doc;
+  doc["token"] = prefs::getRelayToken(); // current credential
+  doc["newToken"] = newToken;
+  String body;
+  serializeJson(doc, body);
+
+  String resp;
+  const int code =
+      httpReq("http://" + s_ip + CATFISH_EP_CONFIG, true, body, 4000, resp);
+  if (code > 0) noteTransportSuccess();
+  if (code <= 0) {
+    noteTransportFailure();
+    r.error = describeError(code, resp);
+    return r;
+  }
+  if (code != 200) {
+    r.error = describeError(code, resp);
+    return r;
+  }
+
+  JsonDocument rd;
+  if (deserializeJson(rd, resp) != DeserializationError::Ok ||
+      !(rd["ok"] | false)) {
+    r.error = describeError(code, resp);
+    return r;
+  }
+
+  r.ok = true;
+  r.ip = s_ip;
+  return r;
 }
 
 } // namespace relay_client

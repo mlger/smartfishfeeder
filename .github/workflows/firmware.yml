@@ -28,6 +28,26 @@ permissions:
   contents: read
 
 jobs:
+  test-native:
+    name: Native unit tests (feed_scheduler)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO (pinned for reproducible builds)
+        run: pip install platformio==6.1.19
+
+      - name: Run native tests
+        run: pio test -d firmware/display-unit -e native
+
   build-display-unit:
     name: Build Display Unit (ESP32-S3)
     runs-on: ubuntu-latest
@@ -42,8 +62,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PlatformIO
-        run: pip install "platformio>=6.1,<7"
+      - name: Install PlatformIO (pinned for reproducible builds)
+        run: pip install platformio==6.1.19
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -56,6 +76,16 @@ jobs:
       - name: Build firmware
         run: pio run -d firmware/display-unit
 
+      - name: Firmware size report
+        run: |
+          pio run -d firmware/display-unit -t size 2>&1 | tee size.log
+          {
+            echo "### Display Unit (ESP32-S3) firmware size"
+            echo '```'
+            grep -E '^(RAM|Flash):' size.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Stage binaries
         run: |
           mkdir -p staging
@@ -64,6 +94,8 @@ jobs:
           cp firmware/display-unit/.pio/build/display-unit/firmware.bin staging/
           cp firmware/display-unit/.pio/build/display-unit/bootloader.bin staging/
           cp firmware/display-unit/.pio/build/display-unit/partitions.bin staging/
+          # ELF for symbolized crash triage (release asset only)
+          cp firmware/display-unit/.pio/build/display-unit/firmware.elf staging/
 
       - name: Upload display-unit artifact
         uses: actions/upload-artifact@v4
@@ -86,8 +118,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PlatformIO
-        run: pip install "platformio>=6.1,<7"
+      - name: Install PlatformIO (pinned for reproducible builds)
+        run: pip install platformio==6.1.19
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -100,12 +132,24 @@ jobs:
       - name: Build firmware
         run: pio run -d firmware/relay-unit
 
+      - name: Firmware size report
+        run: |
+          pio run -d firmware/relay-unit -t size 2>&1 | tee size.log
+          {
+            echo "### Relay Unit (ESP8266) firmware size"
+            echo '```'
+            grep -E '^(RAM|Flash):' size.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # espressif8266 uploads a self-contained firmware.bin at offset 0x0,
       # so the web flasher needs a single part at 0.
       - name: Stage binaries
         run: |
           mkdir -p staging
           cp firmware/relay-unit/.pio/build/relay-unit/firmware.bin staging/relay-unit-firmware.bin
+          # ELF for symbolized crash triage (release asset only)
+          cp firmware/relay-unit/.pio/build/relay-unit/firmware.elf staging/relay-unit-firmware.elf
 
       - name: Upload relay-unit artifact
         uses: actions/upload-artifact@v4
@@ -243,7 +287,9 @@ jobs:
           cp dist/display-unit/firmware.bin "assets/display-unit-firmware-${V}.bin"
           cp dist/display-unit/bootloader.bin "assets/display-unit-bootloader-${V}.bin"
           cp dist/display-unit/partitions.bin "assets/display-unit-partitions-${V}.bin"
+          cp dist/display-unit/firmware.elf "assets/display-unit-firmware-${V}.elf"
           cp dist/relay-unit/relay-unit-firmware.bin "assets/relay-unit-firmware-${V}.bin"
+          cp dist/relay-unit/relay-unit-firmware.elf "assets/relay-unit-firmware-${V}.elf"
 
       - name: Attach assets to release
         uses: softprops/action-gh-release@v2

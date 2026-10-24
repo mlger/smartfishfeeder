@@ -15,6 +15,11 @@ uint16_t s_last_fired[feed_scheduler::MAX_FEED_TIMES];
 int s_count = 0;
 bool s_dirty = false;
 
+// Injectable clock (test hook; nullptr = system time). See set_time_source().
+time_t (*s_time_fn)() = nullptr;
+
+time_t nowTime() { return s_time_fn ? s_time_fn() : time(nullptr); }
+
 void resetFireTracking() {
   for (int i = 0; i < feed_scheduler::MAX_FEED_TIMES; i++) s_last_fired[i] = 0xFFFF;
 }
@@ -155,7 +160,7 @@ bool toggle(int index) {
 }
 
 bool timeValid() {
-  time_t now = time(nullptr);
+  time_t now = nowTime();
   struct tm lt;
   if (!localtime_r(&now, &lt)) return false;
   return lt.tm_year >= (2025 - 1900); // NTP-synced gate
@@ -166,7 +171,7 @@ FeedTime tick() {
 
   if (!timeValid() || s_count == 0) return none;
 
-  time_t now = time(nullptr);
+  time_t now = nowTime();
   struct tm lt;
   if (!localtime_r(&now, &lt)) return none;
 
@@ -199,7 +204,7 @@ NextFeed nextOccurrence() {
 
   if (!timeValid() || s_count == 0) return out;
 
-  time_t now = time(nullptr);
+  time_t now = nowTime();
   struct tm lt;
   if (!localtime_r(&now, &lt)) return out;
 
@@ -241,5 +246,7 @@ NextFeed nextOccurrence() {
   }
   return out;
 }
+
+void set_time_source(time_t (*fn)()) { s_time_fn = fn; }
 
 } // namespace feed_scheduler

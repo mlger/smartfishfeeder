@@ -33,9 +33,19 @@ void workerTask(void * /*param*/) {
       r.retry = cmd.retry;
       r.hour = cmd.hour;
       r.minute = cmd.minute;
-      r.seconds = cmd.seconds;
+      r.seconds = fr.ok ? fr.seconds_applied : cmd.seconds;
+      r.clamped = fr.clamped;
+      strlcpy(r.note, fr.note.c_str(), sizeof(r.note));
       strlcpy(r.ip, fr.ip.c_str(), sizeof(r.ip));
       if (!fr.ok) fillError(r, fr.error);
+    } else if (cmd.type == net_worker::Cmd::CMD_TOKEN_ROTATE) {
+      Serial.println("[NET] worker: token rotate request");
+      const relay_client::Result tr = relay_client::rotateToken(String(cmd.token));
+      r.kind = net_worker::Result::RES_TOKEN;
+      r.ok = tr.ok;
+      strlcpy(r.token, cmd.token, sizeof(r.token));
+      strlcpy(r.ip, tr.ip.c_str(), sizeof(r.ip));
+      if (!tr.ok) fillError(r, tr.error);
     } else {
       // PROBE: discover when needed, then GET /status
       bool online = false;
@@ -76,7 +86,9 @@ bool begin() {
     Serial.println("[NET] ERROR: worker queue alloc failed");
     return false;
   }
-  if (xTaskCreatePinnedToCore(workerTask, "net-worker", 8192, nullptr, 2,
+  // 12 KB stack: HTTPClient + ArduinoJson + discovery chains measured well
+  // under 8 KB, but headroom is free on this part (L5 review item).
+  if (xTaskCreatePinnedToCore(workerTask, "net-worker", 12288, nullptr, 2,
                               nullptr, 0) != pdPASS) {
     Serial.println("[NET] ERROR: worker task create failed");
     return false;
@@ -103,6 +115,14 @@ bool enqueueProbe(bool report) {
   Cmd c;
   c.type = Cmd::CMD_PROBE;
   c.report = report;
+  return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
+}
+
+bool enqueueTokenRotate(const char *newToken) {
+  if (!s_cmdq || !newToken || !newToken[0]) return false;
+  Cmd c;
+  c.type = Cmd::CMD_TOKEN_ROTATE;
+  strlcpy(c.token, newToken, sizeof(c.token));
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }
 

@@ -7,13 +7,17 @@ How to build, flash and configure both firmwares. For wiring see [hardware.md](h
 | | Display Unit | Relay Unit |
 |---|--------------|------------|
 | Board | Waveshare ESP32-S3-Touch-LCD-4.3B (`esp32-s3-devkitc-1`) | ESP8266 NodeMCU V3 (`nodemcuv2`) |
-| Platform | pioarduino 55.03.312 (Arduino core 3.x / ESP-IDF 5.5) | espressif8266@^4.2.1 |
-| Framework libs | LVGL 8.4.0, ArduinoJson ^7.4.2, WiFiManager ^2.0.17 + vendored ESP32_Display_Panel 1.0.0 / ESP32_IO_Expander 1.0.1 / esp-lib-utils 0.1.2 (in `lib/`) | ArduinoJson ^7.4.2, WiFiManager ^2.0.17 |
+| Platform | pioarduino 55.03.312 (Arduino core 3.x / ESP-IDF 5.5) | espressif8266@4.2.1 (pinned) |
+| Framework libs | LVGL 8.4.0, ArduinoJson 7.4.2, WiFiManager 2.0.17 (pinned) + vendored ESP32_Display_Panel 1.0.0 / ESP32_IO_Expander 1.0.1 / esp-lib-utils 0.1.2 (in `lib/`) | ArduinoJson 7.4.2, WiFiManager 2.0.17 (pinned) |
 | Flash layout | 16 MB, `default_16MB.csv` — bootloader `0x0`, partitions `0x8000`, boot_app0 `0xe000`, app `0x10000` | Single self-contained `firmware.bin` at `0x0` |
 | Memory | `qio_opi`: 16 MB QIO flash + 8 MB octal PSRAM (`-DBOARD_HAS_PSRAM`) | 4 MB flash (board default) |
 | Serial | 115200 baud (exception decoder enabled) | 115200 baud |
 
 The display unit's panel library versions are vendored exactly as in Waveshare's official 4.3B demo package and must not be bumped casually — the LVGL port files (`src/lvgl_v8_port.cpp/h`) require the **LVGL v8 API**.
+
+**Version single source:** both firmwares report the same version string from `firmware/common/catfish_protocol.h` (`CATFISH_APP_VERSION`). That header is also the single source of truth for discovery strings/ports, hostnames, token default/capacity, pulse limits and endpoint paths — change protocol constants there, never per-unit.
+
+**Architecture (display unit):** the LVGL task renders/touches; a `wifi-task` owns WiFiManager/mDNS/NTP; a `net-worker` task (core 0) owns **all** blocking relay HTTP/discovery. `loop()` only enqueues commands and drains results through FreeRTOS queues, so the 1 Hz scheduler stays punctual during 6 s feed POSTs or 5.5 s discovery chains. UI callbacks never touch flash, the network, or the scheduler — they enqueue `UiEvent`s that `loop()` consumes.
 
 ## Prerequisites
 
@@ -40,6 +44,25 @@ pio run -d firmware/relay-unit       # ESP8266 relay
 ```
 
 The first build downloads the toolchains and registry libraries (LVGL, ArduinoJson, WiFiManager); the panel libraries are already vendored in `firmware/display-unit/lib/`. Artifacts land in `firmware/<unit>/.pio/build/<env>/` (`firmware.bin`, `bootloader.bin`, `partitions.bin` for the S3).
+
+Library/platform versions are pinned (ArduinoJson 7.4.2, WiFiManager 2.0.17, espressif8266 4.2.1, CI uses PlatformIO 6.1.19) so builds are reproducible.
+
+## Test (host-side, no hardware)
+
+The feeding schedule engine is unit-tested on your machine with PlatformIO's native environment:
+
+```sh
+pio test -d firmware/display-unit -e native
+```
+
+This compiles the real `feed_scheduler.cpp` against a minimal `test/mocks/Arduino.h` with an injected clock (`feed_scheduler::set_time_source`) and covers add/duplicate rejection, clamping, capacity, once-per-minute firing, boot-inside-minute behaviour, disabled entries, NTP gating, today/tomorrow selection, identity removal and JSON persistence round-trips. CI runs the same suite in every build.
+
+## Scheduled-feed resilience (display unit)
+
+- A failed scheduled feed is retried **once** ~30 s later (two retry slots cover entries failing in the same window); the final failure raises a `Feed FAILED: <reason>` toast.
+- A scheduled feed that fires while WiFi is down is not lost — it is retried ~60 s later when connectivity returns.
+- Errors from the relay are mapped to human-readable toasts (`Token mismatch`, `Relay busy`, `Invalid duration`).
+- A successful feed shows an optimistic "Feeding..." relay state for the pulse duration, then reconciles with the next real `/status` probe.
 
 ## Flash
 
@@ -120,14 +143,16 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 
 | Setting | Where | Default | How to change |
 |---------|-------|---------|---------------|
-| Feed token | Relay Unit | `catfish` | `POST /config` with `{"token":"..."}` (persisted to flash), or edit the default in `config.h` and re-flash |
+| Feed token | Relay Unit | `catfish` | Display UI: Settings → Relay Unit → *Pairing token* (tick "Also update the relay unit" to rotate both sides), or `POST /config` with `{"token":"..."}` |
 | Relay active level | Relay Unit `config.h` | board-dependent | `RELAY_ACTIVE_LEVEL` compile-time constant — set to match your relay board (many are ACTIVE-LOW), re-flash |
 | Timezone | Display Unit | Asia/Manila | POSIX TZ string `PHT-8` (UTC+8, no DST); schedule times are local |
 | NTP | Display Unit | pool servers | Synced periodically; UI shows synced time |
+| Backlight | Display Unit | on | Settings → Display → Backlight switch (persisted across reboots); screen auto-dims after 10 min idle and wakes on touch |
+| Factory reset | Relay Unit | — | Hold the **FLASH** button ~5 s while running: EEPROM config (token, pulse caps) is wiped to defaults and the unit reboots. Refused while a pulse is running |
 
 **Timezone note:** the firmware uses the POSIX form `PHT-8` — a positive UTC offset is written with a minus sign in POSIX. Schedule entries entered on the Schedule screen are interpreted in this timezone.
 
-**Token note:** `catfish` is a default, not a feature. Change it before going live: `curl -X POST http://catfish-relay.local/config -H 'Content-Type: application/json' -d '{"token":"your-new-token"}'`. The display unit's Settings screen must be updated with the same token so `POST /feed` keeps working. Changing the token via `/config` takes effect immediately and survives reboots.
+**Token note:** `catfish` is a default, not a feature. Change it before going live — the easiest way is the display unit itself (Settings → Relay Unit → *Pairing token*, tick **"Also update the relay unit"**): it rotates the relay token via `POST /config` and only saves the new token locally after the relay accepted it. To rotate without the display: `curl -X POST http://catfish-relay.local/config -H 'Content-Type: application/json' -d '{"token":"your-current-token","newToken":"your-new-token"}'`, then update the display's token in Settings. Token changes take effect immediately and survive reboots.
 
 ## OTA updates
 
@@ -137,7 +162,18 @@ The relay unit runs ArduinoOTA, so firmware updates need no cable once it is on 
 pio run -d firmware/relay-unit -t upload --upload-port catfish-relay.local
 ```
 
-Requirements: display unit/PC and relay unit on the same LAN, mDNS resolution working (`.local`), and the relay unit idle. Display Unit OTA is on the roadmap (see the README); for now flash it over USB.
+Requirements: display unit/PC and relay unit on the same LAN, mDNS resolution working (`.local`), and the relay unit idle.
+
+OTA is **open (no password) by default** — a documented decision for this LAN-only appliance. To require a password, add the credential at build time:
+
+```sh
+pio run -d firmware/relay-unit -t upload --upload-port catfish-relay.local \
+    --build-flag '-DOTA_PASSWORD="s3cret"'
+```
+
+(or add `-DOTA_PASSWORD=\"s3cret\"` to `build_flags` in `firmware/relay-unit/platformio.ini`).
+
+Display Unit OTA is on the roadmap (see the README); for now flash it over USB.
 
 ## Partitions & PSRAM notes
 
@@ -151,7 +187,7 @@ Requirements: display unit/PC and relay unit on the same LAN, mDNS resolution wo
 |---------|--------------|-----|
 | White screen on the display unit | Panel not initialized (bad board config or boot loop before LVGL starts) | Check serial logs; verify `include/esp_panel_board_custom_conf.h` was not modified; re-flash all four images at the correct offsets |
 | No touch response | GT911 reset/int sequence handled via CH422G expander | Confirm vendored libs are 1.0.0/1.0.1 (not registry variants); check logs for `GT911`/expander init errors; power-cycle fully |
-| Relay not found by display unit | Different subnet/AP isolation, mDNS blocked, relay offline | Ping `catfish-relay.local`; test UDP discovery (see [api.md](api.md)); ensure both units are on the same 2.4 GHz SSID and that client isolation is off |
+| Relay not found by display unit | Different subnet/AP isolation, mDNS blocked, relay offline | Ping `catfish-relay.local`; test UDP discovery (see [api.md](api.md)); ensure both units are on the same 2.4 GHz SSID and that client isolation is off. A stale saved IP self-heals within ~2–3 min (3 failed probes drop it) — or press *Test connection* which re-runs discovery |
 | Setup portal not appearing | Credentials already saved, or portal only shows when WiFi fails | Erase flash (`pio run -d <dir> -t erase`) and re-provision; check the phone actually joined the setup AP |
 | `PSRAM init failed` at boot | Wrong memory type or missing build flag | Keep `qio_opi` and `-DBOARD_HAS_PSRAM` in `firmware/display-unit/platformio.ini`; verify you have the N16R8 module (8 MB PSRAM) |
 | WiFi keeps dropping | Weak 2.4 GHz signal, PSU sag, RF congestion | Move closer to the AP, check the 5 V rail under motor load (brown-outs reset the NodeMCU), pick a clearer channel |
