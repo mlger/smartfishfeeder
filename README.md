@@ -15,7 +15,7 @@ Catfish Feeder is a two-board, self-hosted fish feeder. The **Display Unit** (Wa
 - NTP time sync with Asia/Manila timezone (`PHT-8`, UTC+8, no DST)
 - First-boot WiFi provisioning via WiFiManager captive portal (AP `CatfishFeeder-Setup`)
 - Browser-based flashing (ESP Web Tools) — no toolchain install required
-- ArduinoOTA updates on the relay unit
+- ArduinoOTA updates on both units (relay: `catfish-relay.local`, display: `catfishfeeder.local`)
 - Relay discovery via mDNS (`catfish-relay.local`) and UDP broadcast on port 5050
 - Token-protected feed API (`POST /feed`, default token `catfish` — change it)
 - Fully documented: wiring, build, API, UI design pipeline, AI tooling
@@ -123,7 +123,7 @@ CI builds both firmwares on every push (ESP32-S3 factory image pre-merged at boo
 - Web dashboard (beyond the relay unit's built-in page)
 - Servo / stepper-based feeding mechanism option
 - Camera snapshot on each feed event
-- OTA updates for the display unit (relay unit already supports ArduinoOTA)
+- ~~OTA updates for the display unit~~ — shipped in v1.1.0 (ArduinoOTA on both units, optional build-time password)
 - Multi-tank / multi-relay support (one display unit driving several relays)
 
 ## Credits

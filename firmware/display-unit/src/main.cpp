@@ -19,6 +19,8 @@
 #include <Arduino.h>
 #include <time.h>
 
+#include <ArduinoOTA.h>
+
 #include "lvgl_v8_port.h"
 #include "esp_display_panel.hpp"
 
@@ -32,6 +34,14 @@
 
 using namespace esp_panel::board;
 using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
+
+// ------------------------------------------------------------------ OTA
+// ArduinoOTA is open by default on this LAN-only appliance (same decision as
+// the relay unit). To require a password, add -DOTA_PASSWORD=\"s3cret\" to
+// build_flags (or inject it from CI). Empty string keeps the open behaviour.
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
 
 static Board *s_board = nullptr;
 
@@ -140,6 +150,52 @@ static void uiToast(const String &msg) {
   lvgl_port_lock(-1);
   ui_toast(msg);
   lvgl_port_unlock();
+}
+
+// ---------------------------------------------------------------------------
+// ArduinoOTA (display unit): begun lazily on the first loop() pass AFTER WiFi
+// connects, because mDNS ('catfishfeeder') is registered inside wifi-task and
+// the Arduino core advertises the _arduino/_tcp service through that shared
+// mDNS instance. handle() is pumped from loop() (~50 ms cadence); callbacks
+// fire in the same task context as every other UI update, so toasts are safe.
+// ---------------------------------------------------------------------------
+static bool s_ota_ready = false;
+
+static void beginOtaOnce() {
+  if (s_ota_ready || !net_wifi::wifi_is_connected()) return;
+
+  ArduinoOTA.setHostname(CATFISH_DISPLAY_HOSTNAME);
+
+  ArduinoOTA.onStart([] {
+    Serial.println("[SYS] OTA update started (firmware)");
+    uiToast("Receiving update...");
+  });
+  ArduinoOTA.onEnd([] {
+    Serial.println("[SYS] OTA update finished, rebooting");
+    uiToast("Update OK - restarting");
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static uint8_t s_last_step = 0; // log at 25% steps, not per chunk
+    if (!total) return;
+    const uint8_t step = (uint8_t)((done * 100U / total) / 25U);
+    if (step != s_last_step) {
+      s_last_step = step;
+      Serial.printf("[SYS] OTA progress %u%%\n", (unsigned)(done * 100U / total));
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    Serial.printf("[SYS] OTA error %d\n", (int)err);
+    uiToast("Update failed (code " + String((int)err) + ")");
+  });
+
+  if (OTA_PASSWORD[0] != '\0') {
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    Serial.println("[SYS] OTA ready: catfishfeeder.local:3232 (password protected)");
+  } else {
+    Serial.println("[SYS] OTA ready: catfishfeeder.local:3232 (LAN, no password)");
+  }
+  ArduinoOTA.begin();
+  s_ota_ready = true;
 }
 
 /** Route a feed request to the worker; manual feeds get immediate feedback. */
@@ -354,9 +410,11 @@ static void handleWorkerResult(const net_worker::Result &r) {
   if (r.report) {
     if (!net_wifi::wifi_is_connected())
       ui_toast("WiFi not connected");
-    else if (r.online)
-      ui_toast(String("Relay OK  v") + r.version);
-    else
+    else if (r.online) {
+      String t = String("Relay OK  v") + r.version;
+      if (r.protoMismatch) t += " (protocol mismatch!)";
+      ui_toast(t);
+    } else
       ui_toast("Relay unreachable");
   }
   lvgl_port_unlock();
@@ -415,6 +473,10 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
+
+  // OTA updater: begin lazily once WiFi/mDNS is up, then serve every pass.
+  beginOtaOnce();
+  if (s_ota_ready) ArduinoOTA.handle();
 
   // ---- drain UI events + worker results (every pass, ~50 ms latency) ----
   UiEvent ev;

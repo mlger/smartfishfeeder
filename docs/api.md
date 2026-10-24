@@ -79,7 +79,8 @@ Full runtime snapshot (no auth).
   "heap": 21340,
   "rssi": -58,
   "ip": "192.168.1.42",
-  "version": "1.0.0",
+  "version": "1.1.0",
+  "proto": 1,
   "ntpSynced": true
 }
 ```
@@ -98,11 +99,16 @@ Full runtime snapshot (no auth).
 | `rssi` | int | WiFi signal in dBm |
 | `ip` | string | Current IP address |
 | `version` | string | Firmware version |
+| `proto` | int | Wire-contract revision (see `CATFISH_PROTOCOL_VERSION` in `firmware/common/catfish_protocol.h`). The display unit compares it to its own value and warns on a mismatch — the usual cause is only one unit being re-flashed |
 | `ntpSynced` | bool | `true` once NTP time is valid (affects `lastFeedEpoch` accuracy) |
 
 ```sh
 curl http://catfish-relay.local/status
 ```
+
+### Protocol versioning
+
+Firmware on both units must agree on the wire contract (endpoints, JSON fields, discovery strings). Each build embeds `CATFISH_PROTOCOL_VERSION`; the relay reports it as `"proto"` in `/status`, and the display logs a warning (once per boot) and marks the *Test connection* toast with **(protocol mismatch!)** when the values differ. If you see it, re-flash both units from the same commit/tag.
 
 ## GET /health
 

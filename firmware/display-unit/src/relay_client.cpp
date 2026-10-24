@@ -29,6 +29,10 @@ String s_ip; // cached relay IP, dotted string ("" = unknown)
 constexpr uint8_t TRANSPORT_FAIL_LIMIT = 3;
 uint8_t s_transport_fail_streak = 0;
 
+// Protocol-version mismatch is an operator-visible problem: warn once per boot
+// (the 60 s probe cadence would otherwise repeat it forever).
+bool s_proto_warned = false;
+
 void clearIpCache() {
   s_ip = "";
   prefs::setRelayIp("");
@@ -341,6 +345,16 @@ Status fetchStatus() {
   st.lastFeedEpoch = (uint32_t)(doc["lastFeedEpoch"] | 0);
   st.version = String((const char *)(doc["version"] | "unknown"));
   st.state = String((const char *)(doc["state"] | ""));
+  st.protocolVersion = (int)(doc["proto"] | -1);
+
+  if (st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION &&
+      !s_proto_warned) {
+    s_proto_warned = true;
+    Serial.printf(
+        "[NET] WARNING: relay protocol v%d but display expects v%d - flash BOTH "
+        "units to matching firmware versions\n",
+        st.protocolVersion, CATFISH_PROTOCOL_VERSION);
+  }
   return st;
 }
 

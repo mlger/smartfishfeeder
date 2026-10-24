@@ -156,24 +156,27 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 
 ## OTA updates
 
-The relay unit runs ArduinoOTA, so firmware updates need no cable once it is on the network:
+**Both units run ArduinoOTA**, so firmware updates need no cable once they are on the network:
 
 ```sh
-pio run -d firmware/relay-unit -t upload --upload-port catfish-relay.local
+pio run -d firmware/relay-unit -t upload --upload-port catfish-relay.local     # ESP8266, port 8266
+pio run -d firmware/display-unit -t upload --upload-port catfishfeeder.local   # ESP32-S3, port 3232
 ```
 
-Requirements: display unit/PC and relay unit on the same LAN, mDNS resolution working (`.local`), and the relay unit idle.
+The display unit begins its OTA service lazily once WiFi/mDNS is up and advertises the standard `_arduino._tcp` service as `catfishfeeder` — it shows up in IDE/PlatformIO device lists like the relay does. While an update is in flight the screen shows a *Receiving update...* toast; the unit reboots itself when the transfer completes.
 
-OTA is **open (no password) by default** — a documented decision for this LAN-only appliance. To require a password, add the credential at build time:
+Requirements: PC and unit on the same LAN, mDNS resolution working (`.local`), and the relay unit idle (the display unit can stay in normal operation).
+
+OTA is **open (no password) by default** — a documented decision for this LAN-only appliance. To require a password, add the credential at build time (per unit):
 
 ```sh
 pio run -d firmware/relay-unit -t upload --upload-port catfish-relay.local \
     --build-flag '-DOTA_PASSWORD="s3cret"'
+pio run -d firmware/display-unit -t upload --upload-port catfishfeeder.local \
+    --build-flag '-DOTA_PASSWORD="s3cret"'
 ```
 
-(or add `-DOTA_PASSWORD=\"s3cret\"` to `build_flags` in `firmware/relay-unit/platformio.ini`).
-
-Display Unit OTA is on the roadmap (see the README); for now flash it over USB.
+(or add `-DOTA_PASSWORD=\"s3cret\"` to `build_flags` in the unit's `platformio.ini` — both `main.cpp` files fall back to an empty password when the flag is absent).
 
 ## Partitions & PSRAM notes
 
