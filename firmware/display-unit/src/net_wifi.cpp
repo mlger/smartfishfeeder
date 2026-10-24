@@ -4,7 +4,7 @@
  */
 #include "net_wifi.h"
 #include <Arduino.h>
-#include <MDNS.h>
+#include <ESPmDNS.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <time.h>

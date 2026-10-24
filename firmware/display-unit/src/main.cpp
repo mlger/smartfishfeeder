@@ -23,6 +23,7 @@
 #include "ui/ui.h"
 
 using namespace esp_panel::board;
+using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*)
 
 static Board *s_board = nullptr;
 

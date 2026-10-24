@@ -115,7 +115,7 @@ smartfishfeeder/
 └── LICENSE                  # MIT + third-party notices
 ```
 
-CI builds both firmwares on every push, merges the ESP32-S3 images (bootloader `0x0`, partitions `0x8000`, boot_app0 `0xe000`, firmware `0x10000`) for the web flasher, deploys the flasher to GitHub Pages, and attaches binaries to GitHub Releases on `v*` tags.
+CI builds both firmwares on every push (ESP32-S3 factory image pre-merged at bootloader `0x0`, partitions `0x8000`, boot_app0 `0xe000`, firmware `0x10000`) for the web flasher, deploys the flasher to GitHub Pages, and attaches binaries to GitHub Releases on `v*` tags.
 
 ## Roadmap
 

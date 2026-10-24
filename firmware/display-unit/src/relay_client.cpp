@@ -6,7 +6,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
-#include <MDNS.h>
+#include <ESPmDNS.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiUdp.h>

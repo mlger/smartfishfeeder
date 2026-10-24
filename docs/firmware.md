@@ -50,7 +50,7 @@ Pick one of the three methods. All produce the same result.
 1. Open **https://mlger.github.io/smartfishfeeder/** in Chrome or Edge.
 2. Connect the unit by USB and click **Connect**.
 3. Click **Install** and confirm. ESP Web Tools writes:
-   - Display Unit — 4 images: bootloader `0x0`, partitions `0x8000`, boot_app0 `0xe000`, firmware `0x10000` (CI pre-merges them; you can also flash the released `merged_firmware.bin` as one image at `0x0` with esptool).
+   - Display Unit — 4 images: bootloader `0x0`, partitions `0x8000`, boot_app0 `0xe000`, firmware `0x10000` (CI pre-merges them; you can also flash the released `merged-firmware.bin` as one image at `0x0` with esptool).
    - Relay Unit — one self-contained `firmware.bin` at `0x0`.
 4. Wait for "successfully installed", then press RST (display unit) or replug (NodeMCU).
 
@@ -69,7 +69,7 @@ esptool.py --chip esp32s3 --port <PORT> --baud 921600 write_flash \
 Or flash the CI-merged whole-flash image in one shot:
 
 ```sh
-esptool.py --chip esp32s3 --port <PORT> --baud 921600 write_flash 0x0 merged_firmware.bin
+esptool.py --chip esp32s3 --port <PORT> --baud 921600 write_flash 0x0 merged-firmware.bin
 ```
 
 Relay Unit:

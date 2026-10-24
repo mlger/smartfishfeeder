@@ -1,8 +1,10 @@
 # Catfish Feeder — firmware CI, GitHub Pages web flasher, releases
 #
 # - Builds both PlatformIO projects (display-unit ESP32-S3, relay-unit ESP8266)
-# - Merges the 4 ESP32-S3 binaries into one flashable image with esptool v5
-#   (`merge-bin` — v5 renamed `merge_bin` and `--flash_mode` -> `--flash-mode`)
+# - Display unit: pioarduino emits firmware.factory.bin — a single flashable
+#   image (bootloader @0x0, partitions @0x8000, boot_app0 @0xe000, app @0x10000,
+#   DIO flash mode) used directly by the web flasher.
+# - Relay unit: espressif8266 produces a self-contained firmware.bin flashed at 0x0.
 # - Serves web-flasher/ + fresh firmware manifests on GitHub Pages (build_type=workflow)
 # - Attaches firmware binaries to GitHub releases on v* tags
 #
@@ -36,8 +38,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PlatformIO and esptool
-        run: pip install platformio esptool
+      - name: Install PlatformIO
+        run: pip install platformio
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -53,26 +55,11 @@ jobs:
       - name: Stage binaries
         run: |
           mkdir -p staging
+          # firmware.factory.bin = merged single image for the web flasher
+          cp firmware/display-unit/.pio/build/display-unit/firmware.factory.bin staging/
           cp firmware/display-unit/.pio/build/display-unit/firmware.bin staging/
           cp firmware/display-unit/.pio/build/display-unit/bootloader.bin staging/
           cp firmware/display-unit/.pio/build/display-unit/partitions.bin staging/
-          cp firmware/display-unit/.pio/build/display-unit/boot_app0.bin staging/
-
-      # esptool v5 syntax (verified against esptool 5.6.0):
-      # subcommand and options use hyphens; -o/--output is required.
-      # DIO is used for maximum compatibility when flashing via the browser;
-      # the board itself is QIO-capable (N16R8) and DIO works on QIO hardware.
-      - name: Merge ESP32-S3 firmware image
-        working-directory: staging
-        run: |
-          esptool --chip esp32s3 merge-bin \
-            --output merged-firmware.bin \
-            --flash-mode dio \
-            --flash-size 16MB \
-            0x0 bootloader.bin \
-            0x8000 partitions.bin \
-            0xe000 boot_app0.bin \
-            0x10000 firmware.bin
 
       - name: Upload display-unit artifact
         uses: actions/upload-artifact@v4
@@ -94,7 +81,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install PlatformIO
-        run: pip install platformio esptool
+        run: pip install platformio
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -152,7 +139,7 @@ jobs:
         run: |
           mkdir -p site/fw
           cp web-flasher/* site/
-          cp dist/display-unit/merged-firmware.bin site/fw/display-unit-merged.bin
+          cp dist/display-unit/firmware.factory.bin site/fw/display-unit-merged.bin
           cp dist/relay-unit/relay-unit-firmware.bin site/fw/relay-unit-firmware.bin
 
       - name: Generate firmware manifests (version = short commit SHA)
@@ -239,11 +226,10 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p assets
-          cp dist/display-unit/merged-firmware.bin assets/merged-firmware.bin
+          cp dist/display-unit/firmware.factory.bin assets/merged-firmware.bin
           cp dist/display-unit/firmware.bin assets/display-unit-firmware.bin
           cp dist/display-unit/bootloader.bin assets/display-unit-bootloader.bin
           cp dist/display-unit/partitions.bin assets/display-unit-partitions.bin
-          cp dist/display-unit/boot_app0.bin assets/display-unit-boot_app0.bin
           cp dist/relay-unit/relay-unit-firmware.bin assets/relay-unit-firmware.bin
 
       - name: Attach assets to release
