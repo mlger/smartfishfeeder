@@ -27,6 +27,7 @@
 #include "feed_scheduler.h"
 #include "net_wifi.h"
 #include "net_worker.h"
+#include "mqtt_mgr.h"
 #include "prefs.h"
 #include "relay_client.h"
 #include "ui/ui.h"
@@ -68,6 +69,13 @@ static SchedRetry s_retries[2];
 // superseded early by the next real /status probe.
 static bool s_opt_feeding = false;
 static uint32_t s_opt_feeding_until = 0;
+
+// Last relay state, mirrored to MQTT (retained) whenever it changes.
+static bool s_relay_online_cached = false;
+static bool s_feeding_cached = false;
+
+// MQTT status as last painted on the Settings card (0xFF = force first sync).
+static uint8_t s_mqtt_last_ui = 0xFF;
 
 static void clearRetryFor(uint8_t hour, uint8_t minute) {
   for (SchedRetry &s : s_retries) {
@@ -129,7 +137,7 @@ static void appSetBacklight(bool on) {
   Serial.printf("[SYS] backlight %s\n", on ? "ON" : "OFF");
 }
 
-/** Recompute next feeding from the scheduler and push it to the UI. */
+/** Recompute next feeding from the scheduler and push it to the UI + MQTT. */
 static void refreshNextFeedUi() {
   if (!feed_scheduler::timeValid()) {
     lvgl_port_lock(-1);
@@ -144,12 +152,59 @@ static void refreshNextFeedUi() {
   else
     ui_set_next_feed("No feedings scheduled");
   lvgl_port_unlock();
+  // "HH:MM" plain string (retained); 'none' when the schedule is empty. Not
+  // published before NTP is valid — the last value stays until we know.
+  if (nf.valid)
+    mqtt_mgr::publishNextFeed(fmtHhmm(nf.hour, nf.minute));
+  else
+    mqtt_mgr::publishNextFeed(String("none"));
 }
 
 static void uiToast(const String &msg) {
   lvgl_port_lock(-1);
   ui_toast(msg);
   lvgl_port_unlock();
+}
+
+// ---------------------------------------------------------------------------
+// MQTT <-> UI sync (loop context only)
+// ---------------------------------------------------------------------------
+static String mqttBrokerSummary() {
+  if (!prefs::getMqttEnabled()) return String("Broker: not set");
+  return String("Broker: ") + prefs::getMqttHost() + ":" +
+         (unsigned)prefs::getMqttPort() + "  (" + prefs::getMqttPrefix() + "/...)";
+}
+
+static void mqttSyncUi() {
+  const mqtt_mgr::Status st = mqtt_mgr::status();
+  if ((uint8_t)st == s_mqtt_last_ui) return;
+  s_mqtt_last_ui = (uint8_t)st;
+  const char *txt = "disabled";
+  uint8_t state = 0;
+  switch (st) {
+    case mqtt_mgr::Status::Disabled:   txt = "disabled";           state = 0; break;
+    case mqtt_mgr::Status::Offline:    txt = "offline - retrying"; state = 1; break;
+    case mqtt_mgr::Status::Connecting: txt = "connecting...";      state = 1; break;
+    case mqtt_mgr::Status::Connected:  txt = "connected";          state = 2; break;
+  }
+  lvgl_port_lock(-1);
+  ui_set_mqtt_status(String(txt), state);
+  ui_set_mqtt_broker(mqttBrokerSummary());
+  lvgl_port_unlock();
+}
+
+/** Full retained state snapshot (called after every (re)connect). */
+static void mqttPublishAllState() {
+  mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
+  String nf = "none";
+  if (feed_scheduler::timeValid()) {
+    const feed_scheduler::NextFeed n = feed_scheduler::nextOccurrence();
+    if (n.valid) nf = fmtHhmm(n.hour, n.minute);
+  }
+  mqtt_mgr::publishNextFeed(nf);
+  mqtt_mgr::publishRelayOnline(s_relay_online_cached);
+  mqtt_mgr::publishFeeding(s_feeding_cached);
+  mqtt_mgr::publishPulse(prefs::getDefaultPulse());
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +327,8 @@ static void handleUiEvent(const UiEvent &ev) {
 
     case UI_EVT_SET_PULSE:
       prefs::setDefaultPulse(ev.a);
+      ui_set_pulse(ev.a); // also corrects the spinbox when set via Home Assistant
+      mqtt_mgr::publishPulse(ev.a); // retained; no-op when disconnected
       Serial.printf("[FEED] default pulse set to %u s\n", (unsigned)ev.a);
       break;
 
@@ -322,6 +379,20 @@ static void handleUiEvent(const UiEvent &ev) {
       feed_scheduler::setEnabled(ev.a, ev.flag); // single-writer flip (loop ctx)
       feed_scheduler::flushIfDirty();
       refreshNextFeedUi(); // enable/disable changes the next occurrence
+      break;
+
+    case UI_EVT_MQTT_CFG:
+      prefs::setMqttEnabled(ev.mqttEnable);
+      prefs::setMqttHost(String(ev.mqttHost));
+      prefs::setMqttPort(ev.mqttPort);
+      prefs::setMqttUser(String(ev.mqttUser));
+      prefs::setMqttPass(String(ev.mqttPass));
+      prefs::setMqttPrefix(String(ev.mqttPrefix));
+      Serial.printf("[SYS] MQTT settings saved (en=%u %s:%u prefix '%s')\n",
+                    ev.mqttEnable ? 1 : 0, ev.mqttHost, (unsigned)ev.mqttPort,
+                    ev.mqttPrefix);
+      mqtt_mgr::applyConfig();
+      mqttSyncUi();
       break;
 
     default:
@@ -376,6 +447,11 @@ static void handleWorkerResult(const net_worker::Result &r) {
         Serial.printf("[FEED] relay clamp note: %s\n", r.note);
       s_opt_feeding = true;
       s_opt_feeding_until = millis() + (uint32_t)r.seconds * 1000UL + 2000UL;
+      s_relay_online_cached = true;
+      s_feeding_cached = true;
+      // Retained MQTT mirror: the relay IS pulsing now (M2-consistent).
+      mqtt_mgr::publishFeeding(true);
+      if (clock_ok) mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
       Serial.printf("[FEED] feed OK via %s (%u s)\n", r.ip, (unsigned)r.seconds);
       refreshNextFeedUi();
     } else if (r.manual) {
@@ -404,9 +480,15 @@ static void handleWorkerResult(const net_worker::Result &r) {
 
   // RES_PROBE
   s_opt_feeding = false; // a real /status result supersedes the optimistic state
+  s_relay_online_cached = r.online;
+  s_feeding_cached = r.online && r.feeding;
   lvgl_port_lock(-1);
   ui_set_probe_busy(false);
   ui_set_relay(r.online, r.ip, r.feeding);
+  lvgl_port_unlock();
+  // Retained MQTT mirror of the relay state (no-ops when disconnected).
+  mqtt_mgr::publishRelayOnline(r.online);
+  if (r.online) mqtt_mgr::publishFeeding(r.feeding);
   if (r.report) {
     if (!net_wifi::wifi_is_connected())
       ui_toast("WiFi not connected");
@@ -432,6 +514,9 @@ void setup() {
   prefs::begin();
   feed_scheduler::init();
   relay_client::init();
+  if (!mqtt_mgr::begin()) {
+    Serial.println("[SYS] WARN: MQTT manager unavailable (continuing without)");
+  }
 
   // --- board + LVGL ---
   s_board = new Board();
@@ -462,6 +547,8 @@ void setup() {
     Serial.println("[SYS] ERROR: net worker unavailable; feeds will fail");
   }
   net_wifi::start();
+  mqtt_mgr::applyConfig(); // arms retry pump (WiFi-gated); status -> UI via 1 Hz sync
+  mqttSyncUi();
 
   // prime loop() cadence: first relay probe ~15 s after boot
   s_t_1s = millis();
@@ -484,6 +571,17 @@ void loop() {
 
   net_worker::Result res;
   while (net_worker::receive(res)) handleWorkerResult(res);
+
+  // ---- drain MQTT connection events (connected -> dump discovery+state) ----
+  bool mqConn = false;
+  while (mqtt_mgr::receive(mqConn)) {
+    if (mqConn) {
+      mqtt_mgr::publishDiscovery();
+      mqtt_mgr::publishAvailable();
+      mqttPublishAllState();
+    }
+    mqttSyncUi();
+  }
 
   // ---------------- 1 Hz block ----------------
   if ((now - s_t_1s) >= 1000) {
@@ -516,10 +614,16 @@ void loop() {
     // end of the optimistic feeding indicator (pulse + 2 s elapsed)
     if (s_opt_feeding && (int32_t)(now - s_opt_feeding_until) >= 0) {
       s_opt_feeding = false;
+      s_feeding_cached = false;
       lvgl_port_lock(-1);
       ui_set_relay(true, relay_client::ip(), false);
       lvgl_port_unlock();
+      mqtt_mgr::publishFeeding(false);
     }
+
+    // MQTT reconnect pump + Settings-card status sync
+    mqtt_mgr::retryIfDue(now);
+    mqttSyncUi();
 
     // UI housekeeping (clock, countdown, relay dot, idle dim)
     lvgl_port_lock(-1);

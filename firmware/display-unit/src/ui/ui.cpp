@@ -86,6 +86,18 @@ lv_obj_t *s_lbl_rssi = nullptr;
 lv_obj_t *s_lbl_relay_ip = nullptr;
 lv_obj_t *s_probe_btn = nullptr;
 
+// Settings > MQTT card + editor overlay (lv_layer_top)
+lv_obj_t *s_mq_status = nullptr;  // status line (color-coded)
+lv_obj_t *s_mq_broker = nullptr;  // "Broker: host:port • prefix/..."
+lv_obj_t *s_mq_overlay = nullptr;
+lv_obj_t *s_mq_sw_en = nullptr;   // "Enabled" switch inside the editor
+lv_obj_t *s_mq_ta_host = nullptr;
+lv_obj_t *s_mq_sb_port = nullptr;
+lv_obj_t *s_mq_ta_prefix = nullptr;
+lv_obj_t *s_mq_ta_user = nullptr;
+lv_obj_t *s_mq_ta_pass = nullptr;
+lv_obj_t *s_mq_kb = nullptr;
+
 // Token editor overlay (lv_layer_top)
 lv_obj_t *s_tok_overlay = nullptr;
 lv_obj_t *s_tok_ta = nullptr;
@@ -149,6 +161,13 @@ void closeTokenOverlay();
 void tokenEditCb(lv_event_t *e);
 void tokenSaveCb(lv_event_t *e);
 void tokenCancelCb(lv_event_t *e);
+void buildMqttOverlay();
+void openMqttOverlay();
+void closeMqttOverlay();
+void mqttEditCb(lv_event_t *e);
+void mqttSaveCb(lv_event_t *e);
+void mqttCancelCb(lv_event_t *e);
+void mqttTaFocusCb(lv_event_t *e);
 
 // ---------------------------------------------------------------------------
 // Small widget builders
@@ -459,6 +478,54 @@ void tokenSaveCb(lv_event_t *e) {
   ev.flag = s_tok_rotate && lv_obj_has_state(s_tok_rotate, LV_STATE_CHECKED);
   strlcpy(ev.token, t, sizeof(ev.token));
   if (uiEventSend(ev)) closeTokenOverlay(); // loop() persists (+rotates relay)
+}
+
+// ---------------------------------------------------------------------------
+// MQTT editor overlay (same pattern as the token editor; the keyboard is
+// hidden until a textarea is focused, then rebinds to whichever field has
+// focus — LVGL scrolls the focused field above the keyboard automatically).
+// ---------------------------------------------------------------------------
+void mqttEditCb(lv_event_t *e) {
+  (void)e;
+  openMqttOverlay();
+}
+
+void mqttCancelCb(lv_event_t *e) {
+  (void)e;
+  closeMqttOverlay();
+}
+
+void mqttTaFocusCb(lv_event_t *e) {
+  lv_obj_t *ta = (lv_obj_t *)lv_event_get_target(e);
+  if (s_mq_kb) {
+    lv_keyboard_set_textarea(s_mq_kb, ta);
+    lv_obj_clear_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+void mqttSaveCb(lv_event_t *e) {
+  (void)e;
+  const bool en = s_mq_sw_en && lv_obj_has_state(s_mq_sw_en, LV_STATE_CHECKED);
+  const char *host = lv_textarea_get_text(s_mq_ta_host);
+  if (en && (!host || host[0] == '\0')) {
+    ui_toast("Broker host required");
+    return;
+  }
+  const char *prefix = lv_textarea_get_text(s_mq_ta_prefix);
+  if (!prefix || prefix[0] == '\0' || strchr(prefix, '/') || strchr(prefix, ' ') ||
+      strchr(prefix, '+') || strchr(prefix, '#')) {
+    ui_toast("Prefix: no spaces or wildcards");
+    return;
+  }
+  UiEvent ev;
+  ev.type = UI_EVT_MQTT_CFG;
+  ev.mqttEnable = en;
+  ev.mqttPort = (uint16_t)lv_spinbox_get_value(s_mq_sb_port);
+  strlcpy(ev.mqttHost, host ? host : "", sizeof(ev.mqttHost));
+  strlcpy(ev.mqttUser, lv_textarea_get_text(s_mq_ta_user), sizeof(ev.mqttUser));
+  strlcpy(ev.mqttPass, lv_textarea_get_text(s_mq_ta_pass), sizeof(ev.mqttPass));
+  strlcpy(ev.mqttPrefix, prefix ? prefix : "", sizeof(ev.mqttPrefix));
+  if (uiEventSend(ev)) closeMqttOverlay(); // loop() persists + applies
 }
 
 void toastTimerCb(lv_timer_t *t) {
@@ -880,6 +947,25 @@ void buildSettings() {
   lv_obj_add_event_cb(test, relayTestCb, LV_EVENT_CLICKED, nullptr);
   s_probe_btn = test;
 
+  // -- Home Assistant / MQTT card
+  lv_obj_t *card_mq = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_mq, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_mq, 8, 0);
+  makeTitle(card_mq, "HOME ASSISTANT (MQTT)");
+  s_mq_status = lv_label_create(card_mq);
+  lv_label_set_text(s_mq_status, "MQTT: disabled");
+  lv_obj_set_style_text_font(s_mq_status, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_mq_status, lv_color_hex(C_MUTED), 0);
+  s_mq_broker = lv_label_create(card_mq);
+  lv_label_set_text(s_mq_broker, "Broker: not set");
+  lv_obj_set_style_text_font(s_mq_broker, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_mq_broker, lv_color_hex(C_TEXT), 0);
+  lv_obj_t *mq_edit = makeBtn(card_mq, LV_SYMBOL_EDIT "  Configure",
+                              C_CARD, C_AMBER, C_CARD_HI, lv_pct(100), 64);
+  lv_obj_set_style_border_color(mq_edit, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(mq_edit, 2, 0);
+  lv_obj_add_event_cb(mq_edit, mqttEditCb, LV_EVENT_CLICKED, nullptr);
+
   // -- System card
   lv_obj_t *card_sys = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(card_sys, LV_FLEX_FLOW_COLUMN);
@@ -1061,6 +1147,182 @@ void closeTokenOverlay() {
   if (s_tok_kb) lv_keyboard_set_textarea(s_tok_kb, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// MQTT editor overlay
+// ---------------------------------------------------------------------------
+void buildMqttOverlay() {
+  s_mq_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_mq_overlay);
+  lv_obj_set_size(s_mq_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_mq_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_mq_overlay, LV_OPA_70, 0);
+  lv_obj_add_flag(s_mq_overlay, LV_OBJ_FLAG_CLICKABLE); // swallow clicks behind
+  lv_obj_add_flag(s_mq_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_mq_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *card = makeCard(s_mq_overlay, 720, 416);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 10, 0);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE); // fields scroll above keyboard
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, "MQTT BROKER");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  lv_obj_t *hint = lv_label_create(card);
+  lv_label_set_text(
+      hint, "Publishes feeder state to Home Assistant via MQTT auto-discovery.");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
+
+  // enabled switch row
+  lv_obj_t *en_row = lv_obj_create(card);
+  lv_obj_remove_style_all(en_row);
+  lv_obj_set_width(en_row, lv_pct(100));
+  lv_obj_set_height(en_row, 40);
+  lv_obj_set_flex_flow(en_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(en_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(en_row, 12, 0);
+  lv_obj_clear_flag(en_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *en_lbl = lv_label_create(en_row);
+  lv_label_set_text(en_lbl, "Connect to broker");
+  lv_obj_set_style_text_font(en_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(en_lbl, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(en_lbl, 1);
+  s_mq_sw_en = lv_switch_create(en_row);
+  lv_obj_set_size(s_mq_sw_en, 72, 36);
+
+  // helper lambda-equivalent: one styled one-line textarea
+  auto makeTa = [&](lv_obj_t *parent, const char *placeholder, bool secret,
+                    uint8_t max_len) {
+    lv_obj_t *ta = lv_textarea_create(parent);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_max_length(ta, max_len);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_obj_set_style_bg_color(ta, lv_color_hex(C_BG_DARK), 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(C_CARD_HI), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 8, 0);
+    lv_obj_set_style_pad_all(ta, 8, 0);
+    if (secret) lv_textarea_set_password_mode(ta, true);
+    lv_obj_add_event_cb(ta, mqttTaFocusCb, LV_EVENT_FOCUSED, nullptr);
+    return ta;
+  };
+
+  s_mq_ta_host = makeTa(card, "broker host or IP", false,
+                        CATFISH_MQTT_HOST_LEN - 1);
+
+  // port + prefix row
+  lv_obj_t *pp_row = lv_obj_create(card);
+  lv_obj_remove_style_all(pp_row);
+  lv_obj_set_width(pp_row, lv_pct(100));
+  lv_obj_set_height(pp_row, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(pp_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(pp_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(pp_row, 12, 0);
+  lv_obj_clear_flag(pp_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *port_lbl = lv_label_create(pp_row);
+  lv_label_set_text(port_lbl, "Port");
+  lv_obj_set_style_text_font(port_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(port_lbl, lv_color_hex(C_TEXT), 0);
+  s_mq_sb_port = lv_spinbox_create(pp_row);
+  lv_spinbox_set_range(s_mq_sb_port, 1, 65535);
+  lv_spinbox_set_digit_format(s_mq_sb_port, 5, 0);
+  lv_spinbox_set_value(s_mq_sb_port, CATFISH_MQTT_PORT);
+  lv_obj_set_size(s_mq_sb_port, 110, 44);
+  lv_obj_set_style_bg_color(s_mq_sb_port, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_mq_sb_port, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(s_mq_sb_port, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_font(s_mq_sb_port, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_border_color(s_mq_sb_port, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(s_mq_sb_port, 1, 0);
+  lv_obj_set_style_radius(s_mq_sb_port, 8, 0);
+  lv_obj_t *pre_lbl = lv_label_create(pp_row);
+  lv_label_set_text(pre_lbl, "Prefix");
+  lv_obj_set_style_text_font(pre_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(pre_lbl, lv_color_hex(C_TEXT), 0);
+  s_mq_ta_prefix = lv_textarea_create(pp_row);
+  lv_textarea_set_one_line(s_mq_ta_prefix, true);
+  lv_textarea_set_max_length(s_mq_ta_prefix, CATFISH_MQTT_PREFIX_LEN - 1);
+  lv_textarea_set_placeholder_text(s_mq_ta_prefix, CATFISH_MQTT_PREFIX);
+  lv_obj_set_flex_grow(s_mq_ta_prefix, 1);
+  lv_obj_set_style_bg_color(s_mq_ta_prefix, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_mq_ta_prefix, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(s_mq_ta_prefix, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_font(s_mq_ta_prefix, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_border_color(s_mq_ta_prefix, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(s_mq_ta_prefix, 1, 0);
+  lv_obj_set_style_radius(s_mq_ta_prefix, 8, 0);
+  lv_obj_set_style_pad_all(s_mq_ta_prefix, 8, 0);
+  lv_obj_add_event_cb(s_mq_ta_prefix, mqttTaFocusCb, LV_EVENT_FOCUSED, nullptr);
+
+  s_mq_ta_user = makeTa(card, "username (optional)", false,
+                        CATFISH_MQTT_USER_LEN - 1);
+  s_mq_ta_pass = makeTa(card, "password (optional)", true,
+                        CATFISH_MQTT_PASS_LEN - 1);
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *save = makeBtn(btns, LV_SYMBOL_OK "  Save", C_AMBER, C_INK,
+                           C_AMBER_HI, 100, 64);
+  lv_obj_set_flex_grow(save, 1);
+  lv_obj_add_event_cb(save, mqttSaveCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *cancel = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                             C_CARD_HI, 100, 64);
+  lv_obj_set_flex_grow(cancel, 1);
+  lv_obj_add_event_cb(cancel, mqttCancelCb, LV_EVENT_CLICKED, nullptr);
+
+  s_mq_kb = lv_keyboard_create(s_mq_overlay);
+  lv_obj_set_size(s_mq_kb, lv_pct(100), 180);
+  lv_obj_align(s_mq_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_keyboard_set_textarea(s_mq_kb, nullptr);
+  lv_obj_add_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN); // appears on first field focus
+  lv_obj_set_style_bg_color(s_mq_kb, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_mq_kb, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(s_mq_kb, lv_color_hex(C_CARD), LV_PART_ITEMS);
+  lv_obj_set_style_text_color(s_mq_kb, lv_color_hex(C_TEXT), LV_PART_ITEMS);
+}
+
+void openMqttOverlay() {
+  if (!s_mq_overlay) return;
+  lv_textarea_set_text(s_mq_ta_host, prefs::getMqttHost().c_str());
+  lv_spinbox_set_value(s_mq_sb_port, prefs::getMqttPort());
+  lv_textarea_set_text(s_mq_ta_prefix, prefs::getMqttPrefix().c_str());
+  lv_textarea_set_text(s_mq_ta_user, prefs::getMqttUser().c_str());
+  lv_textarea_set_text(s_mq_ta_pass, prefs::getMqttPass().c_str());
+  if (prefs::getMqttEnabled())
+    lv_obj_add_state(s_mq_sw_en, LV_STATE_CHECKED);
+  else
+    lv_obj_clear_state(s_mq_sw_en, LV_STATE_CHECKED);
+  lv_obj_add_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_mq_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_mq_overlay);
+}
+
+void closeMqttOverlay() {
+  if (s_mq_overlay) lv_obj_add_flag(s_mq_overlay, LV_OBJ_FLAG_HIDDEN);
+  if (s_mq_kb) {
+    lv_keyboard_set_textarea(s_mq_kb, nullptr);
+    lv_obj_add_flag(s_mq_kb, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1336,7 @@ void ui_init() {
   buildSettings();
   toastTimerInit();
   buildTokenOverlay();
+  buildMqttOverlay();
 
   showScreen(0);
   ui_set_next_feed("Waiting for time sync...");
@@ -1085,6 +1348,8 @@ bool ui_event_receive(UiEvent &out) {
   if (!s_evt_queue) return false;
   return xQueueReceive(s_evt_queue, &out, 0) == pdTRUE;
 }
+
+bool ui_event_send(const UiEvent &ev) { return uiEventSend(ev); }
 
 void ui_tick() {
   // backlight idle auto-dim (M6)
@@ -1269,5 +1534,23 @@ void ui_set_probe_busy(bool busy) {
 void ui_schedule_refresh() { rebuildScheduleList(); }
 
 void ui_editor_close() { closeEditor(); }
+
+void ui_set_mqtt_status(const String &text, uint8_t state) {
+  if (!s_mq_status) return;
+  lv_label_set_text_fmt(s_mq_status, "MQTT: %s", text.c_str());
+  uint32_t color = C_MUTED;
+  if (state == 1) color = C_AMBER;    // connecting / retrying
+  if (state == 2) color = C_GREEN;    // connected
+  if (state == 3) color = C_RED;      // error
+  lv_obj_set_style_text_color(s_mq_status, lv_color_hex(color), 0);
+}
+
+void ui_set_mqtt_broker(const String &text) {
+  if (s_mq_broker) lv_label_set_text(s_mq_broker, text.c_str());
+}
+
+void ui_set_pulse(uint8_t seconds) {
+  if (s_sb_pulse) lv_spinbox_set_value(s_sb_pulse, seconds);
+}
 
 } // namespace ui

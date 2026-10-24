@@ -47,6 +47,25 @@ void setRelayIp(const String &ip);
 uint8_t getDefaultPulse();
 void setDefaultPulse(uint8_t seconds);
 
+// ---- MQTT / Home Assistant (display unit is the hub) ----
+// All MQTT getters/setters are called ONLY from loop() (single-writer,
+// same discipline as every other prefs section): applyConfig() runs in loop
+// and hands copies to the MQTT client's internal task.
+bool getMqttEnabled();
+void setMqttEnabled(bool on);
+/** Broker host or IP ("" = not configured). */
+String getMqttHost();
+void setMqttHost(const String &host);
+uint16_t getMqttPort();
+void setMqttPort(uint16_t port);
+String getMqttUser();
+void setMqttUser(const String &user);
+String getMqttPass();
+void setMqttPass(const String &pass);
+/** State/command topic root (default "catfish"). */
+String getMqttPrefix();
+void setMqttPrefix(const String &prefix);
+
 // ---- Display ----
 /** User's backlight preference (idle dimming is transient, not persisted). */
 bool getBacklightOn();

@@ -18,6 +18,7 @@ Catfish Feeder is a two-board, self-hosted fish feeder. The **Display Unit** (Wa
 - ArduinoOTA updates on both units (relay: `catfish-relay.local`, display: `catfishfeeder.local`)
 - Relay discovery via mDNS (`catfish-relay.local`) and UDP broadcast on port 5050
 - Token-protected feed API (`POST /feed`, default token `catfish` — change it)
+- MQTT hub on the display unit with **Home Assistant auto-discovery**: HA button/sensors drive real feeds, feeder state (last/next feed, relay online) streams back — see [docs/mqtt.md](docs/mqtt.md)
 - Fully documented: wiring, build, API, UI design pipeline, AI tooling
 
 ## Architecture
@@ -89,6 +90,7 @@ Details, offsets, and troubleshooting: [docs/firmware.md](docs/firmware.md).
 | [Hardware & wiring](docs/hardware.md) | BOM, wiring tables, power sizing, mounting, safety, feeding mechanisms |
 | [Firmware guide](docs/firmware.md) | Prerequisites, build, flash (web/esptool/PIO), provisioning, config, OTA, troubleshooting |
 | [HTTP & UDP API](docs/api.md) | `/feed`, `/status`, `/health`, `/config`, UDP discovery, mDNS, security notes |
+| [MQTT & Home Assistant](docs/mqtt.md) | Topic map, HA discovery entities, commands, reconnection behaviour |
 | [Figma to LVGL](docs/figma-lvgl.md) | 800x480 UI design pipeline: Figma plugin, LVGL AI, design tokens |
 | [AI tooling](docs/tooling.md) | Claude Code MCP servers, Figma Dev Mode MCP, Codespaces, CI, secrets hygiene |
 | [Verified hardware notes](docs/notes/hardware-4.3b.md) | Pin-level source of truth for the 4.3B (verified against Waveshare demo) |
@@ -119,7 +121,7 @@ CI builds both firmwares on every push (ESP32-S3 factory image pre-merged at boo
 
 ## Roadmap
 
-- MQTT client with Home Assistant auto-discovery
+- ~~MQTT client with Home Assistant auto-discovery~~ — shipped in v1.2.0 (hub on the display unit: feed button, pulse number, state sensors, LWT availability)
 - Web dashboard (beyond the relay unit's built-in page)
 - Servo / stepper-based feeding mechanism option
 - Camera snapshot on each feed event

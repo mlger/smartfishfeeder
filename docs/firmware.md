@@ -148,6 +148,7 @@ If the saved WiFi is unavailable, the units fall back to their setup APs automat
 | Timezone | Display Unit | Asia/Manila | POSIX TZ string `PHT-8` (UTC+8, no DST); schedule times are local |
 | NTP | Display Unit | pool servers | Synced periodically; UI shows synced time |
 | Backlight | Display Unit | on | Settings → Display → Backlight switch (persisted across reboots); screen auto-dims after 10 min idle and wakes on touch |
+| MQTT / Home Assistant | Display Unit | disabled | Settings → HOME ASSISTANT (MQTT) → *Configure*: broker, port, credentials, topic prefix — topic map and behaviour in [mqtt.md](mqtt.md) |
 | Factory reset | Relay Unit | — | Hold the **FLASH** button ~5 s while running: EEPROM config (token, pulse caps) is wiped to defaults and the unit reboots. Refused while a pulse is running |
 
 **Timezone note:** the firmware uses the POSIX form `PHT-8` — a positive UTC offset is written with a minus sign in POSIX. Schedule entries entered on the Schedule screen are interpreted in this timezone.

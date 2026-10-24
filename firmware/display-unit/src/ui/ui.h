@@ -16,6 +16,10 @@
 #include <Arduino.h>
 #include <stdint.h>
 
+// Shared protocol constants: CATFISH_APP_VERSION below and the MQTT field
+// caps used by UiEvent come from here (dependency-free header).
+#include <catfish_protocol.h>
+
 // Single source of truth is firmware/common/catfish_protocol.h
 // (CATFISH_APP_VERSION, shared with the relay unit); this fallback keeps IDE
 // tooling happy and avoids macro redefinition.
@@ -24,6 +28,8 @@
 #endif
 
 // ---- Events: LVGL callbacks -> loop() (payload-bearing, race-free) ----
+// The queue is also written from the MQTT manager's async task (incoming
+// Home Assistant commands), which is why ui_event_send() is public.
 enum UiEventType : uint8_t {
   UI_EVT_FEED = 0,      // FEED NOW pressed      (a=seconds, flag=manual)
   UI_EVT_RELAY_TEST,    // "Test connection" pressed
@@ -34,6 +40,7 @@ enum UiEventType : uint8_t {
   UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s)
   UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
   UI_EVT_SCHED_PERSIST, // enable switch flipped (a=index, flag=enabled — loop applies + flushes)
+  UI_EVT_MQTT_CFG,      // MQTT settings saved   (mqtt* fields valid — loop persists + applies)
 };
 
 struct UiEvent {
@@ -43,6 +50,13 @@ struct UiEvent {
   uint8_t c = 0;
   bool flag = false;
   char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
+  // MQTT settings (UI_EVT_MQTT_CFG); sizes == prefs/catfish_protocol caps
+  bool mqttEnable = false;
+  uint16_t mqttPort = 0;
+  char mqttHost[CATFISH_MQTT_HOST_LEN] = {0};
+  char mqttUser[CATFISH_MQTT_USER_LEN] = {0};
+  char mqttPass[CATFISH_MQTT_PASS_LEN] = {0};
+  char mqttPrefix[CATFISH_MQTT_PREFIX_LEN] = {0};
 };
 
 namespace ui {
@@ -55,6 +69,21 @@ void ui_tick();
 
 /** Non-blocking event drain for loop(). @return false when the queue is empty. */
 bool ui_event_receive(UiEvent &out);
+
+/**
+ * Enqueue an event from OUTSIDE the LVGL task (e.g. mqtt_mgr's AsyncTCP
+ * callback thread). Same queue the LVGL callbacks use; never blocks.
+ */
+bool ui_event_send(const UiEvent &ev);
+
+/** Settings > MQTT card status line. state: 0 muted, 1 busy, 2 good, 3 bad. */
+void ui_set_mqtt_status(const String &text, uint8_t state);
+
+/** Settings > MQTT card broker summary, e.g. "Broker: 192.168.1.10:1883". */
+void ui_set_mqtt_broker(const String &text);
+
+/** Reflect externally changed default pulse (Home Assistant) in the spinbox. */
+void ui_set_pulse(uint8_t seconds);
 
 /** WiFi state for the status-bar symbol and Settings > Network card. */
 void ui_set_wifi(bool connected, const String &ssid, const String &ip, int rssi);
