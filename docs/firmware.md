@@ -166,6 +166,8 @@ pio run -d firmware/display-unit -t upload --upload-port catfishfeeder.local   #
 
 The display unit begins its OTA service lazily once WiFi/mDNS is up and advertises the standard `_arduino._tcp` service as `catfishfeeder` — it shows up in IDE/PlatformIO device lists like the relay does. While an update is in flight the screen shows a *Receiving update...* toast; the unit reboots itself when the transfer completes.
 
+Prefer a browser? The **web dashboard** (http://catfishfeeder.local/) can also flash `firmware.bin` from any phone — *System → Update firmware*. Both paths write to the same OTA slot; don't run them simultaneously. Details in [dashboard.md](dashboard.md).
+
 Requirements: PC and unit on the same LAN, mDNS resolution working (`.local`), and the relay unit idle (the display unit can stay in normal operation).
 
 OTA is **open (no password) by default** — a documented decision for this LAN-only appliance. To require a password, add the credential at build time (per unit):

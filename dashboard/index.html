@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Catfish Feeder</title>
+<style>
+:root{--bg:#10201F;--bar:#0B1615;--card:#1A2E2C;--hi:#243F3B;--amber:#F2A33C;--amber-p:#D98F2B;--txt:#F2F7F6;--mut:#8FA9A4;--grn:#46D07E;--red:#D96459}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:16px/1.45 -apple-system,'Segoe UI',Roboto,sans-serif;padding-bottom:32px}
+.wrap{max-width:520px;margin:0 auto;padding:16px}
+header{display:flex;justify-content:space-between;align-items:center;padding:10px 2px 18px}
+h1{font-size:18px;letter-spacing:3px;color:var(--txt)}
+.dots{display:flex;gap:10px}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--mut);opacity:.3}
+.dot.on{background:var(--grn);opacity:1}
+.card{background:var(--card);border-radius:12px;padding:16px;margin-bottom:12px}
+.card h2{font-size:11px;letter-spacing:2px;color:var(--mut);margin-bottom:10px}
+.big{font-size:34px;font-weight:700}
+.sub{color:var(--mut);font-size:13px;margin-top:4px}
+.row{display:flex;align-items:center;gap:12px}
+.row .grow{flex:1}
+button{border:0;border-radius:12px;font:inherit;font-weight:600;cursor:pointer;color:var(--txt);background:var(--hi);padding:12px 16px}
+button:active{filter:brightness(1.2)}
+button:disabled{opacity:.4;cursor:default}
+.primary{background:var(--amber);color:#121E1C;width:100%;font-size:18px;padding:16px}
+.primary:disabled{background:var(--hi);color:var(--mut)}
+.ghost{background:none;border:2px solid var(--amber);color:var(--amber)}
+.mini{padding:8px 10px;font-size:14px}
+.spin{display:flex;align-items:center;gap:8px}
+.spin button{width:44px;height:44px;padding:0;font-size:20px}
+.spin span{min-width:70px;text-align:center;font-size:20px;font-weight:700}
+ul{list-style:none}
+li{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+li:last-child{border:0}
+.time{font-size:20px;font-weight:700;min-width:70px}
+.sec{color:var(--mut);font-size:13px;flex:1}
+input[type=time],input[type=text],input[type=password],input[type=file],select{background:var(--bar);border:1px solid var(--hi);color:var(--txt);border-radius:8px;padding:10px;font:inherit}
+input[type=checkbox]{width:20px;height:20px;accent-color:var(--amber)}
+.addrow{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.addrow input[type=time]{width:112px}
+.addrow input[type=number]{width:70px;background:var(--bar);border:1px solid var(--hi);color:var(--txt);border-radius:8px;padding:10px;font:inherit}
+.switch{position:relative;width:44px;height:24px;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--bar);border:1px solid var(--hi);border-radius:24px;transition:.2s}
+.slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;border-radius:50%;background:var(--mut);transition:.2s}
+.switch input:checked+.slider{background:var(--amber);border-color:var(--amber)}
+.switch input:checked+.slider:before{transform:translateX(19px);background:#121E1C}
+.toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:var(--hi);border:2px solid var(--amber);border-radius:12px;padding:12px 20px;font-size:14px;opacity:0;transition:.25s;pointer-events:none;max-width:90vw;z-index:9}
+.toast.show{opacity:1}
+dialog{background:var(--card);color:var(--txt);border:2px solid var(--amber);border-radius:12px;padding:20px;max-width:360px;width:90vw}
+dialog::backdrop{background:rgba(0,0,0,.7)}
+dialog h3{margin-bottom:12px;font-size:16px}
+dialog input{width:100%;margin:8px 0 14px}
+.prog{height:8px;background:var(--bar);border-radius:8px;overflow:hidden;margin-top:10px;display:none}
+.prog>i{display:block;height:100%;background:var(--amber);width:0}
+.mut{color:var(--mut);font-size:12px}
+footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>CATFISH FEEDER</h1>
+  <div class="dots">
+    <div class="dot" id="dotWifi" title="WiFi"></div>
+    <div class="dot" id="dotRelay" title="Relay"></div>
+    <div class="dot" id="dotMqtt" title="MQTT"></div>
+  </div>
+</header>
+
+<div class="card">
+  <h2>NEXT FEEDING</h2>
+  <div class="big" id="nextTime">--:--</div>
+  <div class="sub" id="lastTime">Last fed: never</div>
+  <div class="sub" id="feeding" style="color:var(--amber);display:none">Feeding now...</div>
+</div>
+
+<div class="card">
+  <h2>FEED NOW</h2>
+  <div class="row" style="margin-bottom:12px">
+    <div class="grow mut">Pulse duration</div>
+    <div class="spin">
+      <button id="pMinus">&minus;</button><span id="pVal">3 s</span><button id="pPlus">+</button>
+    </div>
+  </div>
+  <button class="primary" id="feedBtn">FEED NOW</button>
+</div>
+
+<div class="card">
+  <h2>SCHEDULE</h2>
+  <ul id="schedList"></ul>
+  <div class="addrow">
+    <input type="time" id="addTime">
+    <input type="number" id="addSec" min="1" max="30" value="3" title="seconds">
+    <button class="mini ghost" id="addBtn">Add</button>
+    <button class="mini" id="saveBtn" disabled>Save</button>
+  </div>
+  <div class="mut" style="margin-top:8px">Toggle to pause an entry &middot; Save sends the whole schedule</div>
+</div>
+
+<div class="card">
+  <h2>SYSTEM</h2>
+  <div class="row" style="margin-bottom:10px">
+    <div class="grow mut" id="fwLine">Firmware</div>
+    <button class="mini ghost" id="updBtn">Update firmware</button>
+  </div>
+  <input type="file" id="updFile" accept=".bin" style="display:none">
+  <div class="prog" id="prog"><i></i></div>
+  <div class="mut" id="wifiLine" style="margin-top:8px"></div>
+  <div class="mut" id="relayLine"></div>
+  <div class="mut" id="mqttLine"></div>
+</div>
+
+<footer>L LAN only &middot; commands need the pairing token</footer>
+</div>
+
+<dialog id="tokDlg">
+  <h3>Pairing token</h3>
+  <div class="mut" style="margin-bottom:8px">Same token as Settings &rarr; Relay Unit on the device (default <b>catfish</b>).</div>
+  <input type="password" id="tokInput" placeholder="pairing token">
+  <button class="primary" id="tokSave">Save</button>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+let token=localStorage.catfishToken||"";
+let pulse=3, schedule=[], dirty=false, feedBusy=false;
+
+function toast(m,ms=2200){const t=$("toast");t.textContent=m;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms)}
+function iso(s){if(!s)return"never";const d=new Date(s*1000);const p=n=>String(n).padStart(2,"0");const now=new Date();
+  const sameDay=d.toDateString()===now.toDateString();
+  return(sameDay?"Today ":"")+p(d.getHours())+":"+p(d.getMinutes())}
+
+async function api(path,opt={}){
+  const r=await fetch(path,{...opt,headers:{...(opt.headers||{}),"X-Catfish-Token":token}});
+  if(r.status===403){$("tokDlg").showModal();throw new Error("bad token")}
+  const txt=await r.text();try{return JSON.parse(txt)}catch(e){return{raw:txt}}
+}
+function mut(path,method,body){
+  return api(path,{method,body:body?JSON.stringify(body):undefined,
+    headers:body?{"Content-Type":"application/json"}:{}})
+}
+
+/* ---------- status ---------- */
+async function refresh(){
+  if(document.hidden)return;
+  try{
+    const s=await api("/api/status");
+    $("nextTime").textContent=s.nextFeed==="none"?"none scheduled":(s.nextFeed||"waiting for time sync");
+    $("lastTime").textContent="Last fed: "+(s.lastFeedIso&&s.lastFeedIso!=="unknown"?iso(s.lastFedEpoch):"never");
+    $("feeding").style.display=s.feeding?"block":"none";
+    $("feedBtn").disabled=feedBusy||s.feeding;
+    $("feedBtn").textContent=s.feeding?"FEEDING...":"FEED NOW";
+    $("dotWifi").classList.toggle("on",!!s.wifiUp);
+    $("dotRelay").classList.toggle("on",!!s.relayOnline);
+    $("dotMqtt").classList.toggle("on",s.mqttState===2);
+    $("fwLine").textContent="Firmware v"+(s.version||"?")+"  \u00B7  "+(s.schedCount||0)+" scheduled feedings";
+    $("wifiLine").textContent="WiFi: "+(s.wifiUp?s.wifiSsid+" ("+s.wifiIp+", "+s.rssi+" dBm)":"offline");
+    $("relayLine").textContent="Relay: "+(s.relayOnline?"online at "+s.relayIp:"offline");
+    $("mqttLine").textContent="MQTT: "+(s.mqtt||"n/a");
+    if(!dirty){pulse=s.pulse||3;renderPulse()}
+  }catch(e){}
+}
+setInterval(refresh,3000);
+
+/* ---------- feed ---------- */
+function renderPulse(){$("pVal").textContent=pulse+" s"}
+$("pMinus").onclick=()=>{if(pulse>1){pulse--;renderPulse()}};
+$("pPlus").onclick=()=>{if(pulse<30){pulse++;renderPulse()}};
+$("feedBtn").onclick=async()=>{
+  feedBusy=true;$("feedBtn").disabled=true;$("feedBtn").textContent="FEEDING...";
+  try{const r=await mut("/api/feed","POST",{seconds:pulse});
+    if(r.ok)toast("Feeding fish...");else toast(r.error||"Failed",3000)}
+  catch(e){toast(e.message,3000)}
+  feedBusy=false;setTimeout(refresh,800);
+};
+
+/* ---------- schedule ---------- */
+function renderSched(){
+  const ul=$("schedList");ul.innerHTML="";
+  schedule.forEach((e,i)=>{
+    const li=document.createElement("li");
+    const sw=document.createElement("label");sw.className="switch";
+    const cb=document.createElement("input");cb.type="checkbox";cb.checked=e.e;
+    cb.onchange=()=>{schedule[i].e=cb.checked;dirty=true;$("saveBtn").disabled=false};
+    const sl=document.createElement("span");sl.className="slider";
+    sw.append(cb,sl);
+    const t=document.createElement("span");t.className="time";
+    t.textContent=String(e.h).padStart(2,"0")+":"+String(e.m).padStart(2,"0");
+    const s=document.createElement("span");s.className="sec";s.textContent=e.s+" s";
+    const del=document.createElement("button");del.className="mini";del.textContent="\u2715";
+    del.onclick=()=>{schedule.splice(i,1);dirty=true;$("saveBtn").disabled=false;renderSched()};
+    li.append(sw,t,s,del);ul.appendChild(li);
+  });
+  if(!schedule.length)ul.innerHTML='<li class="mut">No feedings scheduled</li>';
+}
+async function loadSched(){
+  try{const j=await api("/api/schedule");
+    schedule=Array.isArray(j)?j:(j.entries||[]);dirty=false;$("saveBtn").disabled=true;renderSched()}
+  catch(e){}
+}
+$("addBtn").onclick=()=>{
+  const v=$("addTime").value;if(!v)return toast("Pick a time first");
+  const[h,m]=v.split(":").map(Number);
+  const s=Math.max(1,Math.min(30,parseInt($("addSec").value)||3));
+  if(schedule.some(e=>e.h===h&&e.m===m))return toast("Time already scheduled");
+  if(schedule.length>=8)return toast("Schedule full (max 8)");
+  schedule.push({h,m,e:true,s});dirty=true;$("saveBtn").disabled=false;renderSched();
+};
+$("saveBtn").onclick=async()=>{
+  try{const r=await mut("/api/schedule","PUT",schedule);
+    if(r.ok){toast("Schedule saved");dirty=false;$("saveBtn").disabled=true;loadSched()}
+    else toast(r.error||"Rejected",3000)}
+  catch(e){toast(e.message,3000)}
+};
+
+/* ---------- firmware ---------- */
+$("updBtn").onclick=()=>$("updFile").click();
+$("updFile").onchange=async()=>{
+  const f=$("updFile").files[0];if(!f)return;
+  if(!confirm("Install "+f.name+" ("+(f.size/1024).toFixed(0)+" KB)? The device reboots afterwards."))return;
+  const fd=new FormData();fd.append("file",f,f.name);
+  $("prog").style.display="block";
+  try{
+    const r=await fetch("/api/update",{method:"POST",body:fd,headers:{"X-Catfish-Token":token}});
+    const p=r.ok?100:0;$("prog").firstElementChild.style.width=p+"%";
+    if(r.ok){toast("Update OK - device reboots");setTimeout(()=>location.reload(),8000)}
+    else if(r.status===403){$("tokDlg").showModal()}else toast("Update failed",3000);
+  }catch(e){toast("Upload aborted: "+e.message,3000)}
+  $("prog").style.display="none";$("updFile").value="";
+};
+
+/* ---------- token ---------- */
+$("tokSave").onclick=()=>{token=$("tokInput").value.trim();localStorage.catfishToken=token;
+  $("tokDlg").close();refresh();loadSched()};
+if(!token){$("tokInput").value="catfish"}
+
+refresh();loadSched();
+</script>
+</body>
+</html>

@@ -159,6 +159,39 @@ bool toggle(int index) {
   return true;
 }
 
+bool replaceAll(const String &json) {
+  JsonDocument doc;
+  if (deserializeJson(doc, json) != DeserializationError::Ok) return false;
+  if (!doc.is<JsonArray>()) return false;
+
+  // Validate the whole payload into a scratch buffer first: the live schedule
+  // is only swapped when everything checks out (atomic replace).
+  FeedTime tmp[MAX_FEED_TIMES];
+  int n = 0;
+  for (JsonVariant v : doc.as<JsonArray>()) {
+    if (n >= MAX_FEED_TIMES) return false; // oversize payload rejected whole
+    FeedTime t;
+    t.hour = (uint8_t)(v["h"] | 0);
+    t.minute = (uint8_t)(v["m"] | 0);
+    t.enabled = (bool)(v["e"] | true);
+    t.seconds = (uint8_t)(v["s"] | 3);
+    clampEntry(t);
+    for (int i = 0; i < n; i++) {
+      if (tmp[i].hour == t.hour && tmp[i].minute == t.minute) return false;
+    }
+    tmp[n++] = t;
+  }
+
+  for (int i = 0; i < n; i++) {
+    s_entries[i] = tmp[i];
+    s_last_fired[i] = 0xFFFF;
+  }
+  s_count = n;
+  s_dirty = true;
+  Serial.printf("[FEED] schedule replaced (%d entries)\n", n);
+  return true;
+}
+
 bool timeValid() {
   time_t now = nowTime();
   struct tm lt;

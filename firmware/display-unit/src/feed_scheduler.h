@@ -63,6 +63,16 @@ bool setEnabled(int index, bool enabled);
 /** Flip an entry's enabled flag. Marks persistence dirty. */
 bool toggle(int index);
 
+/**
+ * Atomically replace the WHOLE schedule from a JSON array (web dashboard
+ * PUT /api/schedule). All-or-nothing: on any validation failure (bad JSON,
+ * more than MAX_FEED_TIMES entries, duplicate HH:MM inside the payload) the
+ * current schedule is left untouched and false is returned. Entries are
+ * clamped like add(). Marks persistence dirty.
+ * Called from loop() only (single writer).
+ */
+bool replaceAll(const String &json);
+
 /** true when local time looks NTP-synced (struct tm year >= 2025). */
 bool timeValid();
 
