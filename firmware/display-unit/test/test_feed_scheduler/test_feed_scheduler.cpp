@@ -226,6 +226,69 @@ void test_toggle_marks_dirty_and_stops_firing(void) {
   TEST_ASSERT_TRUE(feed_scheduler::flushIfDirty()); // mutation was persisted
 }
 
+// ---------------------------------------------------------------------------
+// replaceAll(): atomic whole-schedule replace (web dashboard PUT)
+// ---------------------------------------------------------------------------
+void test_replace_all_swaps_everything(void) {
+  TEST_ASSERT_TRUE(feed_scheduler::replaceAll(
+      R"([{"h":6,"m":15,"e":true,"s":5},{"h":18,"m":45,"e":false,"s":10}])"));
+  TEST_ASSERT_EQUAL_INT(2, feed_scheduler::getCount());
+  FeedTime e0{}, e1{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, e0));
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(1, e1));
+  TEST_ASSERT_EQUAL_UINT8(6, e0.hour);
+  TEST_ASSERT_EQUAL_UINT8(5, e0.seconds);
+  TEST_ASSERT_EQUAL_UINT8(18, e1.hour);
+  TEST_ASSERT_FALSE(e1.enabled);
+  TEST_ASSERT_TRUE(feed_scheduler::flushIfDirty()); // replacement persisted
+}
+
+void test_replace_all_rejects_bad_json_and_keeps_state(void) {
+  TEST_ASSERT_FALSE(feed_scheduler::replaceAll("not json"));
+  TEST_ASSERT_FALSE(feed_scheduler::replaceAll("{\"h\":1}")); // not an array
+  TEST_ASSERT_EQUAL_INT(2, feed_scheduler::getCount()); // setUp defaults intact
+}
+
+void test_replace_all_rejects_duplicates_and_keeps_state(void) {
+  TEST_ASSERT_FALSE(feed_scheduler::replaceAll(
+      R"([{"h":7,"m":30,"s":3},{"h":7,"m":30,"s":9}])"));
+  TEST_ASSERT_EQUAL_INT(2, feed_scheduler::getCount());
+  FeedTime e0{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, e0));
+  TEST_ASSERT_EQUAL_UINT8(7, e0.hour); // untouched
+}
+
+void test_replace_all_rejects_oversize_and_keeps_state(void) {
+  String big = "[";
+  for (int i = 0; i < feed_scheduler::MAX_FEED_TIMES + 1; i++) {
+    big += "{\"h\":23,\"m\":59,\"s\":1}";
+    if (i < feed_scheduler::MAX_FEED_TIMES) big += ",";
+  }
+  big += "]";
+  // same HH:MM duplicates would also trip; use distinct minutes
+  String ok = "[";
+  for (int i = 0; i <= feed_scheduler::MAX_FEED_TIMES; i++) {
+    ok += "{\"h\":23,\"m\":" + std::to_string(i) + ",\"s\":1}";
+    if (i < feed_scheduler::MAX_FEED_TIMES) ok += ",";
+  }
+  ok += "]";
+  TEST_ASSERT_FALSE(feed_scheduler::replaceAll(ok));
+  TEST_ASSERT_EQUAL_INT(2, feed_scheduler::getCount());
+}
+
+void test_replace_all_accepts_empty_array_and_clamps(void) {
+  TEST_ASSERT_TRUE(feed_scheduler::replaceAll("[]"));
+  TEST_ASSERT_EQUAL_INT(0, feed_scheduler::getCount());
+
+  TEST_ASSERT_TRUE(feed_scheduler::replaceAll(
+      R"([{"h":25,"m":70,"s":99}])"));
+  FeedTime e0{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, e0));
+  TEST_ASSERT_EQUAL_UINT8(23, e0.hour); // clamped like add()
+  TEST_ASSERT_EQUAL_UINT8(59, e0.minute);
+  TEST_ASSERT_EQUAL_UINT8(30, e0.seconds);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_add_clamps_out_of_range_entry);
@@ -241,5 +304,10 @@ int main(void) {
   RUN_TEST(test_remove_by_identity);
   RUN_TEST(test_persistence_flush_and_roundtrip);
   RUN_TEST(test_toggle_marks_dirty_and_stops_firing);
+  RUN_TEST(test_replace_all_swaps_everything);
+  RUN_TEST(test_replace_all_rejects_bad_json_and_keeps_state);
+  RUN_TEST(test_replace_all_rejects_duplicates_and_keeps_state);
+  RUN_TEST(test_replace_all_rejects_oversize_and_keeps_state);
+  RUN_TEST(test_replace_all_accepts_empty_array_and_clamps);
   return UNITY_END();
 }

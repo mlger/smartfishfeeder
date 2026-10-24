@@ -30,6 +30,7 @@
 #include "mqtt_mgr.h"
 #include "prefs.h"
 #include "relay_client.h"
+#include "web_server.h"
 #include "ui/ui.h"
 #include <catfish_protocol.h>
 
@@ -193,18 +194,50 @@ static void mqttSyncUi() {
   lvgl_port_unlock();
 }
 
+/** "HH:MM" of the next enabled feeding ("none"/"" per scheduler state). */
+static String nextFeedHhmm() {
+  if (!feed_scheduler::timeValid()) return String("");
+  const feed_scheduler::NextFeed n = feed_scheduler::nextOccurrence();
+  return n.valid ? fmtHhmm(n.hour, n.minute) : String("none");
+}
+
 /** Full retained state snapshot (called after every (re)connect). */
 static void mqttPublishAllState() {
   mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
-  String nf = "none";
-  if (feed_scheduler::timeValid()) {
-    const feed_scheduler::NextFeed n = feed_scheduler::nextOccurrence();
-    if (n.valid) nf = fmtHhmm(n.hour, n.minute);
-  }
-  mqtt_mgr::publishNextFeed(nf);
+  mqtt_mgr::publishNextFeed(nextFeedHhmm());
   mqtt_mgr::publishRelayOnline(s_relay_online_cached);
   mqtt_mgr::publishFeeding(s_feeding_cached);
   mqtt_mgr::publishPulse(prefs::getDefaultPulse());
+}
+
+/** Refresh the plain-field cache the web-task serves /api/status from. */
+static void webPublishSnapshot() {
+  web_server::Snapshot s;
+  s.wifiUp = net_wifi::wifi_is_connected();
+  strlcpy(s.wifiSsid, net_wifi::wifi_ssid().c_str(), sizeof(s.wifiSsid));
+  strlcpy(s.wifiIp, net_wifi::wifi_ip().c_str(), sizeof(s.wifiIp));
+  s.rssi = (int16_t)net_wifi::wifi_rssi();
+  s.relayOnline = s_relay_online_cached;
+  s.feeding = s_feeding_cached;
+  strlcpy(s.relayIp, relay_client::ip().c_str(), sizeof(s.relayIp));
+  const String nf = nextFeedHhmm();
+  strlcpy(s.nextFeed, nf.c_str(), sizeof(s.nextFeed));
+  s.lastFedEpoch = prefs::getLastFedEpoch();
+  s.pulse = prefs::getDefaultPulse();
+  s.schedCount = (uint16_t)feed_scheduler::getCount();
+  s.clockValid = feed_scheduler::timeValid();
+  strlcpy(s.version, CATFISH_APP_VERSION, sizeof(s.version));
+  const mqtt_mgr::Status st = mqtt_mgr::status();
+  const char *mtxt = "disabled";
+  s.mqttState = 0;
+  switch (st) {
+    case mqtt_mgr::Status::Offline:    mtxt = "offline";    s.mqttState = 1; break;
+    case mqtt_mgr::Status::Connecting: mtxt = "connecting"; s.mqttState = 1; break;
+    case mqtt_mgr::Status::Connected:  mtxt = "connected";  s.mqttState = 2; break;
+    case mqtt_mgr::Status::Disabled:   break;
+  }
+  strlcpy(s.mqtt, mtxt, sizeof(s.mqtt));
+  web_server::publishSnapshot(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +550,9 @@ void setup() {
   if (!mqtt_mgr::begin()) {
     Serial.println("[SYS] WARN: MQTT manager unavailable (continuing without)");
   }
+  if (!web_server::begin()) {
+    Serial.println("[SYS] WARN: web dashboard unavailable (continuing without)");
+  }
 
   // --- board + LVGL ---
   s_board = new Board();
@@ -572,6 +608,23 @@ void loop() {
   net_worker::Result res;
   while (net_worker::receive(res)) handleWorkerResult(res);
 
+  // ---- web dashboard: apply schedule replacements (authoritative path) ----
+  char *json = nullptr;
+  while (web_server::takeScheduleReplace(&json)) {
+    if (feed_scheduler::replaceAll(String(json))) {
+      feed_scheduler::flushIfDirty();
+      lvgl_port_lock(-1);
+      ui_schedule_refresh();
+      lvgl_port_unlock();
+      uiToast("Schedule updated from dashboard");
+      refreshNextFeedUi();
+    } else {
+      Serial.println("[WEB] schedule replace rejected by scheduler");
+      uiToast("Dashboard schedule rejected");
+    }
+    free(json);
+  }
+
   // ---- drain MQTT connection events (connected -> dump discovery+state) ----
   bool mqConn = false;
   while (mqtt_mgr::receive(mqConn)) {
@@ -624,6 +677,9 @@ void loop() {
     // MQTT reconnect pump + Settings-card status sync
     mqtt_mgr::retryIfDue(now);
     mqttSyncUi();
+
+    // web dashboard state cache (~1 Hz; plain-field reads for the web task)
+    webPublishSnapshot();
 
     // UI housekeeping (clock, countdown, relay dot, idle dim)
     lvgl_port_lock(-1);
