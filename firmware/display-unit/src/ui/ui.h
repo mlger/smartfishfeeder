@@ -95,6 +95,16 @@ struct UiEvent {
 
 namespace ui {
 
+/** v1.10.1 boot splash: themed "CATFISH FEEDER v<ver>" screen, loaded and
+ *  force-flushed immediately (RGB panels read WHITE until the LCD peripheral
+ *  starts scanning and the backlight is already on). Caller holds
+ *  lvgl_port_lock(). */
+void ui_boot_splash(const char *version);
+
+/** Delete the boot splash once ui_init() has loaded the real screens.
+ *  Caller holds lvgl_port_lock(). Safe no-op when there is no splash. */
+void ui_boot_splash_done();
+
 /** Build all three screens + overlays. Caller must hold lvgl_port_lock(). */
 void ui_init();
 

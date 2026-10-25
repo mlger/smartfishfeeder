@@ -1475,11 +1475,32 @@ void setup() {
   if (s_board->getBacklight()) {
     s_board->getBacklight()->setBrightness(1); // switch type: on (no PWM)
   }
+#endif
 
+  // --- LVGL + boot splash (v1.10.1) ---
+  // The 4.3B's RGB panel reads WHITE from power-up until the LCD peripheral
+  // starts scanning, and the backlight switches on right inside begin().
+  // Bring LVGL up FIRST and flush a branded splash, so the remaining
+  // (blocking) setup steps below run on-screen instead of on a white slab.
+  if (!lvgl_port_init(
+#if CATFISH_QEMU
+          nullptr, nullptr
+#else
+          s_board->getLCD(), s_board->getTouch()
+#endif
+          )) {
+    Serial.println("[SYS] ERROR: LVGL port init failed");
+  }
+  lvgl_port_lock(-1);
+  ui_boot_splash(CATFISH_APP_VERSION);
+  lvgl_port_unlock();
+
+#if !CATFISH_QEMU
   // --- battery-backed RTC (v1.8.1: after the panel stack owns the bus) ---
-  // Probing earlier would fail (no legacy driver installed yet). Ordering
-  // still keeps the restored wall clock in effect before the first LVGL
-  // frame renders (lvgl_port_init/ui_init come below).
+  // Probing earlier would fail (no legacy driver installed yet). The restore
+  // lands well before loop()'s first tick, so the app screens (built below)
+  // and the 1 Hz clock all start from the correct wall time; the splash
+  // itself carries no clock.
   rtcBootInit();
 
   // --- optional microSD feed log (v1.7.0) ---
@@ -1493,16 +1514,6 @@ void setup() {
   // guard); ESP-NOW starts lazily once WiFi is up (loop()).
   net_rf24::begin();
 #endif
-
-  if (!lvgl_port_init(
-#if CATFISH_QEMU
-          nullptr, nullptr
-#else
-          s_board->getLCD(), s_board->getTouch()
-#endif
-          )) {
-    Serial.println("[SYS] ERROR: LVGL port init failed");
-  }
 
   // build UI under lock
   lvgl_port_lock(-1);
@@ -1522,6 +1533,7 @@ void setup() {
       names[i] = prefs::getTankName(i + 1);
     ui_tanks_rebuild(tankCountClamped(), names, 0);
   }
+  ui_boot_splash_done(); // v1.10.1: real UI is loaded — free the splash
   lvgl_port_unlock();
   refreshNextFeedUi();
 
