@@ -164,6 +164,117 @@ void test_clamp_pulse_matches_firmware_limits(void) {
   TEST_ASSERT_EQUAL_UINT8(30, mqtt_payloads::clampPulse(999)); // sanity: limit is 30
 }
 
+// ---------------------------------------------------------------------------
+// v1.9.0: state topics + per-tank object discovery paths
+// ---------------------------------------------------------------------------
+void test_v190_state_topics(void) {
+  const String p = "catfish";
+  TEST_ASSERT_EQUAL_STRING("catfish/paused", mqtt_payloads::pausedTopic(p).c_str());
+  TEST_ASSERT_EQUAL_STRING("catfish/feeds_today",
+                           mqtt_payloads::feedsTodayTopic(p).c_str());
+  TEST_ASSERT_EQUAL_STRING("catfish/fails_today",
+                           mqtt_payloads::failsTodayTopic(p).c_str());
+  // tank1 spot-checks
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/last_feed",
+                           mqtt_payloads::tankLastFeedTopic(p, 1).c_str());
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/seconds",
+                           mqtt_payloads::tankSecondsTopic(p, 1).c_str());
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/food",
+                           mqtt_payloads::tankFoodTopic(p, 1).c_str());
+  // empty prefix falls back to the default root like every other builder
+  TEST_ASSERT_EQUAL_STRING("catfish/paused", mqtt_payloads::pausedTopic("").c_str());
+  TEST_ASSERT_EQUAL_STRING("catfish/tank2/food",
+                           mqtt_payloads::tankFoodTopic("", 2).c_str());
+}
+
+void test_v190_tank_discovery_path_obj(void) {
+  TEST_ASSERT_EQUAL_STRING("homeassistant/sensor/catfish_tank1_last_feed/config",
+                           mqtt_payloads::tankDiscoveryPathObj("sensor", 1,
+                                                               "last_feed")
+                               .c_str());
+  TEST_ASSERT_EQUAL_STRING("homeassistant/sensor/catfish_tank2_food/config",
+                           mqtt_payloads::tankDiscoveryPathObj("sensor", 2,
+                                                               "food")
+                               .c_str());
+}
+
+void test_v190_discovery_payloads_parse_as_json(void) {
+  const String paused = mqtt_payloads::discoveryPaused("catfish");
+  const String today = mqtt_payloads::discoveryFeedsToday("catfish");
+  const String fails = mqtt_payloads::discoveryFailsToday("catfish");
+  const String tlf = mqtt_payloads::discoveryTankLastFeed("catfish", 1, "Pond");
+  const String tsec = mqtt_payloads::discoveryTankSeconds("catfish", 1, "");
+  const String tfood = mqtt_payloads::discoveryTankFood("catfish", 1, "Pond");
+
+  JsonDocument d;
+  TEST_ASSERT_TRUE(deserializeJson(d, paused) == DeserializationError::Ok);
+  TEST_ASSERT_EQUAL_STRING("catfish/paused", d["state_topic"] | "");
+  TEST_ASSERT_EQUAL_STRING("catfish_paused", d["uniq_id"] | "");
+  TEST_ASSERT_EQUAL_STRING("ON", d["payload_on"] | "");
+  TEST_ASSERT_EQUAL_STRING("offline", d["payload_not_available"] | "");
+
+  TEST_ASSERT_TRUE(deserializeJson(d, today) == DeserializationError::Ok);
+  TEST_ASSERT_EQUAL_STRING("catfish/feeds_today", d["state_topic"] | "");
+  TEST_ASSERT_EQUAL_STRING("feeds", d["unit_of_measurement"] | "");
+
+  TEST_ASSERT_TRUE(deserializeJson(d, fails) == DeserializationError::Ok);
+  TEST_ASSERT_EQUAL_STRING("catfish/fails_today", d["state_topic"] | "");
+  TEST_ASSERT_EQUAL_STRING("fails", d["unit_of_measurement"] | "");
+
+  TEST_ASSERT_TRUE(deserializeJson(d, tlf) == DeserializationError::Ok);
+  TEST_ASSERT_EQUAL_STRING("Pond last feed", d["name"] | "");
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/last_feed", d["state_topic"] | "");
+  TEST_ASSERT_EQUAL_STRING("timestamp", d["device_class"] | "");
+
+  TEST_ASSERT_TRUE(deserializeJson(d, tsec) == DeserializationError::Ok);
+  TEST_ASSERT_EQUAL_STRING("Tank 1 feed seconds", d["name"] | ""); // empty name fallback
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/seconds", d["state_topic"] | "");
+  TEST_ASSERT_EQUAL_STRING("s", d["unit_of_measurement"] | "");
+
+  TEST_ASSERT_TRUE(deserializeJson(d, tfood) == DeserializationError::Ok);
+  TEST_ASSERT_EQUAL_STRING("catfish/tank1/food", d["state_topic"] | "");
+  TEST_ASSERT_EQUAL_STRING("%", d["unit_of_measurement"] | "");
+  TEST_ASSERT_EQUAL_STRING("catfish_tank1_food", d["uniq_id"] | "");
+  TEST_ASSERT_NOT_NULL(strstr(tfood.c_str(), "\"identifiers\":[\"catfish-display\"]"));
+}
+
+// ---------------------------------------------------------------------------
+// v1.9.0 (F1): parseFeedCmd
+// ---------------------------------------------------------------------------
+void test_parse_feed_cmd_legacy_on(void) {
+  uint8_t secs = 99, mask = 99;
+  TEST_ASSERT_TRUE(mqtt_payloads::parseFeedCmd("ON", &secs, &mask));
+  TEST_ASSERT_EQUAL_UINT8(0, secs); // 0 = device default pulse
+  TEST_ASSERT_EQUAL_UINT8(0, mask); // 0 = all configured tanks
+}
+
+void test_parse_feed_cmd_json_fields(void) {
+  uint8_t secs = 0, mask = 0;
+  TEST_ASSERT_TRUE(mqtt_payloads::parseFeedCmd("{\"seconds\":7}", &secs, &mask));
+  TEST_ASSERT_EQUAL_UINT8(7, secs);
+  TEST_ASSERT_EQUAL_UINT8(0, mask);
+
+  TEST_ASSERT_TRUE(
+      mqtt_payloads::parseFeedCmd("{\"seconds\":7,\"tanks\":5}", &secs, &mask));
+  TEST_ASSERT_EQUAL_UINT8(7, secs);
+  TEST_ASSERT_EQUAL_UINT8(5, mask); // raw mask 0b101 = tanks 1+3
+
+  TEST_ASSERT_TRUE(mqtt_payloads::parseFeedCmd("{\"tanks\":15}", &secs, &mask));
+  TEST_ASSERT_EQUAL_UINT8(0, secs);
+  TEST_ASSERT_EQUAL_UINT8(15, mask); // max accepted mask
+}
+
+void test_parse_feed_cmd_rejects_invalid_payloads(void) {
+  uint8_t secs = 7, mask = 7;
+  TEST_ASSERT_FALSE(mqtt_payloads::parseFeedCmd("{\"seconds\":0}", &secs, &mask));
+  TEST_ASSERT_FALSE(mqtt_payloads::parseFeedCmd("{\"seconds\":99}", &secs, &mask));
+  TEST_ASSERT_FALSE(mqtt_payloads::parseFeedCmd("{\"tanks\":16}", &secs, &mask));
+  TEST_ASSERT_FALSE(mqtt_payloads::parseFeedCmd("garbage", &secs, &mask));
+  TEST_ASSERT_FALSE(mqtt_payloads::parseFeedCmd("", &secs, &mask));
+  // null pointers must not crash either
+  TEST_ASSERT_TRUE(mqtt_payloads::parseFeedCmd("ON", nullptr, nullptr));
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_make_topic_falls_back_to_default_prefix);
@@ -181,5 +292,11 @@ int main(void) {
   RUN_TEST(test_epoch_to_iso8601_utc);
   RUN_TEST(test_epoch_zero_means_never);
   RUN_TEST(test_clamp_pulse_matches_firmware_limits);
+  RUN_TEST(test_v190_state_topics);
+  RUN_TEST(test_v190_tank_discovery_path_obj);
+  RUN_TEST(test_v190_discovery_payloads_parse_as_json);
+  RUN_TEST(test_parse_feed_cmd_legacy_on);
+  RUN_TEST(test_parse_feed_cmd_json_fields);
+  RUN_TEST(test_parse_feed_cmd_rejects_invalid_payloads);
   return UNITY_END();
 }

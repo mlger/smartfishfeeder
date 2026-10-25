@@ -48,6 +48,15 @@ struct Snapshot {
   bool tankOnline[CATFISH_MAX_TANKS] = {false, false, false, false};
   bool tankFeeding[CATFISH_MAX_TANKS] = {false, false, false, false};
   char tankIp[CATFISH_MAX_TANKS][16] = {};
+  // v1.9.0: feeding state + policy + estimator (loop() refreshes 1 Hz)
+  bool vacation = false;
+  uint16_t feedsOkToday = 0;
+  uint16_t feedsFailToday = 0;
+  uint32_t totalFeeds = 0;
+  char clockSrc[8] = {0};       // "none" / "rtc" / "ntp"
+  uint8_t tankFoodPct[CATFISH_MAX_TANKS] = {255, 255, 255, 255}; // 255 = unknown
+  uint16_t tankGps[CATFISH_MAX_TANKS] = {0, 0, 0, 0};            // g/second
+  char historyJson[1536] = {0}; // newest-first [{e,m,s,ok,f}] (C1/C2)
 };
 
 /** Create the schedule queue + spawn the web task. Call once from setup(). */

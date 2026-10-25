@@ -55,6 +55,32 @@ String relayOnlineTopic(const String &prefix) { return makeTopic(prefix, "relay/
 String lastFeedTopic(const String &prefix) { return makeTopic(prefix, "last_feed"); }
 String nextFeedTopic(const String &prefix) { return makeTopic(prefix, "next_feed"); }
 
+// -------------------------------------------------- v1.9.0 state topics
+String pausedTopic(const String &prefix) { return makeTopic(prefix, "paused"); }
+String feedsTodayTopic(const String &prefix) { return makeTopic(prefix, "feeds_today"); }
+String failsTodayTopic(const String &prefix) { return makeTopic(prefix, "fails_today"); }
+
+String tankLastFeedTopic(const String &prefix, uint8_t tank1) {
+  String p = prefix.length() ? prefix : String(CATFISH_MQTT_PREFIX);
+  char leaf[24];
+  snprintf(leaf, sizeof(leaf), "/tank%u/last_feed", (unsigned)tank1);
+  return p + leaf;
+}
+
+String tankSecondsTopic(const String &prefix, uint8_t tank1) {
+  String p = prefix.length() ? prefix : String(CATFISH_MQTT_PREFIX);
+  char leaf[24];
+  snprintf(leaf, sizeof(leaf), "/tank%u/seconds", (unsigned)tank1);
+  return p + leaf;
+}
+
+String tankFoodTopic(const String &prefix, uint8_t tank1) {
+  String p = prefix.length() ? prefix : String(CATFISH_MQTT_PREFIX);
+  char leaf[20];
+  snprintf(leaf, sizeof(leaf), "/tank%u/food", (unsigned)tank1);
+  return p + leaf;
+}
+
 // ------------------------------------------------------- discovery configs
 String discoveryFeedButton(const String &prefix) {
   JsonDocument doc;
@@ -133,6 +159,44 @@ String discoveryNextFeed(const String &prefix) {
   return serialize(doc);
 }
 
+// ------------------------------------------------- v1.9.0 discovery configs
+String discoveryPaused(const String &prefix) {
+  JsonDocument doc;
+  doc["name"] = "Feeding paused";
+  doc["state_topic"] = pausedTopic(prefix);
+  doc["payload_on"] = "ON";
+  doc["payload_off"] = "OFF";
+  doc["icon"] = "mdi:fish-off";
+  doc["uniq_id"] = "catfish_paused";
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
+String discoveryFeedsToday(const String &prefix) {
+  JsonDocument doc;
+  doc["name"] = "Feeds today";
+  doc["state_topic"] = feedsTodayTopic(prefix);
+  doc["unit_of_measurement"] = "feeds";
+  doc["icon"] = "mdi:counter";
+  doc["uniq_id"] = "catfish_feeds_today";
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
+String discoveryFailsToday(const String &prefix) {
+  JsonDocument doc;
+  doc["name"] = "Feed failures today";
+  doc["state_topic"] = failsTodayTopic(prefix);
+  doc["unit_of_measurement"] = "fails";
+  doc["icon"] = "mdi:alert-circle-outline";
+  doc["uniq_id"] = "catfish_fails_today";
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
 // ---------------------------------------------------------- per-tank (P5)
 // Numeric pieces go through snprintf: the native-test mock String
 // (std::string) has no operator+(int), and this keeps device + host identical.
@@ -154,6 +218,14 @@ String tankDiscoveryPath(const char *component, uint8_t tank1) {
   char path[64];
   snprintf(path, sizeof(path), "homeassistant/%s/catfish_tank%u/config",
            component, (unsigned)tank1);
+  return String(path);
+}
+
+String tankDiscoveryPathObj(const char *component, uint8_t tank1,
+                            const char *obj) {
+  char path[80];
+  snprintf(path, sizeof(path), "homeassistant/%s/catfish_tank%u_%s/config",
+           component, (unsigned)tank1, obj);
   return String(path);
 }
 
@@ -198,6 +270,66 @@ String discoveryTankOnline(const String &prefix, uint8_t tank1,
   return serialize(doc);
 }
 
+// ------------------------------------------- v1.9.0 per-tank sensor entities
+String discoveryTankLastFeed(const String &prefix, uint8_t tank1,
+                             const String &tankName) {
+  JsonDocument doc;
+  char name[40];
+  if (tankName.length())
+    snprintf(name, sizeof(name), "%s last feed", tankName.c_str());
+  else
+    snprintf(name, sizeof(name), "Tank %u last feed", (unsigned)tank1);
+  doc["name"] = name;
+  doc["state_topic"] = tankLastFeedTopic(prefix, tank1);
+  doc["device_class"] = "timestamp";
+  char uniq[28];
+  snprintf(uniq, sizeof(uniq), "catfish_tank%u_last_feed", (unsigned)tank1);
+  doc["uniq_id"] = uniq;
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
+String discoveryTankSeconds(const String &prefix, uint8_t tank1,
+                            const String &tankName) {
+  JsonDocument doc;
+  char name[40];
+  if (tankName.length())
+    snprintf(name, sizeof(name), "%s feed seconds", tankName.c_str());
+  else
+    snprintf(name, sizeof(name), "Tank %u feed seconds", (unsigned)tank1);
+  doc["name"] = name;
+  doc["state_topic"] = tankSecondsTopic(prefix, tank1);
+  doc["unit_of_measurement"] = "s";
+  doc["icon"] = "mdi:timer";
+  char uniq[28];
+  snprintf(uniq, sizeof(uniq), "catfish_tank%u_seconds", (unsigned)tank1);
+  doc["uniq_id"] = uniq;
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
+String discoveryTankFood(const String &prefix, uint8_t tank1,
+                         const String &tankName) {
+  JsonDocument doc;
+  char name[36];
+  if (tankName.length())
+    snprintf(name, sizeof(name), "%s food level", tankName.c_str());
+  else
+    snprintf(name, sizeof(name), "Tank %u food level", (unsigned)tank1);
+  doc["name"] = name;
+  doc["state_topic"] = tankFoodTopic(prefix, tank1);
+  doc["unit_of_measurement"] = "%";
+  doc["icon"] = "mdi:silo-outline";
+  char uniq[26];
+  snprintf(uniq, sizeof(uniq), "catfish_tank%u_food", (unsigned)tank1);
+  doc["uniq_id"] = uniq;
+  addAvailability(doc, prefix);
+  addDevice(doc);
+  return serialize(doc);
+}
+
 // ---------------------------------------------------------------- payloads
 String epochToIso8601(uint32_t epoch) {
   if (epoch == 0) return String("unknown");
@@ -215,6 +347,28 @@ uint8_t clampPulse(long seconds) {
   if (seconds < 1) return 1;
   if (seconds > (long)CATFISH_PULSE_S_LIMIT) return CATFISH_PULSE_S_LIMIT;
   return (uint8_t)seconds;
+}
+
+bool parseFeedCmd(const String &payload, uint8_t *secs, uint8_t *mask) {
+  if (secs) *secs = 0; // 0 = device default pulse
+  if (mask) *mask = 0; // 0 = all configured tanks
+  if (payload == "ON") return true; // legacy aggregate button
+  const char *s = payload.c_str();
+  while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+  if (*s != '{') return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, payload) != DeserializationError::Ok) return false;
+  if (!doc["seconds"].isNull()) {
+    const long v = doc["seconds"] | -1L;
+    if (v < 1 || v > (long)CATFISH_PULSE_S_LIMIT) return false;
+    if (secs) *secs = (uint8_t)v;
+  }
+  if (!doc["tanks"].isNull()) {
+    const long t = doc["tanks"] | -1L;
+    if (t < 1 || t > 15) return false;
+    if (mask) *mask = (uint8_t)t;
+  }
+  return true;
 }
 
 } // namespace mqtt_payloads

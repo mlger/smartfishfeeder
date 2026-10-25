@@ -11,6 +11,7 @@
 #include <espMqttClient.h>
 
 #include <catfish_protocol.h>
+#include "feed_state.h"
 #include "mqtt_payloads.h"
 #include "net_wifi.h"
 #include "prefs.h"
@@ -83,18 +84,28 @@ void onDisconnectCb(espMqttClientTypes::DisconnectReason reason) {
 void onMessageCb(const espMqttClientTypes::MessageProperties & /*properties*/,
                  const char *topic, const uint8_t *payload, size_t len,
                  size_t /*index*/, size_t /*total*/) {
-  char value[12] = {0};
-  if (len >= sizeof(value)) return; // commands are tiny ("ON" / "30")
+  // v1.9.0 (F1): feed/cmd now also accepts JSON {"seconds":n,"tanks":m} —
+  // allow up to 96 bytes; other commands stay tiny.
+  char value[96] = {0};
+  if (len >= sizeof(value)) return;
   memcpy(value, payload, len);
 
-  if (strcmp(topic, s_topic_feed_cmd) == 0 && strcmp(value, "ON") == 0) {
+  if (strcmp(topic, s_topic_feed_cmd) == 0) {
+    uint8_t secs = 0, mask = 0;
+    if (!mqtt_payloads::parseFeedCmd(String(value), &secs, &mask)) {
+      Serial.printf("[MQTT] feed command ignored (bad payload, %u B)\n",
+                    (unsigned)len);
+      return;
+    }
     UiEvent ev;
     ev.type = UI_EVT_FEED;
-    ev.a = prefs::getDefaultPulse(); // benign snapshot read (single byte)
-    ev.flag = true;                  // manual
-    ev.tankMask = 0;                 // 0 = tank 1 (legacy aggregate button)
+    ev.a = secs ? secs : prefs::getDefaultPulse(); // benign snapshot read
+    ev.flag = true;      // manual
+    ev.feedSrc = 2;      // REMOTE for the policy gate (F3)
+    ev.tankMask = mask;  // 0 = all configured tanks
     ui::ui_event_send(ev);
-    Serial.println("[MQTT] feed command received");
+    Serial.printf("[MQTT] feed command received (%u s, tanks 0x%X)\n",
+                  (unsigned)ev.a, (unsigned)ev.tankMask);
     return;
   }
 
@@ -111,6 +122,7 @@ void onMessageCb(const espMqttClientTypes::MessageProperties & /*properties*/,
       ev.type = UI_EVT_FEED;
       ev.a = prefs::getDefaultPulse();
       ev.flag = true; // manual
+      ev.feedSrc = 2; // REMOTE for the policy gate (F3)
       ev.tankMask = (uint8_t)(1u << i);
       ui::ui_event_send(ev);
       Serial.printf("[MQTT] tank %d feed command received\n", i + 1);
@@ -260,6 +272,10 @@ void publishDiscovery() {
       {"homeassistant/binary_sensor/catfish_feeding/config", mqtt_payloads::discoveryFeeding},
       {"homeassistant/sensor/catfish_last_feed/config", mqtt_payloads::discoveryLastFeed},
       {"homeassistant/sensor/catfish_next_feed/config", mqtt_payloads::discoveryNextFeed},
+      // v1.9.0: paused (A5) + daily counters (C3)
+      {"homeassistant/binary_sensor/catfish_paused/config", mqtt_payloads::discoveryPaused},
+      {"homeassistant/sensor/catfish_feeds_today/config", mqtt_payloads::discoveryFeedsToday},
+      {"homeassistant/sensor/catfish_fails_today/config", mqtt_payloads::discoveryFailsToday},
   };
   for (const Cfg &c : cfgs) {
     s_client.publish(c.path, 0, true, c.fn(p).c_str());
@@ -274,6 +290,13 @@ void publishDiscovery() {
                      mqtt_payloads::discoveryTankFeedButton(p, t, name).c_str());
     s_client.publish(mqtt_payloads::tankDiscoveryPath("binary_sensor", t).c_str(), 0,
                      true, mqtt_payloads::discoveryTankOnline(p, t, name).c_str());
+    // v1.9.0 (F2/D1): per-tank last-feed / seconds / food-level sensors
+    s_client.publish(mqtt_payloads::tankDiscoveryPathObj("sensor", t, "last_feed").c_str(),
+                     0, true, mqtt_payloads::discoveryTankLastFeed(p, t, name).c_str());
+    s_client.publish(mqtt_payloads::tankDiscoveryPathObj("sensor", t, "seconds").c_str(),
+                     0, true, mqtt_payloads::discoveryTankSeconds(p, t, name).c_str());
+    s_client.publish(mqtt_payloads::tankDiscoveryPathObj("sensor", t, "food").c_str(),
+                     0, true, mqtt_payloads::discoveryTankFood(p, t, name).c_str());
   }
   Serial.println("[MQTT] discovery configs published (retained)");
 }
@@ -309,6 +332,43 @@ void publishPulse(uint8_t seconds) {
                String((unsigned)seconds), true);
 }
 
+// ------------------------------------------------- v1.9.0 state publishing
+void publishPaused(bool paused) {
+  publishTopic(mqtt_payloads::pausedTopic(prefs::getMqttPrefix()).c_str(),
+               String(paused ? "ON" : "OFF"), true);
+}
+
+void publishFeedsToday(uint16_t ok, uint16_t fail) {
+  const String p = prefs::getMqttPrefix();
+  publishTopic(mqtt_payloads::feedsTodayTopic(p).c_str(), String((unsigned)ok), true);
+  publishTopic(mqtt_payloads::failsTodayTopic(p).c_str(), String((unsigned)fail), true);
+}
+
+void publishTankLastFeed(uint8_t tank1, uint32_t epoch, uint8_t seconds) {
+  if (tank1 < 1 || tank1 > CATFISH_MAX_TANKS) return;
+  const String p = prefs::getMqttPrefix();
+  publishTopic(mqtt_payloads::tankLastFeedTopic(p, tank1).c_str(),
+               mqtt_payloads::epochToIso8601(epoch), true);
+  publishTopic(mqtt_payloads::tankSecondsTopic(p, tank1).c_str(),
+               String((unsigned)seconds), true);
+}
+
+void publishTankFood(uint8_t tank1, uint8_t pct) {
+  if (tank1 < 1 || tank1 > CATFISH_MAX_TANKS) return;
+  if (pct > 100) return; // 255 = unknown (no capacity configured) -> stay silent
+  publishTopic(mqtt_payloads::tankFoodTopic(prefs::getMqttPrefix(), tank1).c_str(),
+               String((unsigned)pct), true);
+}
+
+void publishFoodLevels() {
+  uint8_t count = prefs::getTankCount();
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  for (uint8_t t = 1; t <= count; t++) {
+    publishTankFood(t, feed_state::hopperLevelPct(t));
+  }
+}
+
 void publishTankOnline(uint8_t tank1, bool online) {
   if (tank1 < 1 || tank1 > CATFISH_MAX_TANKS) return;
   publishTopic(mqtt_payloads::tankOnlineTopic(prefs::getMqttPrefix(), tank1).c_str(),
@@ -322,6 +382,10 @@ void clearTankDiscovery(uint8_t prevCount, uint8_t newCount) {
     // empty retained payload = HA removes the entity
     s_client.publish(mqtt_payloads::tankDiscoveryPath("button", t).c_str(), 0, true, "");
     s_client.publish(mqtt_payloads::tankDiscoveryPath("binary_sensor", t).c_str(), 0, true, "");
+    // v1.9.0: the per-tank sensor entities added in this release
+    s_client.publish(mqtt_payloads::tankDiscoveryPathObj("sensor", t, "last_feed").c_str(), 0, true, "");
+    s_client.publish(mqtt_payloads::tankDiscoveryPathObj("sensor", t, "seconds").c_str(), 0, true, "");
+    s_client.publish(mqtt_payloads::tankDiscoveryPathObj("sensor", t, "food").c_str(), 0, true, "");
     publishTankOnline(t, false);
   }
   Serial.printf("[MQTT] tank entities %u..%u removed\n", (unsigned)(newCount + 1),

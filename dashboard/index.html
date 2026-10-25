@@ -55,6 +55,20 @@ dialog input{width:100%;margin:8px 0 14px}
 .prog{height:8px;background:var(--bar);border-radius:8px;overflow:hidden;margin-top:10px;display:none}
 .prog>i{display:block;height:100%;background:var(--amber);width:0}
 .mut{color:var(--mut);font-size:12px}
+.vac{background:rgba(217,100,89,.14);border:1px solid var(--red);color:var(--red);border-radius:10px;padding:10px 14px;text-align:center;font-weight:700;font-size:13px;letter-spacing:1px;margin-bottom:12px}
+.tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:8px;letter-spacing:1px}
+.tok{background:rgba(70,208,126,.15);color:var(--grn)}
+.tfail{background:rgba(217,100,89,.18);color:var(--red)}
+.htime{font-size:13px;font-weight:600;min-width:96px}
+.hsec{color:var(--mut);font-size:13px}
+.frow{display:flex;align-items:center;gap:10px;margin-top:8px}
+.fname{font-size:13px;min-width:64px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fbar{flex:1;height:8px;background:var(--bar);border-radius:8px;overflow:hidden}
+.fbar>i{display:block;height:100%;background:var(--amber)}
+.fpct{font-size:12px;color:var(--mut);min-width:36px;text-align:right}
+.chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.chips .mini{padding:6px 9px;font-size:12px;border-radius:8px}
+.chipLabel{font-size:12px;color:var(--mut)}
 footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
 </style>
 </head>
@@ -69,10 +83,13 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   </div>
 </header>
 
+<div class="vac" id="vacBanner" style="display:none">VACATION &mdash; schedules paused</div>
+
 <div class="card">
   <h2>NEXT FEEDING</h2>
   <div class="big" id="nextTime">--:--</div>
   <div class="sub" id="lastTime">Last fed: never</div>
+  <div class="sub" id="todayLine" style="display:none"></div>
   <div class="sub" id="feeding" style="color:var(--amber);display:none">Feeding now...</div>
 </div>
 
@@ -98,7 +115,27 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
     <button class="mini ghost" id="addBtn">Add</button>
     <button class="mini" id="saveBtn" disabled>Save</button>
   </div>
-  <div class="mut" style="margin-top:8px">Toggle to pause an entry &middot; Save sends the whole schedule</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+    <span class="chipLabel">Days</span>
+    <div id="addDays" class="chips" style="flex:1"></div>
+  </div>
+  <div id="addStRow" style="display:none;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
+    <span class="chipLabel">Per-tank s (0 = shared)</span>
+    <div id="addSt" class="chips"></div>
+  </div>
+  <div class="mut" style="margin-top:8px">Toggle to pause &middot; tap an entry to edit days / per-tank seconds &middot; Save sends the whole schedule</div>
+</div>
+
+<div class="card">
+  <div class="row" id="histHead" style="cursor:pointer">
+    <h2 class="grow" style="margin:0">HISTORY</h2>
+    <button class="mini ghost" id="histRef">Refresh</button>
+    <span class="mut" id="histCaret">&#9656;</span>
+  </div>
+  <div id="histBody" style="display:none;margin-top:8px">
+    <ul id="histList"></ul>
+    <div class="mut" id="histMsg" style="display:none"></div>
+  </div>
 </div>
 
 <div class="card">
@@ -112,6 +149,7 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   <div class="mut" id="wifiLine" style="margin-top:8px"></div>
   <div class="mut" id="relayLine"></div>
   <div class="mut" id="mqttLine"></div>
+  <div id="foodBox" style="display:none"></div>
 </div>
 
 <footer>L LAN only &middot; commands need the pairing token</footer>
@@ -124,6 +162,22 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   <button class="primary" id="tokSave">Save</button>
 </dialog>
 
+<dialog id="edDlg">
+  <h3>Edit feeding</h3>
+  <input type="time" id="edTime">
+  <div class="chipLabel" style="margin:2px 0 6px">Days (all on = daily)</div>
+  <div id="edDays" class="chips"></div>
+  <div class="row" style="margin-top:12px">
+    <div class="grow mut">Shared seconds</div>
+    <input type="number" id="edSec" min="1" max="30" style="width:70px;margin:0">
+  </div>
+  <div id="edStWrap" style="display:none">
+    <div class="chipLabel" style="margin:10px 0 6px">Per-tank seconds (0 = shared)</div>
+    <div id="edSt" class="chips"></div>
+  </div>
+  <button class="primary" id="edSave" style="margin-top:16px">Done</button>
+</dialog>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -134,6 +188,9 @@ let pulse=3, schedule=[], dirty=false, feedBusy=false, pulseDirty=false;
 let tanks=[], selTank=0; // selTank: 0-based index or "all"
 let hour12=false; // v1.6.0: presentation only, from /api/status
 let lastHour12=null;
+let tanksProj=null; // v1.9.0: identity projection so foodPct/gps churn doesn't rebuild the editors
+let addDayChips=null, addStIns=[]; // v1.9.0: add-form weekday mask + per-tank seconds inputs
+let histOpen=false, edIdx=-1, edDayChips=null, edStIns=[]; // v1.9.0: history panel + entry editor
 
 function toast(m,ms=2200){const t=$("toast");t.textContent=m;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms)}
 // 24h "07:30" or 12h "7:30 AM" per the device preference (machine values stay 24h)
@@ -142,7 +199,57 @@ function iso(s){if(!s)return"never";const d=new Date(s*1000);const now=new Date(
   const sameDay=d.toDateString()===now.toDateString();
   return(sameDay?"Today ":"")+fmtHm(d.getHours(),d.getMinutes())}
 function maskOf(sel,n){return sel==="all"?((1<<n)-1):(1<<sel)}
-function maskTag(m){const p=[];for(let i=0;i<4;i++)if(m&(1<<i))p.push(i+1);return p.length?"T"+p.join("+"):""}
+function maskTag(m){const p=[];for(let i=0;i<4;i++)if(m&(1<<i))p.push("T"+(i+1));return p.join("+")} // v1.9.0: "T1+T3" (was "T1+3")
+/* v1.9.0 helpers ---------------------------------------------------- */
+const DAY_N=["Mo","Tu","We","Th","Fr","Sa","Su"];
+const HIST_FLAG={1:"manual",2:"catch-up",3:"retry",4:"verify",5:"blocked",6:"skipped"};
+function daysLabel(d){ // bit0=Mon..bit6=Sun; absent/0x7F = daily, 0 clamps to daily
+  if(!d||d===0x7F)return"Daily";
+  const N=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];let parts=[],run=-1;
+  for(let i=0;i<7;i++){
+    if(d&(1<<i)){if(run<0)run=i}
+    else if(run>=0){parts.push(run===i-1?N[run]:N[run]+"-"+N[i-1]);run=-1}
+  }
+  if(run>=0)parts.push(run===6?N[6]:N[run]+"-"+N[6]);
+  return parts.join(", ")||"Daily";
+}
+function stLabel(e){const p=[];(e.st||[]).forEach((v,k)=>{if(v>0)p.push("T"+(k+1)+":"+v+"s")});return p.length?" \u00B7 "+p.join("+"):""}
+function secLabel(e){
+  let txt=e.s+" s";const tag=tanks.length>1?maskTag(e.t||1):"";
+  if(tag)txt+=" \u00B7 "+tag;
+  txt+=stLabel(e);
+  return txt+" \u00B7 "+daysLabel(e.d);
+}
+function fmtEvent(sec){
+  if(!sec)return"--";
+  const d=new Date(sec*1000),now=new Date(),hm=fmtHm(d.getHours(),d.getMinutes());
+  if(d.toDateString()===now.toDateString())return"Today "+hm;
+  if(new Date(now.getTime()-864e5).toDateString()===d.toDateString())return"Yesterday "+hm;
+  return d.toLocaleDateString(undefined,{month:"short",day:"numeric"})+" "+hm;
+}
+function makeDayChips(box,mask){ // 7 toggle chips; never allow zero days -> all on = daily
+  box.innerHTML="";const st={m:(mask&0x7F)||0x7F},paint=[];
+  for(let i=0;i<7;i++){
+    const b=document.createElement("button");b.className="mini";b.textContent=DAY_N[i];
+    const p=()=>b.style.border="2px solid "+((st.m>>i&1)?"var(--amber)":"var(--hi)");
+    p();paint.push(p);
+    b.onclick=()=>{st.m^=1<<i;if(!st.m){st.m=0x7F;toast("All days on = daily")}paint.forEach(f=>f())};
+    box.appendChild(b);
+  }
+  st.set=v=>{st.m=(v&0x7F)||0x7F;paint.forEach(f=>f())};
+  return st;
+}
+function makeStInputs(box,vals){ // per-tank pulse seconds, 0 = inherit the shared seconds
+  box.innerHTML="";const ins=[],n=Math.max(tanks.length,1);
+  for(let i=0;i<n;i++){
+    const w=document.createElement("label");w.style.cssText="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--mut)";
+    const inp=document.createElement("input");inp.type="number";inp.min=0;inp.max=30;
+    inp.style.cssText="width:56px;margin:0;background:var(--bar);border:1px solid var(--hi);color:var(--txt);border-radius:8px;padding:8px;font:inherit";
+    inp.value=((vals&&vals[i])||0);
+    w.append(document.createTextNode("T"+(i+1)),inp);box.appendChild(w);ins.push(inp);
+  }
+  return ins;
+}
 
 async function api(path,opt={}){
   const r=await fetch(path,{...opt,headers:{...(opt.headers||{}),"X-Catfish-Token":token}});
@@ -173,12 +280,41 @@ function renderTanks(){
 }
 function renderAddTanks(){
   const box=$("addTankBoxes");box.innerHTML="";
-  if(tanks.length<2){box.style.display="none";return}
-  box.style.display="inline-flex";
-  tanks.forEach((t,i)=>{
-    const l=document.createElement("label");l.style.display="inline-flex";l.style.alignItems="center";l.style.gap="2px";l.style.fontSize="12px";
-    const cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.dataset.i=i;
-    l.append(cb,document.createTextNode(i+1));box.appendChild(l);
+  if(tanks.length<2)box.style.display="none";
+  else{
+    box.style.display="inline-flex";
+    tanks.forEach((t,i)=>{
+      const l=document.createElement("label");l.style.display="inline-flex";l.style.alignItems="center";l.style.gap="2px";l.style.fontSize="12px";
+      const cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.dataset.i=i;
+      l.append(cb,document.createTextNode(i+1));box.appendChild(l);
+    });
+  }
+  // v1.9.0: per-tank seconds overrides in the add form (0 = inherit shared)
+  if(tanks.length>1){$("addStRow").style.display="flex";addStIns=makeStInputs($("addSt"))}
+  else{$("addStRow").style.display="none";addStIns=[]}
+}
+function renderFood(tl){ // v1.9.0: hopper level per tank; foodPct 255/absent = unknown
+  const box=$("foodBox"),list=(tl||[]).filter(t=>typeof t.foodPct==="number");
+  if(!list.length){box.style.display="none";box.innerHTML="";return}
+  box.style.display="block";box.innerHTML="";
+  list.forEach(t=>{
+    const r=document.createElement("div");r.className="frow";
+    const n=document.createElement("span");n.className="fname";n.textContent=t.name||("Tank "+t.id);
+    r.appendChild(n);
+    if(t.foodPct===255){
+      const h=document.createElement("span");h.className="mut";
+      h.style.cssText="flex:1;text-align:right";h.textContent="size not set";
+      r.appendChild(h);
+    }else{
+      const p=Math.max(0,Math.min(100,t.foodPct));
+      const bar=document.createElement("div");bar.className="fbar";
+      const i=document.createElement("i");i.style.width=p+"%";if(p<=15)i.style.background="var(--red)";
+      bar.appendChild(i);
+      const pc=document.createElement("span");pc.className="fpct";pc.textContent=p+"%";
+      if(t.gps>0)pc.title="\u2248"+t.gps+" g/s dispense rate";
+      r.append(bar,pc);
+    }
+    box.appendChild(r);
   });
 }
 async function refresh(){
@@ -199,7 +335,16 @@ async function refresh(){
     const tl=(s.tanks||[]).map(t=>t.name+" "+(t.online?"\u25CF":"\u25CB")+(t.feeding?" (feeding)":""));
     $("relayLine").textContent="Tanks: "+(tl.length?tl.join("  \u00B7  "):(s.relayOnline?"online at "+s.relayIp:"offline"));
     $("mqttLine").textContent="MQTT: "+(s.mqtt||"n/a");
-    if(JSON.stringify(s.tanks||[])!==JSON.stringify(tanks)){tanks=s.tanks||[];renderTanks();renderAddTanks();renderSched()}
+    // v1.9.0: vacation badge + today counters (fields absent on v1.8.4 -> hidden)
+    $("vacBanner").style.display=s.vacation?"block":"none";
+    const today=$("todayLine");
+    if(typeof s.feedsOkToday==="number"||typeof s.feedsFailToday==="number"){
+      today.style.display="block";
+      today.textContent="Today: "+(s.feedsOkToday||0)+" fed / "+(s.feedsFailToday||0)+" failed";
+    }else today.style.display="none";
+    renderFood(s.tanks);
+    const proj=(s.tanks||[]).map(t=>[t.id,t.name,t.online,t.feeding].join("|"));
+    if(JSON.stringify(proj)!==JSON.stringify(tanksProj)){tanksProj=proj;tanks=s.tanks||[];renderTanks();renderAddTanks();renderSched()}
     else renderTanks();
     if(hour12!==lastHour12){lastHour12=hour12;renderSched()} // relabel once per format change
     if(!dirty&&!pulseDirty){pulse=s.pulse||3;renderPulse()} // v1.8.2: pulseDirty — the 3 s poll used to snap back a selection made seconds ago
@@ -232,8 +377,9 @@ function renderSched(){
     sw.append(cb,sl);
     const t=document.createElement("span");t.className="time";
     t.textContent=fmtHm(e.h,e.m);
-    const tag=maskTag(e.t||1);
-    const s=document.createElement("span");s.className="sec";s.textContent=e.s+" s"+(tanks.length>1&&tag?" \u00B7 "+tag:"");
+    const s=document.createElement("span");s.className="sec";
+    s.textContent=secLabel(e);s.style.cursor="pointer";s.title="Tap to edit";
+    s.onclick=()=>openEdit(i);
     const del=document.createElement("button");del.className="mini";del.textContent="\u2715";
     del.onclick=()=>{schedule.splice(i,1);dirty=true;$("saveBtn").disabled=false;renderSched()};
     li.append(sw,t,s,del);ul.appendChild(li);
@@ -242,7 +388,15 @@ function renderSched(){
 }
 async function loadSched(){
   try{const j=await api("/api/schedule");
-    schedule=Array.isArray(j)?j:(j.entries||[]);dirty=false;$("saveBtn").disabled=true;renderSched()}
+    // v1.9.0: normalize d (weekday mask) + st (per-tank seconds). Legacy
+    // entries read as daily / inherit-only; the PUT keeps sending h,m,e,s,t
+    // so old firmware simply ignores the new keys.
+    schedule=(Array.isArray(j)?j:(j.entries||[])).map(e=>({
+      h:e.h|0,m:e.m|0,e:!!e.e,s:e.s|0,t:(e.t|0)||1,
+      d:(typeof e.d==="number"&&e.d>0&&e.d<128)?e.d:0x7F,
+      st:[0,1,2,3].map(k=>Array.isArray(e.st)?(e.st[k]|0):0)
+    }));
+    dirty=false;$("saveBtn").disabled=true;renderSched()}
   catch(e){}
 }
 $("addBtn").onclick=()=>{
@@ -254,7 +408,8 @@ $("addBtn").onclick=()=>{
   let t=(1<<Math.max(tanks.length,1))-1; // default: all configured tanks
   const boxes=$("addTankBoxes").querySelectorAll("input");
   if(boxes.length){t=0;boxes.forEach(cb=>{if(cb.checked)t|=1<<(+cb.dataset.i)});if(!t)t=1}
-  schedule.push({h,m,e:true,s,t});dirty=true;$("saveBtn").disabled=false;renderSched();
+  const st=[0,0,0,0];addStIns.forEach((inp,i)=>{if(i<4)st[i]=Math.max(0,Math.min(30,parseInt(inp.value)||0))}); // v1.9.0: 0 = inherit shared s
+  schedule.push({h,m,e:true,s,t,d:addDayChips?addDayChips.m:0x7F,st});dirty=true;$("saveBtn").disabled=false;renderSched();
 };
 $("saveBtn").onclick=async()=>{
   try{const r=await mut("/api/schedule","PUT",schedule);
@@ -265,6 +420,71 @@ $("saveBtn").onclick=async()=>{
       setTimeout(loadSched,2500)}
     else toast(r.error||"Rejected",3000)}
   catch(e){toast(e.message,3000)}
+};
+
+/* ---------- entry editor (v1.9.0) ---------- */
+function openEdit(i){
+  const e=schedule[i];if(!e)return;
+  edIdx=i;
+  $("edTime").value=String(e.h).padStart(2,"0")+":"+String(e.m).padStart(2,"0");
+  $("edSec").value=e.s;
+  edDayChips=makeDayChips($("edDays"),e.d);
+  if(tanks.length>1){$("edStWrap").style.display="block";edStIns=makeStInputs($("edSt"),e.st)}
+  else{$("edStWrap").style.display="none";edStIns=[]}
+  $("edDlg").showModal();
+}
+$("edSave").onclick=()=>{
+  const e=schedule[edIdx];
+  if(e){
+    const v=$("edTime").value;
+    if(v){const p=v.split(":");e.h=+p[0]||0;e.m=+p[1]||0}
+    e.s=Math.max(1,Math.min(30,parseInt($("edSec").value)||e.s));
+    e.d=edDayChips?edDayChips.m:0x7F;
+    const st=[0,0,0,0];edStIns.forEach((inp,k)=>{if(k<4)st[k]=Math.max(0,Math.min(30,parseInt(inp.value)||0))});
+    e.st=st;
+    dirty=true;$("saveBtn").disabled=false;renderSched();
+  }
+  $("edDlg").close();
+};
+
+/* ---------- history (v1.9.0) ---------- */
+function histRow(ev){
+  const li=document.createElement("li");
+  const t=document.createElement("span");t.className="htime";t.textContent=fmtEvent(ev.e);
+  const tg=document.createElement("span");tg.className="tag "+(ev.ok?"tok":"tfail");tg.textContent=ev.ok?"OK":"FAIL";
+  const d=document.createElement("span");d.className="hsec";
+  const mk=maskTag(ev.m||0);
+  d.textContent=(mk?mk+" \u00B7 ":"")+(ev.s||0)+" s";
+  li.append(t,tg,d);
+  const f=HIST_FLAG[ev.f];
+  if(f){const fs=document.createElement("span");fs.className="mut";fs.textContent=f;li.appendChild(fs)}
+  return li;
+}
+async function loadHist(){
+  const ul=$("histList"),msg=$("histMsg");
+  msg.style.display="none";ul.innerHTML='<li class="mut">Loading\u2026</li>';
+  try{
+    const j=await api("/api/history");
+    if(!Array.isArray(j))throw new Error("shape"); // v1.8.4: 404/HTML -> {raw}
+    ul.innerHTML="";
+    const rows=j.slice(0,24); // firmware returns newest first
+    if(!rows.length){msg.textContent="No feed events yet";msg.style.display="block";return}
+    rows.forEach(ev=>ul.appendChild(histRow(ev)));
+  }catch(e){
+    ul.innerHTML="";
+    msg.textContent="History unavailable (needs firmware v1.9.0+)";msg.style.display="block";
+  }
+}
+$("histHead").onclick=()=>{
+  histOpen=!histOpen;
+  $("histBody").style.display=histOpen?"block":"none";
+  $("histCaret").textContent=histOpen?"\u25BE":"\u25B8";
+  if(histOpen)loadHist();
+};
+$("histRef").onclick=e=>{
+  e.stopPropagation();
+  if(!histOpen){histOpen=true;$("histBody").style.display="block";$("histCaret").textContent="\u25BE"}
+  loadHist();
 };
 
 /* ---------- firmware ---------- */
@@ -288,6 +508,7 @@ $("tokSave").onclick=()=>{token=$("tokInput").value.trim();localStorage.catfishT
   $("tokDlg").close();refresh();loadSched()};
 if(!token){$("tokInput").value="catfish"}
 
+addDayChips=makeDayChips($("addDays"),0x7F); // v1.9.0: new entries default to daily
 refresh();loadSched();
 </script>
 </body>

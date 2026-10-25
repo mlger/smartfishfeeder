@@ -46,15 +46,20 @@ void workerTask(void * /*param*/) {
       r.kind = net_worker::Result::RES_FEED;
       r.manual = cmd.manual;
       r.retry = cmd.retry;
+      r.catchup = cmd.catchup;
       r.hour = cmd.hour;
       r.minute = cmd.minute;
       r.seconds = cmd.seconds;
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
         if (!(mask & (1u << (t - 1)))) continue;
-        const relay_client::Result fr = relay_client::feedTank(t, cmd.seconds);
+        // v1.9.0 (A2): per-tank pulse override (0 = the shared seconds)
+        uint8_t secs = cmd.seconds;
+        if (cmd.secTank[t - 1]) secs = cmd.secTank[t - 1];
+        const relay_client::Result fr = relay_client::feedTank(t, secs);
         if (fr.ok) {
           r.tanksOk |= (1u << (t - 1));
-          r.seconds = fr.seconds_applied; // last applied wins (all equal in practice)
+          r.secOk[t - 1] = fr.seconds_applied; // v1.9.0: per-tank applied
+          r.seconds = fr.seconds_applied; // last applied wins (compat field)
           strlcpy(r.ip, fr.ip.c_str(), sizeof(r.ip));
           if (fr.clamped) {
             r.clamped = true;
@@ -116,6 +121,7 @@ void workerTask(void * /*param*/) {
       r.online = online;
       r.feeding = st.feeding;
       r.report = cmd.report;
+      r.verify = cmd.verify; // v1.9.0 (B3): pulse-verify window probe
       r.protoMismatch =
           st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION;
       strlcpy(r.ip, relay_client::ip(tank1).c_str(), sizeof(r.ip));
@@ -157,24 +163,30 @@ bool begin() {
 }
 
 bool enqueueFeed(uint8_t seconds, bool manual, uint8_t hour, uint8_t minute,
-                 bool retry, uint8_t tankMask) {
+                 bool retry, uint8_t tankMask, const uint8_t *secTank,
+                 bool catchup) {
   if (!s_cmdq) return false;
   Cmd c;
   c.type = Cmd::CMD_FEED;
   c.seconds = seconds;
   c.manual = manual;
   c.retry = retry;
+  c.catchup = catchup;
   c.hour = hour;
   c.minute = minute;
   c.tankMask = tankMask;
+  if (secTank) {
+    for (int i = 0; i < 4; i++) c.secTank[i] = secTank[i];
+  }
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }
 
-bool enqueueProbe(bool report, uint8_t tank1) {
+bool enqueueProbe(bool report, uint8_t tank1, bool verify) {
   if (!s_cmdq) return false;
   Cmd c;
   c.type = Cmd::CMD_PROBE;
   c.report = report;
+  c.verify = verify;
   c.tankId = sanitizeTank1(tank1);
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }

@@ -12,6 +12,7 @@
  */
 #include "ui.h"
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <freertos/queue.h>
 #include <lvgl.h>
 #include <stdio.h>
@@ -135,6 +136,8 @@ lv_obj_t *s_mech_sw_dir = nullptr;
 lv_obj_t *s_tank_overlay = nullptr;
 lv_obj_t *s_tank_ta_name = nullptr;
 lv_obj_t *s_tank_ta_tok = nullptr;
+lv_obj_t *s_tank_sb_gps = nullptr;  // v1.9.0 (A3): food rate g/s (0 = off)
+lv_obj_t *s_tank_sb_hcap = nullptr; // v1.9.0 (D1): hopper size in seconds
 lv_obj_t *s_tank_kb = nullptr;
 uint8_t s_tank_edit_id = 1; // tank being edited (1-based)
 
@@ -177,6 +180,41 @@ char s_tank_names[CATFISH_MAX_TANKS][CATFISH_TANK_NAME_LEN] = {
     "Main", "Tank 2", "Tank 3", "Tank 4"};
 lv_obj_t *s_tank_chip_btns[CATFISH_MAX_TANKS + 1] = {nullptr, nullptr, nullptr,
                                                      nullptr, nullptr}; // + "All"
+
+// ------------------------------------------------------------------ v1.9.0
+// Home: floating vacation badge + food bar inside the relay card
+lv_obj_t *s_lbl_vacation = nullptr;
+lv_obj_t *s_food_home_bar = nullptr;
+lv_obj_t *s_food_home_lbl = nullptr;
+bool s_vacation = false;
+
+// Schedule editor: weekday chips (A1) + per-tank seconds (A2) + presets (A3)
+lv_obj_t *s_ed_days_row = nullptr;
+lv_obj_t *s_ed_day_btn[7] = {nullptr, nullptr, nullptr, nullptr,
+                             nullptr, nullptr, nullptr};
+lv_obj_t *s_ed_secs_row = nullptr; // per-tank overrides (multi-tank only)
+lv_obj_t *s_ed_sec_sb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+
+// History overlay (C1)
+lv_obj_t *s_hist_overlay = nullptr;
+lv_obj_t *s_hist_lbl = nullptr;
+
+// Settings: policy card (F3) + food card (D1)
+lv_obj_t *s_sw_vacation = nullptr;
+lv_obj_t *s_sb_gap = nullptr;
+lv_obj_t *s_sb_max = nullptr;
+lv_obj_t *s_sb_ctch = nullptr;
+lv_obj_t *s_sb_low = nullptr;
+lv_obj_t *s_food_rows = nullptr;
+int s_food_rows_count = -1; // rebuilt when the tank count changes
+uint8_t s_food_pct[CATFISH_MAX_TANKS] = {255, 255, 255, 255};
+uint16_t s_food_used[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
+uint16_t s_food_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
+uint16_t s_food_cap[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
+uint8_t s_food_low = 20;
+
+// countdown target day offset (v1.9.0 A1: weekday masks push feeds days out)
+int s_next_days = 0;
 
 // ---------------------------------------------------------------------------
 // Programmatic-input guard (spinbox event storm fix, v1.8.3).
@@ -271,6 +309,18 @@ void scanTanksCb(lv_event_t *e);
 void tankChipCb(lv_event_t *e);
 void rebuildTankChips();
 void rebuildTankRows();
+// v1.9.0
+void vacationSwitchCb(lv_event_t *e);
+void skipOnceCb(lv_event_t *e);
+void dayChipCb(lv_event_t *e);
+void presetCb(lv_event_t *e);
+void refillCb(lv_event_t *e);
+void policySaveCb(lv_event_t *e);
+void histBtnCb(lv_event_t *e);
+void histCloseCb(lv_event_t *e);
+void rebuildFoodRows();
+void refreshFoodRows();
+const char *fmtDaysMask(uint8_t days, char *buf, size_t cap);
 
 // ---------------------------------------------------------------------------
 // Keyboard helpers (v1.6.1) — shared by the token, MQTT and tank editors
@@ -434,6 +484,17 @@ void addStatusBar(lv_obj_t *parent, int idx) {
   lv_obj_set_style_text_letter_space(title, 3, 0);
   lv_obj_align(title, LV_ALIGN_LEFT_MID, 16, 0);
 
+  // v1.9.0 (A5): floating vacation badge on the HOME screen only (absolute —
+  // outside the flex flow so the centered Home layout is untouched)
+  if (idx == 0) {
+    s_lbl_vacation = lv_label_create(parent);
+    lv_label_set_text(s_lbl_vacation, "VACATION \xE2\x80\xA2 SCHEDULES PAUSED");
+    lv_obj_set_style_text_font(s_lbl_vacation, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_lbl_vacation, lv_color_hex(C_RED), 0);
+    lv_obj_align(s_lbl_vacation, LV_ALIGN_TOP_RIGHT, -14, 52);
+    lv_obj_add_flag(s_lbl_vacation, LV_OBJ_FLAG_HIDDEN);
+  }
+
   lv_obj_t *wf = lv_label_create(bar);
   lv_label_set_text(wf, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_font(wf, &lv_font_montserrat_16, 0);
@@ -553,6 +614,98 @@ void addBtnCb(lv_event_t *e) {
   openEditor();
 }
 
+// ---------------------------------------------------------------------------
+// v1.9.0 feeding-feature callbacks (all enqueue; loop() applies + persists)
+// ---------------------------------------------------------------------------
+/** "Daily" / "Mon-Fri" / "Sat+Sun" / "M,T,F" summary for a weekday mask. */
+const char *fmtDaysMask(uint8_t days, char *buf, size_t cap) {
+  static const char *NAMES[7] = {"M", "T", "W", "T", "F", "S", "S"};
+  if (days == 0 || days == 0x7F) {
+    snprintf(buf, cap, "Daily");
+    return buf;
+  }
+  if (days == 0x1F) {
+    snprintf(buf, cap, "Mon-Fri");
+    return buf;
+  }
+  if (days == 0x60) {
+    snprintf(buf, cap, "Sat+Sun");
+    return buf;
+  }
+  int n = 0;
+  for (int i = 0; i < 7; i++) {
+    if (days & (1u << i)) {
+      n += snprintf(buf + n, (n < (int)cap) ? (cap - n) : 0, "%s%s", n ? "," : "",
+                    NAMES[i]);
+    }
+  }
+  return buf;
+}
+
+void vacationSwitchCb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  UiEvent ev;
+  ev.type = UI_EVT_VACATION;
+  ev.flag = on;
+  uiEventSend(ev);
+  Serial.printf("[UI] vacation -> %s (queued)\n", on ? "ON" : "OFF");
+}
+
+void skipOnceCb(lv_event_t *e) {
+  // user_data packs the HH:MM identity (h<<8 | m); skip-once, then cleared.
+  const uintptr_t packed = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  UiEvent ev;
+  ev.type = UI_EVT_SKIP_NEXT;
+  ev.a = (uint8_t)((packed >> 8) & 0x1F);
+  ev.b = (uint8_t)(packed & 0x3F);
+  uiEventSend(ev);
+}
+
+void dayChipCb(lv_event_t *e) {
+  // visual toggle only; editorSaveCb reads the CHECKED state of every chip
+  lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+  const bool on = lv_obj_has_state(btn, LV_STATE_CHECKED);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(on ? C_AMBER : C_CARD), 0);
+  lv_obj_set_style_text_color(btn, lv_color_hex(on ? C_INK : C_MUTED), 0);
+}
+
+void presetCb(lv_event_t *e) {
+  // A3: S/M/L portion presets -> shared seconds (per-tank overrides untouched)
+  const uintptr_t secs = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  if (s_sb_sec) spinSetValueQuiet(s_sb_sec, (int32_t)secs);
+}
+
+void refillCb(lv_event_t *e) {
+  UiEvent ev;
+  ev.type = UI_EVT_REFILL;
+  ev.a = (uint8_t)(uintptr_t)lv_event_get_user_data(e); // tank 1..4 or 0xFF
+  uiEventSend(ev);
+}
+
+void policySaveCb(lv_event_t *e) {
+  (void)e;
+  UiEvent ev;
+  ev.type = UI_EVT_GUARD_CFG;
+  if (s_sb_gap) ev.a = (uint8_t)lv_spinbox_get_value(s_sb_gap);
+  if (s_sb_max) ev.b = (uint8_t)lv_spinbox_get_value(s_sb_max);
+  if (s_sb_ctch) ev.c = (uint8_t)lv_spinbox_get_value(s_sb_ctch);
+  if (s_sb_low) ev.d = (uint8_t)lv_spinbox_get_value(s_sb_low);
+  uiEventSend(ev); // loop() persists + refreshes the food card
+}
+
+void histBtnCb(lv_event_t *e) {
+  (void)e;
+  if (!s_hist_overlay) return;
+  lv_obj_clear_flag(s_hist_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_hist_overlay);
+}
+
+void histCloseCb(lv_event_t *e) {
+  (void)e;
+  if (s_hist_overlay) lv_obj_add_flag(s_hist_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
 void editorSaveCb(lv_event_t *e) {
   (void)e;
   UiEvent ev;
@@ -569,6 +722,17 @@ void editorSaveCb(lv_event_t *e) {
       mask |= (uint8_t)(1u << i);
   }
   ev.tankMask = mask;
+  // v1.9.0 (A1): weekday mask from the day chips (none checked = daily).
+  uint8_t days = 0;
+  for (int i = 0; i < 7; i++) {
+    if (s_ed_day_btn[i] && lv_obj_has_state(s_ed_day_btn[i], LV_STATE_CHECKED))
+      days |= (uint8_t)(1u << i);
+  }
+  ev.days = days;
+  // v1.9.0 (A2): per-tank pulse overrides (0 = inherit the shared seconds).
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    ev.secTank[i] = s_ed_sec_sb[i] ? (uint8_t)lv_spinbox_get_value(s_ed_sec_sb[i]) : 0;
+  }
   // loop() performs the add: on success it rebuilds the list, closes the
   // editor and toasts; on failure the editor stays open with the reason.
   uiEventSend(ev);
@@ -804,31 +968,65 @@ void rebuildScheduleList() {
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
-    char buf[40];
+    char buf[96];
     char hm[12];
+    char day[24];
     catfishFormatHm(hm, sizeof(hm), en.hour, en.minute, s_hour12);
-    if (s_tank_count > 1) {
-      // P5: append the target-tank tag, e.g. "07:30 • 3 s • T1+T3"
-      char tag[16] = {0};
-      int tl = 0;
-      for (uint8_t b = 0; b < s_tank_count && b < CATFISH_MAX_TANKS; b++) {
-        if (en.tanks & (1u << b)) {
-          tl += snprintf(tag + tl, sizeof(tag) - tl, "%s%u", tl ? "+" : "",
-                         (unsigned)(b + 1));
-        }
+    fmtDaysMask(en.days, day, sizeof(day));
+    // v1.9.0 (A2): per-tank overrides replace the plain tank tag when set.
+    bool hasOverrides = false;
+    char secsTag[40] = {0};
+    int sl = 0;
+    for (uint8_t b = 0; b < s_tank_count && b < CATFISH_MAX_TANKS; b++) {
+      if (en.secTank[b]) {
+        hasOverrides = true;
+        sl += snprintf(secsTag + sl, sizeof(secsTag) - sl, "%sT%u:%us",
+                       sl ? "+" : "", (unsigned)(b + 1),
+                       (unsigned)en.secTank[b]);
       }
-      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  T%s",
-               hm, (unsigned)en.seconds, tag[0] ? tag : "1");
+    }
+    if (s_tank_count > 1) {
+      if (hasOverrides) {
+        snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  %s  \xE2\x80\xA2  %s",
+                 hm, (unsigned)en.seconds, secsTag, day);
+      } else {
+        char tag[16] = {0};
+        int tl = 0;
+        for (uint8_t b = 0; b < s_tank_count && b < CATFISH_MAX_TANKS; b++) {
+          if (en.tanks & (1u << b)) {
+            tl += snprintf(tag + tl, sizeof(tag) - tl, "%s%u", tl ? "+" : "",
+                           (unsigned)(b + 1));
+          }
+        }
+        snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  T%s  \xE2\x80\xA2  %s",
+                 hm, (unsigned)en.seconds, tag[0] ? tag : "1", day);
+      }
     } else {
-      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s", hm,
-               (unsigned)en.seconds);
+      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  %s", hm,
+               (unsigned)en.seconds, day);
     }
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, buf);
-    lv_obj_set_style_text_font(tl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(tl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(tl,
                                 lv_color_hex(en.enabled ? C_TEXT : C_MUTED), 0);
     lv_obj_set_flex_grow(tl, 1);
+
+    // v1.9.0 (E4): skip-this-entry-once button
+    lv_obj_t *skip = lv_btn_create(card);
+    lv_obj_set_size(skip, 56, 56);
+    lv_obj_set_style_radius(skip, 12, 0);
+    lv_obj_set_style_bg_color(skip, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_bg_color(skip, lv_color_hex(C_CARD_HI), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(skip, 0, 0);
+    lv_obj_set_style_shadow_width(skip, 0, 0);
+    lv_obj_t *si = lv_label_create(skip);
+    lv_label_set_text(si, LV_SYMBOL_MINUS); // "skip once"
+    lv_obj_set_style_text_color(si, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_text_font(si, &lv_font_montserrat_20, 0);
+    lv_obj_center(si);
+    lv_obj_add_event_cb(skip, skipOnceCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)((en.hour << 8) | en.minute));
 
     lv_obj_t *sw = lv_switch_create(card);
     lv_obj_set_size(sw, 72, 36);
@@ -860,6 +1058,26 @@ void openEditor() {
   lv_roller_set_selected(s_r_hour, 7, LV_ANIM_OFF);
   lv_roller_set_selected(s_r_min, 30, LV_ANIM_OFF);
   spinSetValueQuiet(s_sb_sec, prefs::getDefaultPulse());
+
+  // v1.9.0 (A1): all day chips checked = daily (the default)
+  for (int i = 0; i < 7; i++) {
+    if (s_ed_day_btn[i]) {
+      lv_obj_add_state(s_ed_day_btn[i], LV_STATE_CHECKED);
+      lv_obj_set_style_bg_color(s_ed_day_btn[i], lv_color_hex(C_AMBER), 0);
+      lv_obj_set_style_text_color(s_ed_day_btn[i], lv_color_hex(C_INK), 0);
+    }
+  }
+  // v1.9.0 (A2): clear the per-tank pulse overrides
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    if (s_ed_sec_sb[i]) spinSetValueQuiet(s_ed_sec_sb[i], 0);
+  }
+  // v1.9.0 (A2): show the per-tank row only in multi-tank setups
+  if (s_ed_secs_row) {
+    if (s_tank_count > 1)
+      lv_obj_clear_flag(s_ed_secs_row, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(s_ed_secs_row, LV_OBJ_FLAG_HIDDEN);
+  }
 
   // P5: rebuild the tank checkbox column for the current count (all checked
   // = "feed every configured tank"; hidden entirely for a single tank).
@@ -1015,6 +1233,27 @@ void buildHome() {
   lv_obj_set_style_text_color(s_relay_txt, lv_color_hex(C_TEXT), 0);
   lv_obj_set_flex_grow(s_relay_txt, 1);
   lv_label_set_long_mode(s_relay_txt, LV_LABEL_LONG_WRAP);
+
+  // v1.9.0 (D1): food-level bar for the selected tank (hidden until a hopper
+  // capacity is configured — the estimator needs "hopper size" in Settings)
+  lv_obj_t *frow = lv_obj_create(card_relay);
+  lv_obj_remove_style_all(frow);
+  lv_obj_set_size(frow, lv_pct(100), 30);
+  lv_obj_set_flex_flow(frow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(frow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(frow, 8, 0);
+  lv_obj_clear_flag(frow, LV_OBJ_FLAG_SCROLLABLE);
+  s_food_home_bar = lv_bar_create(frow);
+  lv_obj_set_size(s_food_home_bar, lv_pct(70), 14);
+  lv_bar_set_range(s_food_home_bar, 0, 100);
+  lv_bar_set_value(s_food_home_bar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(s_food_home_bar, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_color(s_food_home_bar, lv_color_hex(C_AMBER), LV_PART_INDICATOR);
+  s_food_home_lbl = lv_label_create(frow);
+  lv_label_set_text(s_food_home_lbl, "Food: --");
+  lv_obj_set_style_text_font(s_food_home_lbl, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(s_food_home_lbl, lv_color_hex(C_MUTED), 0);
 }
 
 void buildSchedule() {
@@ -1035,9 +1274,21 @@ void buildSchedule() {
   lv_obj_set_flex_flow(s_sched_list, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(s_sched_list, 12, 0);
 
-  // ADD FEEDING TIME button (pinned below the list)
-  lv_obj_t *add = makeBtn(c, LV_SYMBOL_PLUS "  ADD FEEDING TIME", C_CARD,
-                          C_AMBER, C_CARD_HI, lv_pct(100), 64);
+  // v1.9.0 (C1) + ADD: button row (pinned below the list)
+  lv_obj_t *btnrow = lv_obj_create(c);
+  lv_obj_remove_style_all(btnrow);
+  lv_obj_set_width(btnrow, lv_pct(100));
+  lv_obj_set_height(btnrow, 64);
+  lv_obj_set_flex_flow(btnrow, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btnrow, 12, 0);
+  lv_obj_clear_flag(btnrow, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *hist = makeBtn(btnrow, LV_SYMBOL_LIST "  HISTORY", C_CARD,
+                           C_TEXT, C_CARD_HI, lv_pct(34), 64);
+  lv_obj_add_event_cb(hist, histBtnCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *add = makeBtn(btnrow, LV_SYMBOL_PLUS "  ADD FEEDING TIME", C_CARD,
+                          C_AMBER, C_CARD_HI, lv_pct(66), 64);
   lv_obj_set_style_border_color(add, lv_color_hex(C_AMBER), 0);
   lv_obj_set_style_border_width(add, 2, 0);
   lv_obj_add_event_cb(add, addBtnCb, LV_EVENT_CLICKED, nullptr);
@@ -1054,10 +1305,12 @@ void buildSchedule() {
   lv_obj_add_flag(s_editor, LV_OBJ_FLAG_CLICKABLE); // swallow clicks behind
   lv_obj_add_flag(s_editor, LV_OBJ_FLAG_HIDDEN);
 
-  lv_obj_t *card = makeCard(s_editor, 720, 330);
-  lv_obj_center(card);
+  lv_obj_t *card = makeCard(s_editor, 736, 336);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 12);
   lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(card, 12, 0);
+  lv_obj_set_style_pad_row(card, 8, 0);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE); // v1.9.0: richer editor scrolls
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
 
   lv_obj_t *title = lv_label_create(card);
   lv_label_set_text(title, "NEW FEEDING TIME");
@@ -1107,12 +1360,94 @@ void buildSchedule() {
   lv_obj_set_style_text_color(ls, lv_color_hex(C_MUTED), 0);
   s_sb_sec = makeSpinRow(col_s, 1, 30, prefs::getDefaultPulse(), nullptr);
 
+  // v1.9.0 (A3): portion presets S/M/L under the seconds spinbox
+  lv_obj_t *preset_row = lv_obj_create(col_s);
+  lv_obj_remove_style_all(preset_row);
+  lv_obj_set_size(preset_row, LV_SIZE_CONTENT, 40);
+  lv_obj_set_flex_flow(preset_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(preset_row, 6, 0);
+  lv_obj_clear_flag(preset_row, LV_OBJ_FLAG_SCROLLABLE);
+  static const char *PRESETS[3] = {"S", "M", "L"};
+  static const int32_t PRESET_S[3] = {2, 5, 10};
+  for (int i = 0; i < 3; i++) {
+    lv_obj_t *p = makeBtn(preset_row, PRESETS[i], C_CARD, C_MUTED, C_CARD_HI,
+                          44, 40);
+    lv_obj_add_event_cb(p, presetCb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)PRESET_S[i]);
+  }
+
   // P5: tank checkboxes column (rebuilt for the current count at openEditor)
   s_ed_tank_row = lv_obj_create(editors);
   lv_obj_remove_style_all(s_ed_tank_row);
   lv_obj_set_size(s_ed_tank_row, 132, LV_SIZE_CONTENT);
   lv_obj_set_flex_flow(s_ed_tank_row, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(s_ed_tank_row, 4, 0);
+
+  // v1.9.0 (A1): weekday chips — full width row under the rollers
+  lv_obj_t *days_wrap = lv_obj_create(card);
+  lv_obj_remove_style_all(days_wrap);
+  lv_obj_set_width(days_wrap, lv_pct(100));
+  lv_obj_set_height(days_wrap, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(days_wrap, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(days_wrap, 4, 0);
+  lv_obj_clear_flag(days_wrap, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *ld = lv_label_create(days_wrap);
+  lv_label_set_text(ld, "DAYS");
+  lv_obj_set_style_text_font(ld, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(ld, lv_color_hex(C_MUTED), 0);
+  s_ed_days_row = lv_obj_create(days_wrap);
+  lv_obj_remove_style_all(s_ed_days_row);
+  lv_obj_set_size(s_ed_days_row, lv_pct(100), 48);
+  lv_obj_set_flex_flow(s_ed_days_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(s_ed_days_row, 6, 0);
+  lv_obj_set_flex_align(s_ed_days_row, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(s_ed_days_row, LV_OBJ_FLAG_SCROLLABLE);
+  static const char *DAY_LETTERS[7] = {"M", "T", "W", "T", "F", "S", "S"};
+  for (int i = 0; i < 7; i++) {
+    lv_obj_t *chip = makeBtn(s_ed_days_row, DAY_LETTERS[i], C_AMBER, C_INK,
+                             C_CARD_HI, 72, 48);
+    lv_obj_add_state(chip, LV_STATE_CHECKED); // daily by default
+    lv_obj_add_event_cb(chip, dayChipCb, LV_EVENT_CLICKED, nullptr);
+    s_ed_day_btn[i] = chip;
+  }
+
+  // v1.9.0 (A2): per-tank seconds overrides (visible in multi-tank setups)
+  lv_obj_t *sec_wrap = lv_obj_create(card);
+  lv_obj_remove_style_all(sec_wrap);
+  lv_obj_set_width(sec_wrap, lv_pct(100));
+  lv_obj_set_height(sec_wrap, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(sec_wrap, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(sec_wrap, 4, 0);
+  lv_obj_clear_flag(sec_wrap, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *lost = lv_label_create(sec_wrap);
+  lv_label_set_text(lost, "PER-TANK SECONDS (0 = same for all)");
+  lv_obj_set_style_text_font(lost, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(lost, lv_color_hex(C_MUTED), 0);
+  s_ed_secs_row = lv_obj_create(sec_wrap);
+  lv_obj_remove_style_all(s_ed_secs_row);
+  lv_obj_set_size(s_ed_secs_row, lv_pct(100), 64);
+  lv_obj_set_flex_flow(s_ed_secs_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(s_ed_secs_row, 10, 0);
+  lv_obj_set_flex_align(s_ed_secs_row, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(s_ed_secs_row, LV_OBJ_FLAG_SCROLLABLE);
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    lv_obj_t *cell = lv_obj_create(s_ed_secs_row);
+    lv_obj_remove_style_all(cell);
+    lv_obj_set_size(cell, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(cell, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(cell, 2, 0);
+    lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *lab = lv_label_create(cell);
+    lv_label_set_text_fmt(lab, "T%u", (unsigned)(i + 1));
+    lv_obj_set_style_text_font(lab, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lab, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lab, 110);
+    lv_obj_t *sb = makeSpinbox(cell, 0, 30, 0, 110, 48);
+    s_ed_sec_sb[i] = sb;
+  }
 
   lv_obj_t *btns = lv_obj_create(card);
   lv_obj_remove_style_all(btns);
@@ -1131,6 +1466,38 @@ void buildSchedule() {
                              C_CARD_HI, 100, 64);
   lv_obj_set_flex_grow(cancel, 1);
   lv_obj_add_event_cb(cancel, editorCancelCb, LV_EVENT_CLICKED, nullptr);
+
+  // --- v1.9.0 (C1): history overlay (hidden; content pushed via ui_set_history)
+  s_hist_overlay = lv_obj_create(s_scr[1]);
+  lv_obj_remove_style_all(s_hist_overlay);
+  lv_obj_set_size(s_hist_overlay, lv_pct(100), 360);
+  lv_obj_align(s_hist_overlay, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_set_style_bg_color(s_hist_overlay, lv_color_hex(C_BG), 0);
+  lv_obj_set_style_bg_opa(s_hist_overlay, LV_OPA_90, 0);
+  lv_obj_add_flag(s_hist_overlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(s_hist_overlay, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *hcard = makeCard(s_hist_overlay, 736, 336);
+  lv_obj_align(hcard, LV_ALIGN_TOP_MID, 0, 12);
+  lv_obj_set_flex_flow(hcard, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(hcard, 8, 0);
+
+  lv_obj_t *htitle = lv_label_create(hcard);
+  lv_label_set_text(htitle, "FEED HISTORY (latest 24)");
+  lv_obj_set_style_text_font(htitle, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(htitle, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(htitle, 2, 0);
+
+  s_hist_lbl = lv_label_create(hcard);
+  lv_label_set_text(s_hist_lbl, "No feed events yet.");
+  lv_obj_set_style_text_font(s_hist_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_hist_lbl, lv_color_hex(C_TEXT), 0);
+  lv_label_set_long_mode(s_hist_lbl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(s_hist_lbl, lv_pct(100));
+
+  lv_obj_t *hclose = makeBtn(hcard, LV_SYMBOL_CLOSE "  Close", C_CARD, C_MUTED,
+                             C_CARD_HI, lv_pct(100), 60);
+  lv_obj_add_event_cb(hclose, histCloseCb, LV_EVENT_CLICKED, nullptr);
 }
 
 void buildSettings() {
@@ -1163,6 +1530,96 @@ void buildSettings() {
   lv_obj_set_style_text_color(lbl_p, lv_color_hex(C_TEXT), 0);
   lv_obj_set_flex_grow(lbl_p, 1);
   s_sb_pulse = makeSpinRow(card_feed, 1, 30, prefs::getDefaultPulse(), pulseSpinCb);
+
+  // -- v1.9.0 (A5/F3): Feeding policy card (vacation + guards + catch-up)
+  lv_obj_t *card_pol = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_pol, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_pol, 10, 0);
+
+  lv_obj_t *row_vac = lv_obj_create(card_pol);
+  lv_obj_remove_style_all(row_vac);
+  lv_obj_set_width(row_vac, lv_pct(100));
+  lv_obj_set_height(row_vac, 44);
+  lv_obj_set_flex_flow(row_vac, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row_vac, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row_vac, 12, 0);
+  lv_obj_clear_flag(row_vac, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *lbl_vac = lv_label_create(row_vac);
+  lv_label_set_text(lbl_vac, "Vacation (pause feeding)");
+  lv_obj_set_style_text_font(lbl_vac, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_vac, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(lbl_vac, 1);
+  s_sw_vacation = lv_switch_create(row_vac);
+  lv_obj_set_size(s_sw_vacation, 72, 36);
+  if (prefs::getVacation()) lv_obj_add_state(s_sw_vacation, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(s_sw_vacation, vacationSwitchCb, LV_EVENT_VALUE_CHANGED,
+                      nullptr);
+
+  lv_obj_t *hint_pol = lv_label_create(card_pol);
+  lv_label_set_text(
+      hint_pol,
+      "Vacation pauses scheduled/catch-up/remote feeds (on-device button stays live).");
+  lv_obj_set_style_text_font(hint_pol, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint_pol, lv_color_hex(C_MUTED), 0);
+
+  lv_obj_t *pol_grid = lv_obj_create(card_pol);
+  lv_obj_remove_style_all(pol_grid);
+  lv_obj_set_width(pol_grid, lv_pct(100));
+  lv_obj_set_height(pol_grid, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(pol_grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_style_pad_column(pol_grid, 24, 0);
+  lv_obj_set_style_pad_row(pol_grid, 8, 0);
+  lv_obj_clear_flag(pol_grid, LV_OBJ_FLAG_SCROLLABLE);
+
+  auto makePolicyCol = [&](const char *title, int32_t mn, int32_t mx,
+                           int32_t val, lv_obj_t **out) {
+    lv_obj_t *col = lv_obj_create(pol_grid);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 4, 0);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *t = lv_label_create(col);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(C_MUTED), 0);
+    *out = makeSpinRow(col, mn, mx, val, nullptr);
+  };
+  makePolicyCol("MIN GAP (MIN)", 0, 240, prefs::getMinGapMin(), &s_sb_gap);
+  makePolicyCol("MAX FEEDS/DAY", 0, 50, prefs::getMaxFeedsDay(), &s_sb_max);
+  makePolicyCol("CATCH-UP (MIN)", 0, 120, prefs::getCatchupWin(), &s_sb_ctch);
+  makePolicyCol("LOW FOOD (%)", 5, 90, prefs::getHopperLowPct(), &s_sb_low);
+
+  lv_obj_t *pol_save =
+      makeBtn(card_pol, LV_SYMBOL_OK "  Save policy", C_CARD, C_AMBER,
+              C_CARD_HI, lv_pct(100), 60);
+  lv_obj_set_style_border_color(pol_save, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(pol_save, 2, 0);
+  lv_obj_add_event_cb(pol_save, policySaveCb, LV_EVENT_CLICKED, nullptr);
+
+  // -- v1.9.0 (D1): Food level card (per-tank estimator + refill)
+  lv_obj_t *card_food = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_food, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_food, 8, 0);
+  makeTitle(card_food, "FOOD LEVEL");
+  lv_obj_t *hint_food = lv_label_create(card_food);
+  lv_label_set_text(
+      hint_food,
+      "Estimated from fed seconds. Set \"Hopper size\" per tank (Settings > TANKS edit).");
+  lv_obj_set_style_text_font(hint_food, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint_food, lv_color_hex(C_MUTED), 0);
+  s_food_rows = lv_obj_create(card_food);
+  lv_obj_remove_style_all(s_food_rows);
+  lv_obj_set_width(s_food_rows, lv_pct(100));
+  lv_obj_set_height(s_food_rows, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(s_food_rows, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_food_rows, 6, 0);
+  lv_obj_t *refill_all =
+      makeBtn(card_food, LV_SYMBOL_REFRESH "  Refill all", C_CARD, C_AMBER,
+              C_CARD_HI, lv_pct(100), 60);
+  lv_obj_add_event_cb(refill_all, refillCb, LV_EVENT_CLICKED,
+                      (void *)(uintptr_t)0xFF);
 
   // -- Display card (backlight + clock format rows)
   lv_obj_t *card_disp = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
@@ -1412,7 +1869,7 @@ void updateNextFeedUi() {
   tgt.tm_hour = s_next_hour;
   tgt.tm_min = s_next_minute;
   tgt.tm_sec = 0;
-  if (s_next_tomorrow) tgt.tm_mday += 1;
+  tgt.tm_mday += s_next_days; // v1.9.0 (A1): weekday masks push feeds days out
   const time_t tt = mktime(&tgt);
 
   long diff = (long)difftime(tt, now);
@@ -1433,7 +1890,11 @@ void updateNextFeedUi() {
     snprintf(sub, sizeof(sub), "in <1 m");
 
   char val[24];
-  if (s_next_tomorrow) {
+  if (s_next_days >= 2) {
+    char hm[12];
+    catfishFormatHm(hm, sizeof(hm), s_next_hour, s_next_minute, s_hour12);
+    snprintf(val, sizeof(val), "T+%dd %s", (int)s_next_days, hm);
+  } else if (s_next_tomorrow) {
     char hm[12];
     catfishFormatHm(hm, sizeof(hm), s_next_hour, s_next_minute, s_hour12);
     snprintf(val, sizeof(val), "Tmrw %s", hm);
@@ -1931,6 +2392,9 @@ void tankSaveCb(lv_event_t *e) {
   ev.a = s_tank_edit_id; // 1-based tank id
   strlcpy(ev.tankName, name, sizeof(ev.tankName));
   strlcpy(ev.token, lv_textarea_get_text(s_tank_ta_tok), sizeof(ev.token));
+  // v1.9.0 (A3/D1): per-tank food rate + hopper capacity
+  if (s_tank_sb_gps) ev.tankGps = (uint16_t)lv_spinbox_get_value(s_tank_sb_gps);
+  if (s_tank_sb_hcap) ev.tankHcap = (uint16_t)lv_spinbox_get_value(s_tank_sb_hcap);
   if (uiEventSend(ev)) closeTankOverlay(); // loop persists + rebuilds
 }
 
@@ -1986,6 +2450,43 @@ void buildTankOverlay() {
   s_tank_ta_tok = makeTa(card, "token override (optional)", true,
                          CATFISH_TOKEN_LEN - 1);
 
+  // v1.9.0 (A3/D1): food rate + hopper size (drive grams display + estimator)
+  lv_obj_t *num_row = lv_obj_create(card);
+  lv_obj_remove_style_all(num_row);
+  lv_obj_set_width(num_row, lv_pct(100));
+  lv_obj_set_height(num_row, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(num_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(num_row, 24, 0);
+  lv_obj_clear_flag(num_row, LV_OBJ_FLAG_SCROLLABLE);
+  {
+    lv_obj_t *col = lv_obj_create(num_row);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 4, 0);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *t = lv_label_create(col);
+    lv_label_set_text(t, "FOOD RATE (G/S, 0 = OFF)");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(C_MUTED), 0);
+    s_tank_sb_gps = makeSpinRow(col, 0, 100, 0, nullptr);
+  }
+  {
+    lv_obj_t *col = lv_obj_create(num_row);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 4, 0);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *t = lv_label_create(col);
+    lv_label_set_text(t, "HOPPER SIZE (SECONDS OF FEED)");
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(C_MUTED), 0);
+    // 5-digit spinbox: up to 60000 s (~16 h of pulse) is far beyond any hopper
+    s_tank_sb_hcap = makeSpinRow(col, 0, 60000, 0, nullptr);
+    lv_spinbox_set_digit_format(s_tank_sb_hcap, 5, 0);
+  }
+
   lv_obj_t *btns = lv_obj_create(card);
   lv_obj_remove_style_all(btns);
   lv_obj_set_width(btns, lv_pct(100));
@@ -2020,6 +2521,10 @@ void openTankOverlay(uint8_t tank1) {
   s_tank_edit_id = tank1;
   lv_textarea_set_text(s_tank_ta_name, s_tank_names[tank1 - 1]);
   lv_textarea_set_text(s_tank_ta_tok, prefs::getTankToken(tank1).c_str());
+  // v1.9.0 (A3/D1): prefill food rate + hopper capacity
+  if (s_tank_sb_gps) spinSetValueQuiet(s_tank_sb_gps, prefs::getTankGps(tank1));
+  if (s_tank_sb_hcap)
+    spinSetValueQuiet(s_tank_sb_hcap, prefs::getTankHopperCap(tank1));
   lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_tank_overlay);
@@ -2122,6 +2627,138 @@ void rebuildTankRows() {
                              56, 56);
     lv_obj_add_event_cb(edit, tankEditCb, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)(i + 1));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.9.0 (D1): food-level rows (Settings > FOOD) + Home relay-card bar
+// ---------------------------------------------------------------------------
+void rebuildFoodRows() {
+  if (!s_food_rows) return;
+  lv_obj_clean(s_food_rows);
+  s_food_rows_count = s_tank_count;
+  for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+    lv_obj_t *row = lv_obj_create(s_food_rows);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 52);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *name = lv_label_create(row);
+    lv_label_set_text(name, s_tank_names[i]);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_width(name, 110);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *bar = lv_bar_create(row);
+    lv_obj_set_size(bar, lv_pct(45), 14);
+    lv_bar_set_range(bar, 0, 100);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(C_BG_DARK), 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(C_AMBER), LV_PART_INDICATOR);
+    lv_obj_add_state(bar, LV_STATE_DISABLED); // styled below via custom color
+
+    lv_obj_t *pct = lv_label_create(row);
+    lv_label_set_text(pct, "--");
+    lv_obj_set_style_text_font(pct, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pct, lv_color_hex(C_MUTED), 0);
+
+    lv_obj_t *used = lv_label_create(row);
+    lv_label_set_text(used, "");
+    lv_obj_set_style_text_font(used, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(used, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_flex_grow(used, 1);
+
+    lv_obj_t *ref = makeBtn(row, LV_SYMBOL_REFRESH, C_CARD, C_AMBER,
+                            C_CARD_HI, 48, 48);
+    lv_obj_add_event_cb(ref, refillCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)(i + 1));
+
+    // stash per-row widget refs (data pointers via lv_obj_set_user_data)
+    lv_obj_set_user_data(bar, pct);
+    lv_obj_set_user_data(pct, used);
+  }
+  refreshFoodRows();
+}
+
+void refreshFoodRows() {
+  if (!s_food_rows || lv_obj_get_child_cnt(s_food_rows) == 0) return;
+  bool anyKnown = false;
+  for (uint8_t i = 0; i < s_food_rows_count && i < CATFISH_MAX_TANKS; i++) {
+    const int idx = i;
+    lv_obj_t *bar = lv_obj_get_child(s_food_rows, idx);
+    if (!bar) continue;
+    lv_obj_t *pct = (lv_obj_t *)lv_obj_get_user_data(bar);
+    lv_obj_t *used = pct ? (lv_obj_t *)lv_obj_get_user_data(pct) : nullptr;
+    const uint8_t p = s_food_pct[i];
+    char buf[40];
+    if (p == 255) {
+      if (bar) {
+        lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(C_BG_DARK),
+                                  LV_PART_INDICATOR);
+      }
+      if (pct) lv_label_set_text(pct, "set size");
+      if (used) lv_label_set_text(used, "");
+    } else {
+      anyKnown = true;
+      if (bar) {
+        lv_bar_set_value(bar, p, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(bar,
+                                  lv_color_hex(p < s_food_low ? C_RED : C_AMBER),
+                                  LV_PART_INDICATOR);
+      }
+      if (pct) {
+        snprintf(buf, sizeof(buf), "%u%%%s", (unsigned)p,
+                 (p < s_food_low) ? " LOW" : "");
+        lv_obj_set_style_text_color(
+            pct, lv_color_hex(p < s_food_low ? C_RED : C_TEXT), 0);
+        lv_label_set_text(pct, buf);
+      }
+      if (used) {
+        if (s_food_gps[i] > 0 && s_food_cap[i] > s_food_used[i]) {
+          const uint32_t g = ((uint32_t)(s_food_cap[i] - s_food_used[i]) *
+                              s_food_gps[i]);
+          snprintf(buf, sizeof(buf), "~%lu g left", (unsigned long)g);
+        } else if (s_food_used[i] > 0) {
+          snprintf(buf, sizeof(buf), "%lu s fed", (unsigned long)s_food_used[i]);
+        } else {
+          buf[0] = '\0';
+        }
+        lv_label_set_text(used, buf);
+      }
+    }
+  }
+  // Home relay-card bar: selected tank, or the lowest known configured tank
+  if (s_food_home_bar && s_food_home_lbl) {
+    if (!anyKnown) {
+      lv_obj_add_flag(s_food_home_bar, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(s_food_home_lbl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_clear_flag(s_food_home_bar, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(s_food_home_lbl, LV_OBJ_FLAG_HIDDEN);
+      uint8_t p = 255;
+      if (s_sel_tank != 0xFE && s_sel_tank < CATFISH_MAX_TANKS) {
+        p = s_food_pct[s_sel_tank];
+      } else {
+        for (uint8_t i = 0; i < s_food_rows_count && i < CATFISH_MAX_TANKS;
+             i++) {
+          if (s_food_pct[i] != 255 && (p == 255 || s_food_pct[i] < p))
+            p = s_food_pct[i];
+        }
+      }
+      if (p == 255) p = 0;
+      lv_bar_set_value(s_food_home_bar, p, LV_ANIM_OFF);
+      lv_obj_set_style_bg_color(
+          s_food_home_bar, lv_color_hex(p < s_food_low ? C_RED : C_AMBER),
+          LV_PART_INDICATOR);
+      char buf[24];
+      snprintf(buf, sizeof(buf), "Food: %u%%", (unsigned)p);
+      lv_label_set_text(s_food_home_lbl, buf);
+    }
   }
 }
 
@@ -2269,9 +2906,10 @@ void ui_set_next_feed(const String &text) {
   if (s_next_sub) lv_label_set_text(s_next_sub, "");
 }
 
-void ui_set_next_feed_time(int hour, int minute, bool tomorrow, bool valid) {
+void ui_set_next_feed_time(int hour, int minute, uint8_t daysAhead, bool valid) {
   s_next_valid = valid;
-  s_next_tomorrow = tomorrow;
+  s_next_tomorrow = (daysAhead > 0);
+  s_next_days = daysAhead;
   s_next_hour = hour;
   s_next_minute = minute;
   s_val_cache[0] = '\0';
@@ -2484,6 +3122,106 @@ void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz) {
   }
   lv_label_set_text(s_lbl_mech, buf);
   lv_obj_set_style_text_color(s_lbl_mech, lv_color_hex(C_TEXT), 0);
+}
+
+// ------------------------------------------------------------------ v1.9.0
+void ui_set_vacation(bool on) {
+  s_vacation = on;
+  if (s_lbl_vacation) {
+    if (on)
+      lv_obj_clear_flag(s_lbl_vacation, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(s_lbl_vacation, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (s_sw_vacation) {
+    if (on)
+      lv_obj_add_state(s_sw_vacation, LV_STATE_CHECKED);
+    else
+      lv_obj_clear_state(s_sw_vacation, LV_STATE_CHECKED);
+  }
+}
+
+void ui_set_food(uint8_t count, const uint8_t pct[CATFISH_MAX_TANKS],
+                 const uint16_t usedSec[CATFISH_MAX_TANKS],
+                 const uint16_t gps[CATFISH_MAX_TANKS],
+                 const uint16_t capSec[CATFISH_MAX_TANKS], uint8_t lowPct) {
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  bool changed = false;
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    const uint8_t srcIdx = (i < count) ? i : CATFISH_MAX_TANKS - 1;
+    (void)srcIdx;
+    if (pct[i] != s_food_pct[i]) changed = true;
+    s_food_pct[i] = pct[i];
+    s_food_used[i] = usedSec[i];
+    s_food_gps[i] = gps[i];
+    s_food_cap[i] = capSec[i];
+  }
+  s_food_low = lowPct;
+  // rebuild rows when the tank count changed (row layout is per count)
+  if (s_food_rows && s_food_rows_count != count) {
+    // keep the current tank names in sync via s_tank_names (ui_tanks_rebuild)
+    rebuildFoodRows();
+    changed = true;
+  }
+  if (changed || s_food_rows_count == count) refreshFoodRows();
+}
+
+void ui_set_history(const String &json) {
+  if (!s_hist_lbl) return;
+  if (json.length() < 3) {
+    lv_label_set_text(s_hist_lbl, "No feed events yet.");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, json) != DeserializationError::Ok ||
+      !doc.is<JsonArray>()) {
+    lv_label_set_text(s_hist_lbl, "No feed events yet.");
+    return;
+  }
+  String out;
+  int n = 0;
+  for (JsonObject o : doc.as<JsonArray>()) {
+    const uint32_t e = (uint32_t)(o["e"] | 0);
+    const uint8_t m = (uint8_t)(o["m"] | 1);
+    const uint8_t s = (uint8_t)(o["s"] | 0);
+    const bool ok = ((o["ok"] | 0) != 0);
+    const uint8_t f = (uint8_t)(o["f"] | 0);
+    const time_t t = (time_t)e;
+    struct tm lt;
+    char when[24] = "--/-- --:--";
+    if (e != 0 && localtime_r(&t, &lt)) {
+      snprintf(when, sizeof(when), "%02d-%02d %02d:%02d", lt.tm_mon + 1,
+               lt.tm_mday, lt.tm_hour, lt.tm_min);
+    }
+    char tanks[20] = {0};
+    int ti = 0;
+    for (uint8_t b = 0; b < CATFISH_MAX_TANKS; b++) {
+      if (m & (1u << b))
+        ti += snprintf(tanks + ti, sizeof(tanks) - ti, "%s%u", ti ? "+" : "",
+                       (unsigned)(b + 1));
+    }
+    const char *flag = "";
+    switch (f) {
+      case 1: flag = " manual"; break;
+      case 2: flag = " catch-up"; break;
+      case 3: flag = " retry"; break;
+      case 4: flag = " VERIFY"; break;
+      case 5: flag = " blocked"; break;
+      case 6: flag = " skipped"; break;
+      default: break;
+    }
+    char line[64];
+    if (ok)
+      snprintf(line, sizeof(line), "%s  OK   T%s  %us%s\n", when,
+               tanks[0] ? tanks : "1", (unsigned)s, flag);
+    else
+      snprintf(line, sizeof(line), "%s  FAIL T%s  %us%s\n", when,
+               tanks[0] ? tanks : "1", (unsigned)s, flag);
+    out += line;
+    if (++n >= 24) break;
+  }
+  lv_label_set_text(s_hist_lbl, out.length() ? out.c_str() : "No feed events yet.");
 }
 
 } // namespace ui

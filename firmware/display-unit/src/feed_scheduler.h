@@ -30,7 +30,26 @@ struct FeedTime {
   uint8_t seconds; // feed pulse duration 1..30 s
   uint8_t tanks;   // P5: target-tank bitmask (bit 0 = tank 1). 0 loads as 1
                    // (legacy blobs) and is clamped back to 1 when stored.
+  // v1.9.0: weekday mask, bit0=Mon .. bit5=Sat, bit6=Sun. 0x7F = every day
+  // (default; legacy blobs and absent JSON key load as every-day).
+  uint8_t days = 0x7F;
+  // v1.9.0: per-tank pulse override in seconds (0 = use the shared `seconds`).
+  uint8_t secTank[4] = {0, 0, 0, 0};
 };
+
+/** v1.9.0: seconds actually fed to @p tank1 (1-based) for an entry. */
+inline uint8_t entrySecondsForTank(const FeedTime &e, uint8_t tank1) {
+  const int i = (int)tank1 - 1;
+  if (i < 0 || i >= 4 || e.secTank[i] == 0) return e.seconds;
+  return e.secTank[i];
+}
+
+/** v1.9.0: true when the entry is scheduled on the given localtime weekday
+ *  (struct tm tm_wday: 0 = Sunday .. 6 = Saturday). Pure helper. */
+inline bool entryCoversWday(const FeedTime &e, int wday) {
+  const uint8_t dayBit = (wday == 0) ? (uint8_t)0x40 : (uint8_t)(1u << (wday - 1));
+  return (e.days & dayBit) != 0;
+}
 
 /**
  * P5: restrict an entry's tank mask to the configured tanks.
@@ -43,6 +62,29 @@ inline uint8_t effectiveTankMask(const FeedTime &e, uint8_t tankCount) {
   const uint8_t allowed = (tankCount == 0) ? 0 : (uint8_t)((1u << tankCount) - 1u);
   const uint8_t m = e.tanks & allowed;
   return m ? m : (uint8_t)0x01;
+}
+
+/**
+ * v1.9.0 (E3): true when any two ENABLED entries that share at least one
+ * weekday fire closer together than @p gapMin minutes (circular distance
+ * over midnight). Pure helper (host-tested); the UI surfaces a warning.
+ */
+inline bool hasNearDuplicate(const FeedTime *entries, int count, int gapMin) {
+  if (!entries || gapMin <= 0) return false;
+  for (int i = 0; i < count; i++) {
+    if (!entries[i].enabled) continue;
+    for (int j = i + 1; j < count; j++) {
+      if (!entries[j].enabled) continue;
+      if ((entries[i].days & entries[j].days) == 0) continue; // never same day
+      const int a = entries[i].hour * 60 + entries[i].minute;
+      const int b = entries[j].hour * 60 + entries[j].minute;
+      int dist = a - b;
+      if (dist < 0) dist = -dist;
+      if (dist > 12 * 60) dist = 24 * 60 - dist; // wrap over midnight
+      if (dist < gapMin) return true;
+    }
+  }
+  return false;
 }
 
 namespace feed_scheduler {
@@ -119,10 +161,11 @@ FeedTime tick();
 
 struct NextFeed {
   bool valid;      // false when time not synced or no enabled entries
-  bool tomorrow;   // next occurrence is tomorrow (no more today)
+  bool tomorrow;   // next occurrence is NOT today
   uint8_t hour;
   uint8_t minute;
   uint8_t seconds;
+  uint8_t daysAhead; // v1.9.0: 0 = today, 1..7 = days into the future
 };
 
 /** Next enabled feeding (today or tomorrow) for UI display. */

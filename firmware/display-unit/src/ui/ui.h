@@ -48,6 +48,10 @@ enum UiEventType : uint8_t {
   UI_EVT_TANK_CFG,      // P5: tank saved (a=tank id 1-based, tankName/tankToken valid)
   UI_EVT_SCAN_TANKS,    // P5: "Scan for relays" pressed
   UI_EVT_RF_FEED,       // v1.8.0: wireless node feed (a=seconds, 0 = default pulse; tankMask; from net_espnow/net_rf24 tasks)
+  UI_EVT_VACATION,      // v1.9.0 (A5): vacation switch flipped (flag=on)
+  UI_EVT_SKIP_NEXT,     // v1.9.0 (E4): skip one occurrence (a=h, b=m)
+  UI_EVT_REFILL,        // v1.9.0 (D1): hopper refill (a=tank 1..4, 0xFF = all)
+  UI_EVT_GUARD_CFG,     // v1.9.0 (F3): policy saved (a=gap min, b=max/day, c=catchup min, d=low %)
 };
 
 struct UiEvent {
@@ -55,9 +59,14 @@ struct UiEvent {
   uint8_t a = 0;
   uint8_t b = 0;
   uint8_t c = 0;
+  uint8_t d = 0;        // v1.9.0: 4th generic byte (GUARD_CFG low-food %)
   bool flag = false;
+  uint8_t feedSrc = 0;  // v1.9.0 (F3): FEED source: 0 touch/node, 1 web, 2 MQTT
   char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
   uint8_t tankMask = 0; // FEED/SCHED_ADD: target tanks (bit i = tank i+1); 0 = tank 1
+  // v1.9.0 (A1/A2): SCHED_ADD weekday mask (bit0=Mon..bit6=Sun; 0 = daily)
+  uint8_t days = 0;
+  uint8_t secTank[4] = {0, 0, 0, 0}; // per-tank pulse override (0 = shared)
   // MQTT settings (UI_EVT_MQTT_CFG); sizes == prefs/catfish_protocol caps
   bool mqttEnable = false;
   uint16_t mqttPort = 0;
@@ -71,8 +80,10 @@ struct UiEvent {
   uint8_t mechFeed = 0; // servo feed angle
   uint16_t mechHz = 0;  // stepper step rate
   uint8_t mechDir = 0;  // stepper DIR level during feed
-  // Tank editor (UI_EVT_TANK_CFG, P5)
-  char tankName[CATFISH_TANK_NAME_LEN] = {0}; // == 16 (15 chars + NUL)
+  // Tank editor (UI_EVT_TANK_CFG, P5 + v1.9.0 A3/D1)
+  char tankName[CATFISH_TANK_NAME_LEN] = {0};   // == 16 (15 chars + NUL)
+  uint16_t tankGps = 0;   // food rate g/second (0 = off)
+  uint16_t tankHcap = 0;  // hopper capacity in pulse-seconds (0 = unknown)
 };
 
 namespace ui {
@@ -142,9 +153,11 @@ void ui_set_next_feed(const String &text);
 
 /**
  * Structured next-feed target so ui_tick() can render a live countdown
- * ("07:30  •  in 2 h 15 m" / "Tomorrow 07:30  •  ..."). valid=false -> "—".
+ * ("07:30  •  in 2 h 15 m" / "Tmrw 07:30  •  ..." / "T+3d 07:30  •  ...").
+ * v1.9.0: @p daysAhead 0 = today, 1..7 = days into the future (weekday masks
+ * can push the next feed days out). valid=false -> "—".
  */
-void ui_set_next_feed_time(int hour, int minute, bool tomorrow, bool valid);
+void ui_set_next_feed_time(int hour, int minute, uint8_t daysAhead, bool valid);
 
 /** "Last fed" card text, e.g. "Today 07:30". */
 void ui_set_last_feed(const String &text);
@@ -170,6 +183,26 @@ void ui_set_sd(const String &text);
 
 /** v1.8.0: Settings > RADIOS card status lines (ESP-NOW + nRF24L01). */
 void ui_set_radios(const String &espnow, const String &rf24);
+
+/** v1.9.0 (A5): vacation state -> Home badge + Settings switch sync. */
+void ui_set_vacation(bool on);
+
+/**
+ * v1.9.0 (D1): push the food-level estimator into the UI (per-tank rows in
+ * Settings > FOOD + the Home relay-card bar). pct 255 = unknown (no capacity
+ * configured for that tank); caps are the per-tank hopper sizes in seconds.
+ */
+void ui_set_food(uint8_t count, const uint8_t pct[CATFISH_MAX_TANKS],
+                 const uint16_t usedSec[CATFISH_MAX_TANKS],
+                 const uint16_t gps[CATFISH_MAX_TANKS],
+                 const uint16_t capSec[CATFISH_MAX_TANKS], uint8_t lowPct);
+
+/**
+ * v1.9.0 (C1): replace the history overlay content. @p json is the same
+ * newest-first ring JSON /api/history serves ([{"e":epoch,"m":mask,"s":sec,
+ * "ok":0/1,"f":flag}]); "" or "[]" clears the list.
+ */
+void ui_set_history(const String &json);
 
 /** Request a manual feed (safe to call from LVGL callbacks). */
 void ui_request_feed(uint8_t seconds);
