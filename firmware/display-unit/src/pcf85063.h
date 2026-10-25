@@ -8,13 +8,19 @@
  * power loss the display booted with no valid wall clock until NTP synced,
  * so schedules didn't fire and "last fed" stayed unknown.
  *
- * Bus ownership (important): Arduino Wire owns the legacy I2C driver on
- * I2C_NUM_0 (installed by begin() BEFORE the display panel stack starts).
- * The board config sets ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST and
- * ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST to 1 so GT911/CH422G attach to the
- * same already-running driver instead of re-installing it. That makes RTC
- * access safe at ANY time from setup() or loop() — one driver, one bus,
- * mutex-protected by the legacy I2C layer.
+ * Bus ownership (important, v1.8.1): the display panel stack installs and
+ * owns the LEGACY I2C driver (driver/i2c.h) on host 0 when Board::begin()
+ * runs — the board config keeps TOUCH/EXPANDER SKIP_INIT_HOST at 0. Arduino
+ * Wire must NOT be used on this board: on arduino-esp32 >= 3.2 (ESP-IDF
+ * >= 5.4) Wire installs the NEW i2c_master driver, which cannot coexist with
+ * the legacy API the vendored panel libraries use (v1.6.0 tried "Wire owns
+ * the bus" and the CH422G — which gates LCD_RST and the backlight — went
+ * dead, leaving a permanently black screen). This driver therefore speaks
+ * the same legacy C API as the panel stack; the legacy driver happily serves
+ * multiple devices on one bus. ALL functions here must be called only AFTER
+ * Board::begin() has succeeded (setup() enforces the ordering). Occasional
+ * RTC transactions coexist with GT911 polling through the legacy driver's
+ * internal port mutex.
  *
  * All times are UTC; the TZ ("PHT-8") applied by configTzTime only affects
  * localtime rendering, never what we store.
@@ -23,7 +29,7 @@
 #define CATFISH_PCF85063_H
 
 #include <Arduino.h>
-#include <Wire.h>
+#include <driver/i2c.h>
 #include <time.h>
 #include <stdint.h>
 #include <catfish_time.h>
@@ -31,6 +37,8 @@
 namespace pcf85063 {
 
 static const uint8_t I2C_ADDR = 0x51;
+static const i2c_port_t I2C_NUM = I2C_NUM_0; // host 0 — panel-owned legacy driver
+static const TickType_t I2C_TIMEOUT = pdMS_TO_TICKS(100);
 
 // Register map (subset we use)
 static const uint8_t REG_CTRL1 = 0x00;
@@ -43,20 +51,19 @@ static const uint8_t MONTH_CENTURY = 0x80; // months bit7: 0 = 20xx, 1 = 19xx
 static const uint8_t HOUR_12H = 0x80;     // hours bit7 must stay 0 (24h mode)
 
 /**
- * @brief Take the shared I2C bus (Wire.begin on SDA 8 / SCL 9) and probe the
- *        chip. Safe to call before the panel stack starts.
- * @return true when the chip ACKs its address (battery holder populated).
+ * @brief Probe the chip (address phase only). Returns false until the panel
+ *        stack has installed the legacy I2C driver, i.e. call only after
+ *        Board::begin() succeeded. Returns true when the chip ACKs (battery
+ *        holder populated).
  */
 inline bool begin() {
-  Wire.begin(8, 9, 400000U);
-  Wire.beginTransmission(I2C_ADDR);
-  return Wire.endTransmission() == 0;
+  return i2c_master_write_to_device(I2C_NUM, I2C_ADDR, nullptr, 0,
+                                    I2C_TIMEOUT) == ESP_OK;
 }
 
 /** @return true when the chip answered the probe in begin(). */
 inline bool isPresent() {
-  Wire.beginTransmission(I2C_ADDR);
-  return Wire.endTransmission() == 0;
+  return begin();
 }
 
 static uint8_t bcdToBin(uint8_t v) { return (uint8_t)((v & 0x0F) + (v >> 4) * 10); }
@@ -73,14 +80,17 @@ static uint8_t binToBcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)
 inline bool readUtc(time_t *out, bool *oscStopped) {
   if (!out || !oscStopped) return false;
   *oscStopped = false;
-  Wire.beginTransmission(I2C_ADDR);
-  Wire.write(REG_SEC);
-  if (Wire.endTransmission(false) != 0) return false; // repeated start
-  if (Wire.requestFrom((int)I2C_ADDR, N_DATETIME_REGS) != N_DATETIME_REGS)
-    return false;
 
+  // Set the register pointer to seconds, then read the 7 calendar regs.
+  // (Write-then-read, no repeated start — the PCF85063 doesn't need one.)
+  const uint8_t reg = REG_SEC;
+  if (i2c_master_write_to_device(I2C_NUM, I2C_ADDR, &reg, 1, I2C_TIMEOUT) !=
+      ESP_OK)
+    return false;
   uint8_t raw[N_DATETIME_REGS];
-  for (int i = 0; i < N_DATETIME_REGS; i++) raw[i] = (uint8_t)Wire.read();
+  if (i2c_master_read_from_device(I2C_NUM, I2C_ADDR, raw, N_DATETIME_REGS,
+                                  I2C_TIMEOUT) != ESP_OK)
+    return false;
 
   const uint8_t sec = bcdToBin(raw[0] & 0x7F);
   const uint8_t min = bcdToBin(raw[1] & 0x7F);
@@ -124,9 +134,8 @@ inline bool writeUtc(time_t t) {
       (uint8_t)(binToBcd(c.month) & (uint8_t)~MONTH_CENTURY), // century 0 = 20xx
       binToBcd((uint8_t)(c.year - 2000)),
   };
-  Wire.beginTransmission(I2C_ADDR);
-  Wire.write(buf, sizeof(buf));
-  return Wire.endTransmission() == 0;
+  return i2c_master_write_to_device(I2C_NUM, I2C_ADDR, buf, sizeof(buf),
+                                    I2C_TIMEOUT) == ESP_OK;
 }
 
 } // namespace pcf85063

@@ -394,6 +394,8 @@ static bool s_ota_ready = false;
 // main power is off. Boot: if the chip holds a plausible time, restore it via
 // settimeofday() so schedules/last-fed are correct immediately (even offline).
 // Once NTP actually syncs, the wall clock is written back into the chip.
+// v1.8.1: probing happens AFTER Board::begin() — the panel stack owns the
+// legacy I2C driver on host 0, and nothing can talk I2C before it is up.
 // ---------------------------------------------------------------------------
 static bool s_rtc_present = false;
 static bool s_rtc_ntp_synced = false;
@@ -921,12 +923,11 @@ void setup() {
     Serial.println("[SYS] WARN: web dashboard unavailable (continuing without)");
   }
 
-  // --- I2C bus + battery-backed RTC (before the panel stack) ---
-  // Wire OWNS the legacy I2C driver on host 0; GT911/CH422G attach to it via
-  // the board config's *_SKIP_INIT_HOST flags. Must precede board init.
-  rtcBootInit();
-
   // --- board + LVGL ---
+  // The panel stack installs + owns the LEGACY I2C driver on host 0 inside
+  // begin() (board conf *_SKIP_INIT_HOST = 0). Nothing may talk I2C before
+  // this point — GT911, CH422G (LCD_RST + backlight!) and the RTC all ride
+  // that driver. See esp_panel_board_custom_conf.h for the v1.8.1 rationale.
   s_board = new Board();
   s_board->init();
   if (!s_board->begin()) {
@@ -936,6 +937,12 @@ void setup() {
   if (s_board->getBacklight()) {
     s_board->getBacklight()->setBrightness(1); // switch type: on (no PWM)
   }
+
+  // --- battery-backed RTC (v1.8.1: after the panel stack owns the bus) ---
+  // Probing earlier would fail (no legacy driver installed yet). Ordering
+  // still keeps the restored wall clock in effect before the first LVGL
+  // frame renders (lvgl_port_init/ui_init come below).
+  rtcBootInit();
 
   // --- optional microSD feed log (v1.7.0) ---
   // After board begin(): the CH422G expander (TF-card CS) is up. Blocking

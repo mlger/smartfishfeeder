@@ -224,8 +224,19 @@
  * For drivers which created by this library, even if they use the same host, the host will be initialized only once.
  * So it is not necessary to set the macro to `1`. For other drivers (like `Wire`), please set the macro to `1`
  * ensure that the host is initialized only once.
+ *
+ * CATFISH (v1.8.1) — both *_SKIP_INIT_HOST flags MUST stay 0. The panel stack
+ * (GT911 touch + CH422G expander via HostI2C) installs and owns the LEGACY
+ * I2C driver (`driver/i2c.h`) on host 0. Arduino Wire must NOT be begun on
+ * this board: on arduino-esp32 >= 3.2 / ESP-IDF >= 5.4, Wire uses the NEW
+ * i2c_master driver (esp32-hal-i2c-ng.c), which does not interoperate with
+ * the legacy API the vendored panel libs speak — v1.6.0's "Wire owns the
+ * bus" experiment ended with `board begin() failed` and a permanently black
+ * screen (LCD_RST/backlight live on the CH422G). The PCF85063 RTC talks to
+ * the chip directly through the same legacy driver (src/pcf85063.h), so no
+ * Wire is needed anywhere.
  */
-#define ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST        (1)     // 1 = GT911 attaches to the Wire-owned I2C driver (RTC sharing, v1.6.0)
+#define ESP_PANEL_BOARD_TOUCH_BUS_SKIP_INIT_HOST        (0)     // 0 = panel stack installs+owns the legacy I2C driver on host 0 (v1.8.1, see below)
 #endif
 
 /**
@@ -342,7 +353,7 @@
  * So it is not necessary to set the macro to `1`. For other devices, please set the macro to `1` ensure that the
  * host is initialized only once.
  */
-#define ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST     (1)     // 1 = CH422G attaches to the Wire-owned I2C driver (RTC sharing, v1.6.0)
+#define ESP_PANEL_BOARD_EXPANDER_SKIP_INIT_HOST     (0)     // 0 = panel stack installs+owns the legacy I2C driver on host 0 (v1.8.1, see below)
 /* For general */
 #define ESP_PANEL_BOARD_EXPANDER_I2C_HOST_ID        (0)     // Typically set to 0
 /* For host */
