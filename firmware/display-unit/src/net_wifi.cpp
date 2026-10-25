@@ -45,8 +45,13 @@ void applyConnectedState() {
 }
 
 void wifiTask(void * /*param*/) {
-  // Don't mirror credentials into NVS on every connect (NVS wear).
-  WiFi.persistent(false);
+  // v1.8.4 FIX (WiFi credentials lost on every power cycle): the old
+  // WiFi.persistent(false) forced esp_wifi_set_storage(WIFI_STORAGE_RAM),
+  // so the STA config never reached NVS and each boot opened the setup
+  // portal again. With the default WIFI_STORAGE_FLASH the driver writes
+  // the STA config into NVS only when the config CHANGES (i.e. once per
+  // credential entry in the portal) — no meaningful NVS wear.
+  WiFi.persistent(true);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(WIFI_HOSTNAME);
   WiFi.setAutoReconnect(true);

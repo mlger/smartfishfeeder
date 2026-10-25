@@ -38,8 +38,17 @@ enum State : uint8_t {
   Mounted,
 };
 
-/** Mount the card (blocking ~100-300 ms — call once from setup()). */
+/** Mount the card (blocking ~100-500 ms across speed retries — setup() only). */
 bool begin(esp_expander::Base *expander);
+
+/**
+ * v1.8.4: hot-plug recheck. Call from loop() while state() == NoCard (the
+ * caller owns the cadence, ~every 10 s). Tries ONE mount speed per call
+ * (round-robin 20/10/4 MHz) so a cardless slot costs ≤ ~0.5 s of loop time
+ * per recheck. Returns true only on a successful mount (caller should
+ * refresh the SD label / toast). No-op when Mounted, Disabled or no expander.
+ */
+bool remount();
 
 /** Current state (cheap; safe anywhere). */
 State state();
