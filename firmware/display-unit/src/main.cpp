@@ -54,6 +54,12 @@ using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
 
 static Board *s_board = nullptr;
 
+#if CATFISH_QEMU
+// Smoke-test observability counters (zero cost in hardware builds; incremented
+// from requestFeed()'s WiFi-abort branch and asserted by qemuSmokePump()).
+static uint32_t g_qemu_wifi_aborts = 0;
+#endif
+
 // loop() cadence timestamps
 static uint32_t s_t_1s = 0;
 static uint32_t s_t_30s = 0;
@@ -495,6 +501,9 @@ static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
       uiToast(String("Feed FAILED: no WiFi"));
     }
     Serial.println("[FEED] aborted: WiFi down");
+#if CATFISH_QEMU
+    g_qemu_wifi_aborts++;
+#endif
     return;
   }
   if (!net_worker::enqueueFeed(seconds, manual, hour, minute, retry, tankMask)) {
@@ -568,6 +577,8 @@ static void handleUiEvent(const UiEvent &ev) {
       break;
 
     case UI_EVT_SET_PULSE:
+      if (ev.a == prefs::getDefaultPulse())
+        break; // no-op replay guard (v1.8.3): skip NVS write + MQTT republish
       prefs::setDefaultPulse(ev.a);
       lvgl_port_lock(-1);
       ui_set_pulse(ev.a); // also corrects the spinbox when set via Home Assistant
@@ -682,6 +693,8 @@ static void handleUiEvent(const UiEvent &ev) {
 
     case UI_EVT_TANK_COUNT: {
       const uint8_t prev = tankCountClamped();
+      if ((uint8_t)ev.a == prev)
+        break; // no-op replay guard (v1.8.3): skip NVS write + rebuild storm
       prefs::setTankCount(ev.a);
       const uint8_t nw = tankCountClamped();
       if (nw < prev) {
@@ -934,6 +947,109 @@ static void handleWorkerResult(const net_worker::Result &r) {
 }
 
 // ---------------------------------------------------------------------------
+// QEMU smoke test (compiled only with -DCATFISH_QEMU=1; run by
+// scripts/qemu_run.sh and the CI "QEMU smoke test" job, see docs/tooling.md).
+// Scripts a fixed sequence of real UiEvents through the SAME queue the touch
+// UI uses, then verifies each side effect (NVS persist, scheduler state,
+// WiFi-down abort accounting). Verdict lines are grepped by the runner: any
+// "[QEMU] FAIL", or a missing "[QEMU] SMOKE PASS", fails the run.
+// ---------------------------------------------------------------------------
+#if CATFISH_QEMU
+static void qemuSmokeLog(const char *what, bool ok) {
+  Serial.printf("[QEMU] %s %s\n", ok ? "PASS" : "FAIL", what);
+}
+
+static void qemuSmokeSend(const UiEvent &ev) {
+  Serial.printf("[QEMU] inject event %d\n", (int)ev.type);
+  if (!ui_event_send(ev)) Serial.println("[QEMU] FAIL event queue send");
+}
+
+static void qemuSmokePump() {
+  static uint8_t s_step = 0;
+  static uint32_t s_due = 2500; // let setup() and the first 1 Hz ticks settle
+  if ((int32_t)(millis() - s_due) < 0) return;
+  s_due = millis() + 1200;
+
+  switch (s_step) {
+    case 0: {
+      UiEvent ev{}; // default pulse -> 7 s
+      ev.type = UI_EVT_SET_PULSE;
+      ev.a = 7;
+      qemuSmokeSend(ev);
+      s_step = 1;
+      break;
+    }
+    case 1:
+      qemuSmokeLog("SET_PULSE persisted (NVS)", prefs::getDefaultPulse() == 7);
+      {
+        UiEvent ev{}; // add schedule 08:00:00, tank 1
+        ev.type = UI_EVT_SCHED_ADD;
+        ev.a = 8;
+        ev.b = 0;
+        ev.c = 0;
+        ev.tankMask = 1;
+        qemuSmokeSend(ev);
+      }
+      s_step = 2;
+      break;
+    case 2: {
+      const feed_scheduler::NextFeed nf = feed_scheduler::nextOccurrence();
+      Serial.printf("[QEMU] next feed %02u:%02u valid=%u (count=%u)\n",
+                    (unsigned)nf.hour, (unsigned)nf.minute, nf.valid ? 1U : 0U,
+                    (unsigned)feed_scheduler::getCount());
+      // 2 first-boot seeded entries + the added 08:00; exact next-occurrence
+      // math is covered by the native test suite — here we prove the wiring.
+      qemuSmokeLog("SCHED_ADD accepted (2 seeded + 1 new)",
+                   feed_scheduler::getCount() == 3 && nf.valid);
+      UiEvent ev{}; // manual feed -> WiFi is down on purpose
+      ev.type = UI_EVT_FEED;
+      ev.a = 3;
+      ev.tankMask = 1;
+      qemuSmokeSend(ev);
+      s_step = 3;
+      break;
+    }
+    case 3:
+      qemuSmokeLog("FEED aborts cleanly with no WiFi",
+                   g_qemu_wifi_aborts == 1);
+      {
+        UiEvent ev{}; // 12-hour clock toggle
+        ev.type = UI_EVT_SET_FMT12;
+        ev.flag = true;
+        qemuSmokeSend(ev);
+      }
+      s_step = 4;
+      break;
+    case 4:
+      qemuSmokeLog("SET_FMT12 persisted", prefs::getHour12());
+      {
+        UiEvent ev{}; // Home "All tanks" chip
+        ev.type = UI_EVT_SELECT_TANK;
+        ev.a = 0xFE;
+        qemuSmokeSend(ev);
+      }
+      s_step = 5;
+      break;
+    case 5:
+      qemuSmokeLog("SELECT_TANK(All) routed", s_selected_tank == 0xFE);
+      Serial.println("[QEMU] SMOKE PASS");
+      s_step = 6;
+      break;
+    default: {
+      // Steady-state heartbeat: keep running (dim timers, LVGL rebuilds,
+      // 1 Hz housekeeping) so late crashes still fail the run.
+      static uint32_t s_beat = 0;
+      if (millis() - s_beat >= 30000) {
+        s_beat = millis();
+        Serial.printf("[QEMU] alive %lus\n", (unsigned long)(s_beat / 1000));
+      }
+      break;
+    }
+  }
+}
+#endif // CATFISH_QEMU
+
+// ---------------------------------------------------------------------------
 // setup / loop
 // ---------------------------------------------------------------------------
 void setup() {
@@ -957,6 +1073,23 @@ void setup() {
   // begin() (board conf *_SKIP_INIT_HOST = 0). Nothing may talk I2C before
   // this point — GT911, CH422G (LCD_RST + backlight!) and the RTC all ride
   // that driver. See esp_panel_board_custom_conf.h for the v1.8.1 rationale.
+#if CATFISH_QEMU
+  // Headless QEMU build: the emulator has no panel/expander/I2C/SPI hardware.
+  // A fixed wall clock is injected instead of the RTC restore so every
+  // time-gated path (scheduler, countdown, last-fed) behaves exactly like
+  // after an NTP sync: 2025-02-07 07:45:00 UTC — safely BETWEEN the two
+  // first-boot seeded schedule entries (07:30, 17:30) so neither fires while
+  // the smoke sequence runs.
+  {
+    struct timeval tv = {};
+    tv.tv_sec = CATFISH_RTC_MIN_EPOCH + (time_t)(37 * 86400) +
+                (time_t)(7 * 3600 + 45 * 60);
+    settimeofday(&tv, nullptr);
+    s_rtc_status = "qemu injected";
+    Serial.printf("[SYS] QEMU: injected wall clock epoch %lld\n",
+                  (long long)tv.tv_sec);
+  }
+#else
   s_board = new Board();
   s_board->init();
   // v1.8.2 fix (flicker): avoid-tearing mode 3 needs TWO full frame buffers,
@@ -992,8 +1125,15 @@ void setup() {
   // nRF24 polls on its own task (SPI shared with the SD card via the bus
   // guard); ESP-NOW starts lazily once WiFi is up (loop()).
   net_rf24::begin();
+#endif
 
-  if (!lvgl_port_init(s_board->getLCD(), s_board->getTouch())) {
+  if (!lvgl_port_init(
+#if CATFISH_QEMU
+          nullptr, nullptr
+#else
+          s_board->getLCD(), s_board->getTouch()
+#endif
+          )) {
     Serial.println("[SYS] ERROR: LVGL port init failed");
   }
 
@@ -1020,7 +1160,13 @@ void setup() {
   if (!net_worker::begin()) {
     Serial.println("[SYS] ERROR: net worker unavailable; feeds will fail");
   }
+#if CATFISH_QEMU
+  // No radio in the emulator: keep the app "offline" on purpose (feeds, OTA,
+  // MQTT and ESP-NOW follow their WiFi-down paths; the smoke test asserts one).
+  Serial.println("[SYS] QEMU: wifi-task skipped (no radio in emulator)");
+#else
   net_wifi::start();
+#endif
   mqtt_mgr::applyConfig(); // arms retry pump (WiFi-gated); status -> UI via 1 Hz sync
   mqttSyncUi();
 
@@ -1033,6 +1179,9 @@ void setup() {
 }
 
 void loop() {
+#if CATFISH_QEMU
+  qemuSmokePump();
+#endif
   const uint32_t now = millis();
 
   // OTA updater: begin lazily once WiFi/mDNS is up, then serve every pass.

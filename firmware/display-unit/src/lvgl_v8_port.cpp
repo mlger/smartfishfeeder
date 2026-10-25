@@ -20,6 +20,30 @@ static TaskHandle_t lvgl_task_handle = nullptr;
 static esp_timer_handle_t lvgl_tick_timer = NULL;
 static void *lvgl_buf[LVGL_PORT_BUFFER_NUM_MAX] = {};
 
+#if CATFISH_QEMU
+// ---------------------------------------------------------------------------
+// Headless QEMU build (see docs/tooling.md): the emulator has no LCD panel,
+// so LVGL registers a plain RAM "display" instead. The full UI object tree,
+// layout engine, timers and animations run exactly as on hardware — only the
+// final blit is a no-op. Partial-refresh with a 20-line buffer keeps SRAM
+// use small (the emulator also has no PSRAM).
+// ---------------------------------------------------------------------------
+#define QEMU_DISP_W                 (800)
+#define QEMU_DISP_H                 (480)
+#define QEMU_DISP_BUF_LINES         (20)
+static lv_disp_draw_buf_t s_qemu_draw_buf;
+static lv_disp_drv_t s_qemu_disp_drv;
+static lv_color_t *s_qemu_buf = nullptr;
+
+static void qemu_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+{
+    (void)area;
+    (void)color_map;
+    /* Rendering lands in the RAM draw buffer; there is no panel to push to. */
+    lv_disp_flush_ready(drv);
+}
+#endif /* CATFISH_QEMU */
+
 #if LVGL_PORT_ROTATION_DEGREE != 0
 static void *get_next_frame_buffer(LCD *lcd)
 {
@@ -737,6 +761,44 @@ IRAM_ATTR bool onDrawBitmapFinishCallback(void *user_data)
 
 bool lvgl_port_init(LCD *lcd, Touch *tp)
 {
+#if CATFISH_QEMU
+    (void)lcd; (void)tp; /* no real panel exists in the emulator */
+
+    lv_disp_t *disp = nullptr;
+
+    lv_init();
+#if !LV_TICK_CUSTOM
+    ESP_UTILS_CHECK_FALSE_RETURN(tick_init(), false, "Initialize LVGL tick failed");
+#endif
+
+    ESP_UTILS_LOGI("QEMU headless display: %dx%d RAM framebuffer", QEMU_DISP_W, QEMU_DISP_H);
+    if (s_qemu_buf == nullptr) {
+        s_qemu_buf = (lv_color_t *)heap_caps_malloc(
+            QEMU_DISP_W * QEMU_DISP_BUF_LINES * sizeof(lv_color_t), MALLOC_CAP_8BIT);
+        assert(s_qemu_buf);
+    }
+    lv_disp_draw_buf_init(&s_qemu_draw_buf, s_qemu_buf, nullptr,
+                          QEMU_DISP_W * QEMU_DISP_BUF_LINES);
+    lv_disp_drv_init(&s_qemu_disp_drv);
+    s_qemu_disp_drv.hor_res = QEMU_DISP_W;
+    s_qemu_disp_drv.ver_res = QEMU_DISP_H;
+    s_qemu_disp_drv.draw_buf = &s_qemu_draw_buf;
+    s_qemu_disp_drv.flush_cb = qemu_flush_cb;
+    disp = lv_disp_drv_register(&s_qemu_disp_drv);
+    ESP_UTILS_CHECK_NULL_RETURN(disp, false, "Register headless LVGL display failed");
+
+    ESP_UTILS_LOGD("Create mutex for LVGL");
+    lvgl_mux = xSemaphoreCreateRecursiveMutex();
+    ESP_UTILS_CHECK_NULL_RETURN(lvgl_mux, false, "Create LVGL mutex failed");
+
+    ESP_UTILS_LOGD("Create LVGL task");
+    BaseType_t core_id = (LVGL_PORT_TASK_CORE < 0) ? tskNO_AFFINITY : LVGL_PORT_TASK_CORE;
+    BaseType_t ret = xTaskCreatePinnedToCore(lvgl_port_task, "lvgl", LVGL_PORT_TASK_STACK_SIZE, NULL,
+                     LVGL_PORT_TASK_PRIORITY, &lvgl_task_handle, core_id);
+    ESP_UTILS_CHECK_FALSE_RETURN(ret == pdPASS, false, "Create LVGL task failed");
+
+    return true;
+#else
     ESP_UTILS_CHECK_FALSE_RETURN(lcd != nullptr, false, "Invalid LCD device");
 
     auto bus_type = lcd->getBus()->getBasicAttributes().type;
@@ -805,6 +867,7 @@ bool lvgl_port_init(LCD *lcd, Touch *tp)
 #endif
 
     return true;
+#endif /* CATFISH_QEMU */
 }
 
 bool lvgl_port_lock(int timeout_ms)
