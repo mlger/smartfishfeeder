@@ -41,13 +41,21 @@ if [ -z "$QEMU" ]; then
   exit 2
 fi
 
-# Espressif's QEMU links libslirp; probe the usual locations once.
-for d in "$ROOT/../tools/deps/usr/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu" "/usr/lib64"; do
-  if ls "$d"/libslirp.so.0* >/dev/null 2>&1; then
-    export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    break
-  fi
-done
+# Espressif's QEMU links libslirp. IMPORTANT: never export LD_LIBRARY_PATH
+# globally in this script — prepending a system lib dir shadowed the
+# setup-python interpreter's bundled libpython on GitHub runners and broke
+# `pio` (ModuleNotFoundError: platformio). Instead, detect a missing
+# libslirp AFTER the build and scope the env override to the QEMU invocation
+# only (QEMU_ENV array).
+QEMU_ENV=()
+if ldd "$QEMU" 2>/dev/null | grep -q "libslirp.*not found"; then
+  for d in "$ROOT/../tools/deps/usr/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu" "/usr/lib64"; do
+    if ls "$d"/libslirp.so.0* >/dev/null 2>&1; then
+      QEMU_ENV=(env "LD_LIBRARY_PATH=$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+      break
+    fi
+  done
+fi
 
 # --- build (unless SKIP_BUILD=1) --------------------------------------------
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
@@ -71,7 +79,7 @@ echo "[qemu-run] booting $IMG with $QEMU (up to ${RUN_SECONDS}s) ..."
 rm -f "$LOG"
 set +e
 timeout --signal=INT --kill-after=5 "$RUN_SECONDS" \
-  "$QEMU" -machine esp32s3 \
+  "${QEMU_ENV[@]}" "$QEMU" -machine esp32s3 \
           -drive file="$IMG",if=mtd,format=raw \
           -display none -monitor none \
           -serial file:"$LOG"
