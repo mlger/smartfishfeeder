@@ -59,6 +59,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Release integrity: on v* tags the tag MUST equal the compiled
+      # CATFISH_APP_VERSION, otherwise release assets would advertise a
+      # different version than the running firmware reports (OTA/web UI).
+      - name: Verify tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          APPV=$(grep -m1 '^#define CATFISH_APP_VERSION' firmware/common/catfish_protocol.h | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG" != "$APPV" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' does not match CATFISH_APP_VERSION '${APPV}'. Bump firmware/common/catfish_protocol.h to ${TAG} (or re-tag) so release assets carry a truthful version."
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} == app version ${APPV}: OK"
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v7
         with:
@@ -347,11 +361,31 @@ jobs:
           cp dist/relay-unit/relay-unit-firmware.bin "assets/relay-unit-firmware-${V}.bin"
           cp dist/relay-unit/relay-unit-firmware.elf "assets/relay-unit-firmware-${V}.elf"
 
+      - name: Generate SHA256 checksums
+        run: cd assets && sha256sum *.bin *.elf > SHA256SUMS.txt
+
       - name: Attach assets to release
         uses: softprops/action-gh-release@v3
         with:
           files: assets/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
+          body: |
+            Firmware for Catfish Feeder **${{ github.ref_name }}**.
+
+            | Unit | Image | Flash at |
+            |---|---|---|
+            | Display unit (ESP32-S3, 16 MB) | `merged-firmware-${{ github.ref_name }}.bin` (single merged image) | `0x0` — or one-click via the [web flasher](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/) |
+            | Display unit (app only, OTA) | `display-unit-firmware-${{ github.ref_name }}.bin` | `0x10000` |
+            | Relay unit (ESP8266, NodeMCU V3) | `relay-unit-firmware-${{ github.ref_name }}.bin` (self-contained) | `0x0` |
+
+            Display unit split images (only for manual esptool workflows):
+            `display-unit-bootloader-${{ github.ref_name }}.bin` @ `0x0`,
+            `display-unit-partitions-${{ github.ref_name }}.bin` @ `0x8000`,
+            app @ `0x10000` (boot_app0 @ `0xe000` is not needed with the merged image).
+
+            `.elf` files are for symbolized crash triage; `SHA256SUMS.txt` covers all assets.
+            The running firmware reports this release as app version `${{ github.ref_name }}` over MQTT / dashboard / OTA.
 
   # Rolling prerelease so firmware is always attached to a release without
   # needing a v* tag. Stable asset names + delete/recreate: the release always
@@ -393,6 +427,7 @@ jobs:
           cp dist/display-unit/firmware.elf          assets/catfish-display-unit-latest.elf
           cp dist/relay-unit/relay-unit-firmware.bin assets/catfish-relay-unit-latest.bin
           cp dist/relay-unit/relay-unit-firmware.elf assets/catfish-relay-unit-latest.elf
+          (cd assets && sha256sum *.bin *.elf > SHA256SUMS.txt)
 
       - name: Publish/update the latest prerelease
         run: |

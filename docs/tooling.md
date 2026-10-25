@@ -89,6 +89,19 @@ Settings live in `~/.claude-mem/settings.json` (user-local, never committed).
 - `.github/workflows/firmware.yml` ("Firmware") builds both units, merges the
   ESP32-S3 image, deploys `web-flasher/` to GitHub Pages on `main`, and
   attaches bins to `v*` tag releases.
+- Firmware releases, two channels:
+  - **Tagged release** (stable): push a `v*` tag whose number equals
+    `CATFISH_APP_VERSION` in `firmware/common/catfish_protocol.h` — e.g. after
+    bumping the header to `1.8.4`, `git tag v1.8.4 && git push origin v1.8.4`.
+    The `release` job then attaches `merged-firmware-vX.Y.Z.bin`,
+    the app-only/OTA bin, relay bin, split images, ELFs and a
+    `SHA256SUMS.txt` to a GitHub release with generated notes and a flashing
+    table. A guard step fails the build when the tag does not match the
+    compiled app version, so assets can never advertise a false version.
+  - **Rolling `latest` prerelease** (dev): every `main` push recreates the
+    `latest` prerelease with stable asset names (`catfish-*-latest.bin`) plus
+    `SHA256SUMS.txt` — same images the web flasher serves. Delete/recreate
+    keeps download URLs stable.
 - Pages URL: <https://mlger.github.io/smartfishfeeder/> (Pages build_type:
   `workflow` — official Pages actions only).
 - esptool v5 merge syntax (verified against esptool 5.6.0):
