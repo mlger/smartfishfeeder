@@ -46,7 +46,7 @@ fi
 # shadowed the setup-python interpreter's bundled libpython on GitHub runners
 # and broke `pio` (ModuleNotFoundError: platformio). The override below is
 # scoped: it only affects the ldd preflight and the QEMU invocation itself.
-LDP_QEMU="$LD_LIBRARY_PATH"
+LDP_QEMU="${LD_LIBRARY_PATH:-}"
 if ldd "$QEMU" 2>/dev/null | grep -q "libslirp.*not found"; then
   for d in "$ROOT/../tools/deps/usr/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu" "/usr/lib64"; do
     if ls "$d"/libslirp.so.0* >/dev/null 2>&1; then
