@@ -25,7 +25,8 @@ constexpr int RETRY_MAX_ATTEMPTS = 1 + (int)(sizeof(RETRY_BACKOFF_S) /
 
 struct RetrySlot {
   bool active = false;
-  uint8_t hour = 0, minute = 0, seconds = 0, tankMask = 0;
+  uint8_t hour = 0, minute = 0, tankMask = 0;
+  uint16_t grams = 0; // v1.10.0: portion (g)
   uint8_t attempts = 0;
   uint32_t dueEpoch = 0; // 0 = in flight (a retry was handed out, not resolved)
 };
@@ -45,7 +46,9 @@ uint32_t s_day = 0; // YYYYMMDD local
 uint16_t s_ok_today = 0, s_fail_today = 0;
 uint32_t s_tot = 0, s_sec = 0;
 
-// Hopper usage per tank, pulse-seconds since refill (D1)
+// Hopper usage per tank, GRAMS since refill (D1; v1.9.0 was pulse-seconds —
+// the NVS key changed from "hopper" to "hopG" so old sec-values never
+// masquerade as grams; usage simply restarts at 0 after the upgrade).
 uint16_t s_used[4] = {0, 0, 0, 0};
 
 // History ring (C1): index 0 = newest (feed_state::HistEntry — anonymous
@@ -82,7 +85,7 @@ void persistRetry() {
     JsonObject o = arr.add<JsonObject>();
     o["h"] = s_retry[i].hour;
     o["m"] = s_retry[i].minute;
-    o["s"] = s_retry[i].seconds;
+    o["g"] = s_retry[i].grams;
     o["t"] = s_retry[i].tankMask;
     o["a"] = s_retry[i].attempts;
     o["due"] = s_retry[i].dueEpoch;
@@ -187,7 +190,12 @@ void init() {
           s.active = true;
           s.hour = (uint8_t)(o["h"] | 0);
           s.minute = (uint8_t)(o["m"] | 0);
-          s.seconds = (uint8_t)(o["s"] | 3);
+          s.grams = (uint16_t)(o["g"] | 0);
+          if (s.grams == 0) {
+            // v1.10.0 migration: pre-1.10 journals stored seconds ("s" key).
+            s.grams = catfishSecondsToGrams((uint8_t)(o["s"] | 3),
+                                            prefs::getTankGps(1));
+          }
           s.tankMask = (uint8_t)(o["t"] | 1);
           s.attempts = (uint8_t)(o["a"] | 1);
           s.dueEpoch = (uint32_t)(o["due"] | 0);
@@ -253,7 +261,7 @@ void init() {
 }
 
 // ------------------------------------------------------------ retry journal
-bool journalArm(uint8_t hour, uint8_t minute, uint8_t seconds,
+bool journalArm(uint8_t hour, uint8_t minute, uint16_t grams,
                 uint8_t tankMask) {
   const uint32_t now = (uint32_t)nowTime();
   RetrySlot *slot = nullptr;
@@ -277,7 +285,7 @@ bool journalArm(uint8_t hour, uint8_t minute, uint8_t seconds,
   slot->active = true;
   slot->hour = hour;
   slot->minute = minute;
-  slot->seconds = seconds;
+  slot->grams = grams;
   slot->tankMask = tankMask ? tankMask : 0x01;
   slot->attempts = slot->attempts ? slot->attempts : 1;
   const uint8_t bi = slot->attempts - 1;
@@ -301,7 +309,7 @@ bool journalDue(uint32_t nowEpoch, RetryDue &out) {
     if ((int32_t)(nowEpoch - s.dueEpoch) < 0) continue;
     out.hour = s.hour;
     out.minute = s.minute;
-    out.seconds = s.seconds;
+    out.grams = s.grams;
     out.tankMask = s.tankMask;
     s.dueEpoch = 0; // in flight until clear/fail resolves it
     persistRetry();
@@ -385,7 +393,7 @@ int scanCatchup(const FeedTime *entries, int count, uint32_t nowEpoch,
     CatchupDue &d = out[n++];
     d.hour = e.hour;
     d.minute = e.minute;
-    d.seconds = e.seconds;
+    d.grams = e.grams;
     d.tankMask = e.tanks;
     Serial.printf("[FEED] catch-up due %02u:%02u (missed %ld s ago)\n",
                   (unsigned)e.hour, (unsigned)e.minute,
@@ -482,16 +490,16 @@ GuardResult checkFeed(FeedSource src, uint32_t nowEpoch) {
 }
 
 // -------------------------------------------------------------------- hopper
-void hopperAddUsage(uint8_t tankMask, const uint8_t perTankSecs[4]) {
+void hopperAddUsage(uint8_t tankMask, const uint16_t perTankGrams[4]) {
   bool changed = false;
   for (uint8_t t = 1; t <= 4; t++) {
     if (!(tankMask & (1u << (t - 1)))) continue;
-    const uint8_t secs = perTankSecs ? perTankSecs[t - 1] : 0;
-    if (secs == 0) continue;
-    uint16_t used = s_used[t - 1] + secs;
+    const uint16_t g = perTankGrams ? perTankGrams[t - 1] : 0;
+    if (g == 0) continue;
+    uint32_t used = (uint32_t)s_used[t - 1] + g;
     if (used > 60000) used = 60000; // saturate (refill resets)
     if (used != s_used[t - 1]) {
-      s_used[t - 1] = used;
+      s_used[t - 1] = (uint16_t)used;
       changed = true;
     }
   }
@@ -518,7 +526,7 @@ uint8_t hopperLevelPct(uint8_t tank1) {
   return (uint8_t)(100U - ((uint32_t)s_used[tank1 - 1] * 100UL) / cap);
 }
 
-uint16_t hopperUsedSec(uint8_t tank1) {
+uint16_t hopperUsedG(uint8_t tank1) {
   if (tank1 < 1 || tank1 > 4) return 0;
   return s_used[tank1 - 1];
 }
@@ -534,13 +542,15 @@ bool hopperLowAny(uint8_t tankCount) {
 }
 
 // ---------------------------------------------------------------- history
-void recordHistory(uint8_t tankMask, uint8_t seconds, bool ok, uint8_t flag) {
+void recordHistory(uint8_t tankMask, uint8_t seconds, uint16_t grams, bool ok,
+                   uint8_t flag) {
   // shift-down insert: index 0 = newest (24 entries max, cheap on ESP32-S3)
   if (s_hist_n < HIST_MAX) s_hist_n++;
   for (int i = s_hist_n - 1; i > 0; i--) s_hist[i] = s_hist[i - 1];
   s_hist[0].epoch = (uint32_t)nowTime();
   s_hist[0].tankMask = tankMask;
   s_hist[0].seconds = seconds;
+  s_hist[0].grams = grams;
   s_hist[0].ok = ok;
   s_hist[0].flag = flag;
   s_hist_dirty = true;
@@ -560,6 +570,7 @@ String historyJson(int maxEntries) {
     o["e"] = s_hist[i].epoch;
     o["m"] = s_hist[i].tankMask;
     o["s"] = s_hist[i].seconds;
+    o["g"] = s_hist[i].grams; // v1.10.0: portion (g)
     o["ok"] = s_hist[i].ok ? 1 : 0;
     o["f"] = s_hist[i].flag;
   }

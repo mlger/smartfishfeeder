@@ -11,11 +11,12 @@ Catfish Feeder is a two-board, self-hosted fish feeder. The **Display Unit** (Wa
 
 ## Features
 
-- Touch UI on a 4.3" 800x480 panel (LVGL 8.4): **Feed Now**, **Schedule**, **Settings**
+- Touch UI on a 4.3" 800x480 panel (LVGL 8.4): **Feed Now**, **Schedule**, **Settings** — portions in **grams** (v1.10.0, converted to wire pulses via each tank's calibrated g/s rate)
+- **On-display WiFi manager** (v1.10.0): scan, pick an AP and enter the password right on the touchscreen — the captive portal stays as fallback
 - NTP time sync with Asia/Manila timezone (`PHT-8`, UTC+8, no DST)
 - **Battery-backed RTC** (v1.6.0): the onboard PCF85063 + CR927 coin cell keeps wall time through power cuts — schedules fire and the clock is correct even before WiFi/NTP (or with none); 12/24-hour display format toggle — see [docs/firmware.md](docs/firmware.md)
 - **Optional SD feed history** (v1.7.0): every feed result appends to `/feeds.csv` on the board's microSD slot (auto-detected, compile-time optional, rotates at 2 MB) — see [docs/firmware.md](docs/firmware.md)
-- **Optional wireless feed buttons** (v1.8.0): battery pucks trigger a feed via **ESP-NOW** or **nRF24L01+** using one shared token-keyed datagram — same pipeline as touch input, SPI bus shared with the SD card — see [docs/firmware.md](docs/firmware.md)
+- **Optional wireless feed buttons** (v1.8.0): battery pucks trigger a feed via **ESP-NOW (default since v1.10.0)** or **nRF24L01+ (opt-in build flag)** using one shared token-keyed datagram — same pipeline as touch input, SPI bus shared with the SD card — see [docs/firmware.md](docs/firmware.md)
 - First-boot WiFi provisioning via WiFiManager captive portal (AP `CatfishFeeder-Setup`)
 - Browser-based flashing (ESP Web Tools) — no toolchain install required
 - ArduinoOTA updates on both units (relay: `catfish-relay.local`, display: `catfishfeeder.local`)

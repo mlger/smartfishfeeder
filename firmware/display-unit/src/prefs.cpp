@@ -43,15 +43,18 @@ char s_mq_prefix[CATFISH_MQTT_PREFIX_LEN] = CATFISH_MQTT_PREFIX;
 char s_retry[256] = {0};
 char s_fired[512] = {0};
 char s_stats[192] = {0};
-char s_hopper[192] = {0};
+char s_hopper[192] = {0}; // v1.10.0: per-tank grams since refill (key "hopG")
 uint32_t s_skip_min = 0xFFFF; // 0xFFFF = none
 bool s_vacation = false;
 uint8_t s_gap_min = 0;    // 0 = off
 uint8_t s_max_day = 0;    // 0 = unlimited
 uint8_t s_ctch_win = 10;  // minutes; 0 = disabled
 uint8_t s_hop_low = 20;   // percent
-uint16_t s_tank_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0}; // g/second per tank
-uint16_t s_tank_hcap[CATFISH_MAX_TANKS] = {0, 0, 0, 0}; // hopper capacity (pulse-seconds)
+uint16_t s_tank_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0}; // g/second per tank (0 = nominal)
+// v1.10.0: hopper capacity in GRAMS (0 = unknown). v1.9.0 stored pulse-seconds;
+// begin() migrates old values once to grams (x tank gps) and sets "hcapG".
+uint16_t s_tank_hcap[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
+uint16_t s_def_grams = CATFISH_DEFAULT_GRAMS; // v1.10.0: default portion (g)
 
 // Guards s_token: written by loop(), read by the net worker task.
 portMUX_TYPE s_token_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -64,12 +67,26 @@ portMUX_TYPE s_token_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE s_blob_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static String blobCopy(const char *src, size_t cap) {
-  char buf[1024];
-  const size_t n = (cap < sizeof(buf)) ? cap : sizeof(buf);
+  // v1.10.0: the stack buffer was a flat 1 KB regardless of the blob size;
+  // size it to the real capacity instead — several getters run on the 6 KB
+  // LVGL task (overlay prefills) and every KB of stack there counts.
+  char buf[128];
+  char *dst = buf;
+  char *heap = nullptr;
+  size_t n = cap;
+  if (n > sizeof(buf)) {
+    heap = (char *)malloc(n);
+    if (!heap) return String(); // allocation failure: report empty, log-free
+    dst = heap;
+  } else {
+    n = (cap < sizeof(buf)) ? cap : sizeof(buf);
+  }
   portENTER_CRITICAL(&s_blob_mux);
-  strlcpy(buf, src, n);
+  strlcpy(dst, src, n);
   portEXIT_CRITICAL(&s_blob_mux);
-  return String(buf);
+  String out(dst);
+  free(heap);
+  return out;
 }
 
 void nvsLogFail(const char *key) {
@@ -147,8 +164,8 @@ bool begin() {
   strlcpy(s_fired, v.c_str(), sizeof(s_fired));
   v = s_nvs.getString("stats", "");
   strlcpy(s_stats, v.c_str(), sizeof(s_stats));
-  v = s_nvs.getString("hopper", "");
-  strlcpy(s_hopper, v.c_str(), sizeof(s_hopper));
+  v = s_nvs.getString("hopG", ""); // v1.10.0: grams; the old sec-based "hopper"
+  strlcpy(s_hopper, v.c_str(), sizeof(s_hopper)); // key is intentionally ignored
   s_skip_min = s_nvs.getULong("skipMin", 0xFFFF);
   s_vacation = s_nvs.getBool("vacation", false);
   s_gap_min = s_nvs.getUChar("gapMin", 0);
@@ -162,6 +179,25 @@ bool begin() {
     snprintf(key, sizeof(key), "hcap%d", i + 1);
     s_tank_hcap[i] = s_nvs.getUShort(key, 0);
   }
+  // v1.10.0 one-time migration: v1.9.0 stored hopper caps in pulse-seconds;
+  // grams = seconds x tank gps (nominal 5 g/s when unset). The flag key makes
+  // the conversion exactly-once so fresh installs are untouched.
+  if (!s_nvs.getBool("hcapG", false)) {
+    for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+      if (s_tank_hcap[i] == 0) continue;
+      uint16_t gps = s_tank_gps[i] ? s_tank_gps[i] : CATFISH_DEFAULT_GPS;
+      uint32_t g = (uint32_t)s_tank_hcap[i] * gps;
+      if (g > CATFISH_MAX_GRAMS) g = CATFISH_MAX_GRAMS;
+      s_tank_hcap[i] = (uint16_t)g;
+      char key[8];
+      snprintf(key, sizeof(key), "hcap%d", i + 1);
+      if (s_nvs.putUShort(key, s_tank_hcap[i]) == 0) nvsLogFail(key);
+    }
+    if (!s_nvs.putBool("hcapG", true)) nvsLogFail("hcapG");
+  }
+  s_def_grams = s_nvs.getUShort("defG", CATFISH_DEFAULT_GRAMS);
+  if (s_def_grams < 1 || s_def_grams > CATFISH_MAX_GRAMS)
+    s_def_grams = CATFISH_DEFAULT_GRAMS;
   if (s_hop_low < 5 || s_hop_low > 90) s_hop_low = 20;
 
   s_loaded = true;
@@ -297,6 +333,15 @@ void setDefaultPulse(uint8_t seconds) {
   if (s_loaded && s_nvs.putUChar("pulse", s_pulse) == 0) nvsLogFail("pulse");
 }
 
+// -------------------------------------------------- v1.10.0: portion (grams)
+uint16_t getDefaultGrams() { return s_def_grams; }
+
+void setDefaultGrams(uint16_t grams) {
+  s_def_grams = catfishClampGrams(grams);
+  if (s_loaded && s_nvs.putUShort("defG", s_def_grams) == 0)
+    nvsLogFail("defG");
+}
+
 uint32_t getLastFedEpoch() { return s_last_fed; }
 
 void setLastFedEpoch(uint32_t epoch) {
@@ -345,7 +390,7 @@ bool setHopperJson(const String &json) {
   portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_hopper, json.c_str(), sizeof(s_hopper));
   portEXIT_CRITICAL(&s_blob_mux);
-  if (s_loaded && s_nvs.putString("hopper", json) == 0) nvsLogFail("hopper");
+  if (s_loaded && s_nvs.putString("hopG", json) == 0) nvsLogFail("hopG");
   return true;
 }
 
@@ -415,13 +460,13 @@ uint16_t getTankHopperCap(uint8_t tank1) {
   return (i < 0) ? 0 : s_tank_hcap[i];
 }
 
-void setTankHopperCap(uint8_t tank1, uint16_t capSec) {
+void setTankHopperCap(uint8_t tank1, uint16_t capG) {
   const int i = tankIdx(tank1);
   if (i < 0) return;
-  s_tank_hcap[i] = capSec;
+  s_tank_hcap[i] = capG;
   char key[8];
   snprintf(key, sizeof(key), "hcap%d", i + 1);
-  if (s_loaded && s_nvs.putUShort(key, capSec) == 0) nvsLogFail(key);
+  if (s_loaded && s_nvs.putUShort(key, capG) == 0) nvsLogFail(key);
 }
 
 bool getBacklightOn() { return s_bl_on; }

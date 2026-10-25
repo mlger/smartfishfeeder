@@ -39,8 +39,8 @@ void workerTask(void * /*param*/) {
       uint8_t mask = cmd.tankMask & ((count >= 4) ? 0x0F : ((1u << count) - 1u));
       if (!mask) mask = 0x01;
 
-      Serial.printf("[NET] worker: feed %u s -> tanks 0x%X (%s)%s\n",
-                    (unsigned)cmd.seconds, (unsigned)mask,
+      Serial.printf("[NET] worker: feed %u g (tanks 0x%X, %s)%s\n",
+                    (unsigned)cmd.grams, (unsigned)mask,
                     cmd.manual ? "manual" : "scheduled", cmd.retry ? " RETRY" : "");
 
       r.kind = net_worker::Result::RES_FEED;
@@ -49,12 +49,12 @@ void workerTask(void * /*param*/) {
       r.catchup = cmd.catchup;
       r.hour = cmd.hour;
       r.minute = cmd.minute;
-      r.seconds = cmd.seconds;
+      r.grams = cmd.grams;
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
         if (!(mask & (1u << (t - 1)))) continue;
-        // v1.9.0 (A2): per-tank pulse override (0 = the shared seconds)
-        uint8_t secs = cmd.seconds;
-        if (cmd.secTank[t - 1]) secs = cmd.secTank[t - 1];
+        // v1.10.0: per-tank wire pulse precomputed by main from the portion
+        uint8_t secs = cmd.secPerTank[t - 1];
+        if (secs == 0) secs = 1; // defensive floor; main always fills set bits
         const relay_client::Result fr = relay_client::feedTank(t, secs);
         if (fr.ok) {
           r.tanksOk |= (1u << (t - 1));
@@ -162,21 +162,21 @@ bool begin() {
   return true;
 }
 
-bool enqueueFeed(uint8_t seconds, bool manual, uint8_t hour, uint8_t minute,
-                 bool retry, uint8_t tankMask, const uint8_t *secTank,
+bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
+                 uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
                  bool catchup) {
   if (!s_cmdq) return false;
   Cmd c;
   c.type = Cmd::CMD_FEED;
-  c.seconds = seconds;
+  c.grams = grams;
   c.manual = manual;
   c.retry = retry;
   c.catchup = catchup;
   c.hour = hour;
   c.minute = minute;
   c.tankMask = tankMask;
-  if (secTank) {
-    for (int i = 0; i < 4; i++) c.secTank[i] = secTank[i];
+  if (secPerTank) {
+    for (int i = 0; i < 4; i++) c.secPerTank[i] = secPerTank[i];
   }
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }

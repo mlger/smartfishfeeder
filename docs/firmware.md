@@ -296,6 +296,46 @@ the library sources, plus hardening for marginal SD setups:
   must be FAT-formatted (FAT32 for ≤ 32 GB); if an SDXC card still refuses,
   re-format it FAT32 on a PC.
 
+## Grams everywhere + on-display WiFi manager (v1.10.0)
+
+User-facing dosing switched from seconds to **GRAMS** on the display unit
+(touch UI, schedule editor, web dashboard, history). The relay wire format
+("feed for N seconds") and `CATFISH_PROTOCOL_VERSION 1` remain untouched: the
+display converts each tank's portion via the calibrated grams-per-second rate
+(Settings > TANKS editor, nominal 5 g/s when unset), clamped to 1..60 s.
+
+- **Portions in grams** — Home Feed Now portion, S/M/L presets (5/15/30 g),
+  schedule entries (`g` + per-tank `gt` overrides in the schedule JSON;
+  legacy `s`/`st` blobs load at 5 g/s), default portion (`defG` NVS key),
+  history (`g` key) and hopper estimator (usage + capacity in grams; caps
+  migrate once from pulse-seconds).
+- **APIs** — `POST /api/feed` accepts `grams` (preferred) or legacy `seconds`;
+  `PUT /api/schedule` entries accept `g`/`gt`; `/api/status` adds `defGrams`.
+  MQTT `feed/cmd` stays seconds on the wire (converted internally).
+- **On-display WiFi manager** — Settings > WIFI card: async scan (up to 12
+  APs), tap an AP, enter the password on the panel keyboard, connect. Runs on
+  wifi-task; the WiFiManager captive portal stays as the fallback path.
+- **ESP-NOW is the default radio** — nRF24L01+ is now opt-in
+  (`-DCATFISH_FEATURE_NRF24=1`; ESP-NOW needs no extra hardware).
+- **Bug fixes**
+  - *Tank-count hang*: changing the tank count (or deleting/toggling a
+    schedule entry) deleted LVGL widgets from the loop task while the LVGL
+    task was still dispatching the tap — heap corruption/hang. All
+    destructive rebuilds now run inside the LVGL task via `lv_async_call`
+    from a loop-side snapshot; the FOOD card also follows the tank count.
+  - *Weekly schedule*: the editor's day chips never toggled (missing
+    `LV_OBJ_FLAG_CHECKABLE`), so every entry stayed "Daily". Fixed with
+    checkable chips + `LV_STATE_CHECKED` style selectors.
+  - *Top bar overlap*: in 12-hour mode the growing clock ran into the WiFi
+    symbol; the symbol is now anchored at the right edge and the clock sits
+    to its left.
+  - *UDP discovery (relay unit)*: the relay now trims trailing
+    whitespace/newline before the exact-match compare — discovery between the
+    shipped firmwares never matched the display's trailing `\n`.
+  - *MQTT policy gate*: Home Assistant feeds (feedSrc 2) now correctly count
+    as REMOTE for vacation / min-gap / daily-cap (the old `== 1` check
+    bypassed all three).
+
 ## Feeding feature pack (v1.9.0)
 
 Implements the full v1.9.0 suggestion backlog (schedule/dosing, reliability,

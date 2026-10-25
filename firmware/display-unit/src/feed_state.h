@@ -54,7 +54,8 @@ enum HistFlag : uint8_t {
 struct HistEntry {
   uint32_t epoch = 0;
   uint8_t tankMask = 0;
-  uint8_t seconds = 0;
+  uint8_t seconds = 0;  // wire: relay-applied pulse seconds
+  uint16_t grams = 0;   // v1.10.0: requested portion in grams
   bool ok = false;
   uint8_t flag = HIST_NONE;
 };
@@ -74,7 +75,7 @@ void set_time_source(time_t (*fn)());
 struct RetryDue {
   uint8_t hour = 0;
   uint8_t minute = 0;
-  uint8_t seconds = 0;
+  uint16_t grams = 0; // v1.10.0: portion (g)
   uint8_t tankMask = 0;
 };
 
@@ -84,7 +85,7 @@ struct RetryDue {
  * an existing (h,m) slot advances the attempt counter — see journalFail().
  * @return false when both slots are full AND no slot matches (h,m).
  */
-bool journalArm(uint8_t hour, uint8_t minute, uint8_t seconds,
+bool journalArm(uint8_t hour, uint8_t minute, uint16_t grams,
                 uint8_t tankMask);
 
 /**
@@ -119,7 +120,7 @@ bool consumeSkip(uint8_t hour, uint8_t minute);
 struct CatchupDue {
   uint8_t hour = 0;
   uint8_t minute = 0;
-  uint8_t seconds = 0;
+  uint16_t grams = 0; // v1.10.0: portion (g)
   uint8_t tankMask = 0;
 };
 
@@ -166,10 +167,10 @@ GuardResult checkFeed(FeedSource src, uint32_t nowEpoch);
 
 // ------------------------------------------------------ D1: hopper
 /**
- * Accumulate usage: per-tank applied seconds for every set bit in @p mask.
- * @param perTankSecs index t-1 = seconds applied to tank t (0 = skip).
+ * Accumulate usage: per-tank applied GRAMS for every set bit in @p mask.
+ * @param perTankGrams index t-1 = grams fed to tank t (0 = skip).
  */
-void hopperAddUsage(uint8_t tankMask, const uint8_t perTankSecs[4]);
+void hopperAddUsage(uint8_t tankMask, const uint16_t perTankGrams[4]);
 
 /** Reset usage for one tank (1-based); 0xFF refills every configured tank. */
 void hopperRefill(uint8_t tank1);
@@ -177,15 +178,16 @@ void hopperRefill(uint8_t tank1);
 /** 0..100, or 255 when the tank has no capacity configured. */
 uint8_t hopperLevelPct(uint8_t tank1);
 
-/** Used pulse-seconds since the last refill for a tank. */
-uint16_t hopperUsedSec(uint8_t tank1);
+/** Used grams since the last refill for a tank (v1.10.0, was seconds). */
+uint16_t hopperUsedG(uint8_t tank1);
 
 /** true when any CONFIGURED tank has a KNOWN level below the threshold. */
 bool hopperLowAny(uint8_t tankCount);
 
 // ------------------------------------------------------ C1: history ring
 /** Append one event (oldest entries fall off after FEED_STATE_HIST_MAX). */
-void recordHistory(uint8_t tankMask, uint8_t seconds, bool ok, uint8_t flag);
+void recordHistory(uint8_t tankMask, uint8_t seconds, uint16_t grams, bool ok,
+                   uint8_t flag);
 
 int historyCount();
 /** Pointer to the internal ring (index 0 = newest). Read-only. */
@@ -195,7 +197,7 @@ const HistEntry *historyAll();
 bool historyDirty();
 void historyClearDirty();
 
-/** Newest-first JSON array: [{"e":epoch,"m":mask,"s":sec,"ok":0/1,"f":flag}]. */
+/** Newest-first JSON array: [{"e":epoch,"m":mask,"s":sec,"g":g,"ok":0/1,"f":flag}]. */
 String historyJson(int maxEntries);
 
 } // namespace feed_state

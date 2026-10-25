@@ -25,18 +25,18 @@ Same token header (`X-Catfish-Token`) on every mutating endpoint.
 |----------|------|---------------|
 | `GET /api/status` | — | Snapshot JSON: wifi (ssid/ip/rssi), relay (online/ip), `nextFeed`, `lastFedEpoch` + `lastFeedIso`, `pulse`, `schedCount`, `feeding`, `clockValid`, `hour12` (v1.6.0+ — the device's 12/24-hour clock preference, presentation only), `mqtt`/`mqttState`, `version`, `selectedTank` and a `tanks` array `[{"id":1,"name":"Main","online":true,"feeding":false,"ip":"192.168.1.42"}, ...]` (first `tankCount` entries valid) |
 | `GET /api/version` | — | `{"version":"1.5.0","proto":1}` |
-| `GET /api/schedule` | — | The live schedule as a JSON array `[{"h":7,"m":30,"e":true,"s":3,"t":1}, ...]` (`t` = target-tank bitmask, added in v1.5.0; old entries without it load as tank 1) |
+| `GET /api/schedule` | — | The live schedule as a JSON array `[{"h":7,"m":30,"e":true,"g":15,"t":1}, ...]` (`g` = portion in **grams**, v1.10.0 — legacy `s` seconds entries still load, converted at 5 g/s; `t` = target-tank bitmask, added in v1.5.0; old entries without it load as tank 1) |
 | `PUT /api/schedule` | token | Whole-array replace. `202` accepted (applied by the main loop moments later, all-or-nothing), `400` bad JSON/size, `503` busy |
-| `POST /api/feed` | token | `{"seconds":1-30}` optional (default pulse otherwise), `"tanks":1-15` optional target-tank bitmask (default: all configured tanks). `202` queued, `503` busy |
+| `POST /api/feed` | token | `{"grams":1-500}` (v1.10.0, preferred) or legacy `{"seconds":1-30}` (converted at the tank's g/s rate); `"tanks":1-15` optional target-tank bitmask (default: all configured tanks). `202` queued, `503` busy |
 | `POST /api/update` | token | `multipart/form-data` firmware upload → `200 {"ok":true,"rebooting":true}` |
 
 Example:
 
 ```sh
-# feed every configured tank for 5 s
+# feed every configured tank a 15 g portion (v1.10.0: grams)
 curl -X POST http://catfishfeeder.local/api/feed \
      -H 'X-Catfish-Token: your-token' \
-     -H 'Content-Type: application/json' -d '{"seconds":5}'
+     -H 'Content-Type: application/json' -d '{"grams":15}'
 
 # feed only tanks 1 and 3 (bitmask 0b101 = 5)
 curl -X POST http://catfishfeeder.local/api/feed \

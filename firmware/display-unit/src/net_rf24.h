@@ -20,7 +20,8 @@
  * 5-byte address CATFISH_RF24_ADDR (see net_rf24.cpp), payload = the
  * catfish_rfnode.h datagram.
  *
- * Feature gate: -DCATFISH_FEATURE_NRF24=1 (default).
+ * Feature gate: v1.10.0 defaults to OFF (ESP-NOW is the default radio —
+ * no extra hardware). Opt in with -DCATFISH_FEATURE_NRF24=1.
  */
 #ifndef CATFISH_NET_RF24_H
 #define CATFISH_NET_RF24_H
@@ -29,7 +30,7 @@
 #include <stdint.h>
 
 #ifndef CATFISH_FEATURE_NRF24
-#define CATFISH_FEATURE_NRF24 1
+#define CATFISH_FEATURE_NRF24 0
 #endif
 
 #ifndef CATFISH_RF24_CHANNEL

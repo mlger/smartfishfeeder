@@ -67,11 +67,14 @@ void routePacket(const uint8_t *buf, size_t len) {
 
   UiEvent ev;
   ev.type = UI_EVT_RF_FEED;
-  ev.a = seconds; // 0 = hub default pulse
+  // v1.10.0: the datagram still carries seconds (wire compat) — convert to
+  // the UI's grams unit here using tank 1's calibrated rate.
+  ev.grams = catfishSecondsToGrams(seconds, prefs::getTankGps(1));
   ev.tankMask = mask;
   ui::ui_event_send(ev);
-  Serial.printf("[RF24] node feed request (%u s, mask 0x%X, seq %u)\n",
-                (unsigned)seconds, (unsigned)mask, (unsigned)seq);
+  Serial.printf("[RF24] node feed request (%u s ~= %u g, mask 0x%X, seq %u)\n",
+                (unsigned)seconds, (unsigned)ev.grams, (unsigned)mask,
+                (unsigned)seq);
 }
 
 void rfTask(void *) {

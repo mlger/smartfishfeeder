@@ -31,14 +31,15 @@ struct Cmd {
     CMD_SCAN_TANKS, // P5: UDP-scan the LAN and bind unassigned tanks
   };
   Type type = CMD_FEED;
-  uint8_t seconds = 0; // FEED: pulse duration (shared / fallback)
+  uint16_t grams = 0;  // v1.10.0: FEED requested portion (g) — echo/bookkeeping
   bool manual = false; // FEED: manual vs scheduled
   bool retry = false;  // FEED: this attempt IS the scheduled-feed retry
   bool catchup = false; // v1.9.0 (A4): this attempt is a missed-feed catch-up
   uint8_t hour = 0;    // FEED: scheduled entry time (0 for manual)
   uint8_t minute = 0;
-  // v1.9.0 (A2): per-tank pulse override, index t-1, 0 = use `seconds`.
-  uint8_t secTank[4] = {0, 0, 0, 0};
+  // v1.10.0: per-tank wire pulse (seconds) precomputed by main from the
+  // portion + the tank's calibrated g/s rate; index t-1, 0 = skip tank.
+  uint8_t secPerTank[4] = {0, 0, 0, 0};
   bool report = false; // PROBE: toast the outcome
   bool verify = false; // v1.9.0 (B3): probe runs inside the pulse-verify window
   char token[CATFISH_TOKEN_LEN] = {0}; // TOKEN_ROTATE: new token for the relay
@@ -63,6 +64,7 @@ struct Result {
   bool catchup = false; // v1.9.0 (A4)
   uint8_t hour = 0;
   uint8_t minute = 0;
+  uint16_t grams = 0;  // v1.10.0: requested portion (g) echo
   uint8_t seconds = 0; // applied pulse seconds (relay may have clamped)
   bool clamped = false; // relay clamp note present
   char note[64] = {0}; // relay clamp note text ("")
@@ -97,11 +99,13 @@ bool begin();
 
 /**
  * Queue a feed request. @p tankMask bit i = tank i+1; 0 = tank 1.
- * @p secTank per-tank pulse override (0 = use @p seconds), may be nullptr.
+ * @p grams requested portion in grams (echo/bookkeeping).
+ * @p secPerTank per-tank wire pulse in seconds precomputed by main
+ * (catfishGramsToSeconds), may be nullptr (then tank 1 gets 1 s minimum).
  * @return false when the command queue is full.
  */
-bool enqueueFeed(uint8_t seconds, bool manual, uint8_t hour, uint8_t minute,
-                 bool retry, uint8_t tankMask, const uint8_t *secTank = nullptr,
+bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
+                 uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
                  bool catchup = false);
 
 /** Queue a per-tank relay probe (discover-if-needed + GET /status). */

@@ -99,13 +99,15 @@ void onMessageCb(const espMqttClientTypes::MessageProperties & /*properties*/,
     }
     UiEvent ev;
     ev.type = UI_EVT_FEED;
-    ev.a = secs ? secs : prefs::getDefaultPulse(); // benign snapshot read
+    // v1.10.0: the wire keeps seconds — convert to the UI's grams unit.
+    ev.grams = catfishSecondsToGrams(secs ? secs : prefs::getDefaultPulse(),
+                                     prefs::getTankGps(1));
     ev.flag = true;      // manual
     ev.feedSrc = 2;      // REMOTE for the policy gate (F3)
     ev.tankMask = mask;  // 0 = all configured tanks
     ui::ui_event_send(ev);
-    Serial.printf("[MQTT] feed command received (%u s, tanks 0x%X)\n",
-                  (unsigned)ev.a, (unsigned)ev.tankMask);
+    Serial.printf("[MQTT] feed command received (%u s ~= %u g, tanks 0x%X)\n",
+                  (unsigned)secs, (unsigned)ev.grams, (unsigned)ev.tankMask);
     return;
   }
 
@@ -120,7 +122,8 @@ void onMessageCb(const espMqttClientTypes::MessageProperties & /*properties*/,
       }
       UiEvent ev;
       ev.type = UI_EVT_FEED;
-      ev.a = prefs::getDefaultPulse();
+      ev.grams = catfishSecondsToGrams(prefs::getDefaultPulse(),
+                                       prefs::getTankGps(i + 1)); // v1.10.0
       ev.flag = true; // manual
       ev.feedSrc = 2; // REMOTE for the policy gate (F3)
       ev.tankMask = (uint8_t)(1u << i);
@@ -131,12 +134,16 @@ void onMessageCb(const espMqttClientTypes::MessageProperties & /*properties*/,
   }
 
   if (strcmp(topic, s_topic_pulse_set) == 0) {
+    // v1.10.0: the HA number entity still speaks SECONDS (wire unit); convert
+    // to the UI's grams and persist as the default portion.
     const long secs = strtol(value, nullptr, 10);
     UiEvent ev;
-    ev.type = UI_EVT_SET_PULSE;
-    ev.a = mqtt_payloads::clampPulse(secs);
+    ev.type = UI_EVT_SET_PORTION;
+    ev.grams = catfishSecondsToGrams(mqtt_payloads::clampPulse((long)secs),
+                                     prefs::getTankGps(1));
     ui::ui_event_send(ev);
-    Serial.printf("[MQTT] pulse command received: %u s\n", (unsigned)ev.a);
+    Serial.printf("[MQTT] pulse command received: %ld s (=> %u g)\n", secs,
+                  (unsigned)ev.grams);
     return;
   }
 }

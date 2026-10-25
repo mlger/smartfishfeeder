@@ -35,6 +35,7 @@ struct Snapshot {
   char nextFeed[12] = {0}; // "HH:MM", "none", or "" while clock unsynced
   uint32_t lastFedEpoch = 0;
   uint8_t pulse = 0;
+  uint16_t defGrams = 0; // v1.10.0: default portion (g)
   uint16_t schedCount = 0;
   bool clockValid = false;
   char version[12] = {0};
