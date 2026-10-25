@@ -41,20 +41,28 @@ if [ -z "$QEMU" ]; then
   exit 2
 fi
 
-# Espressif's QEMU links libslirp. IMPORTANT: never export LD_LIBRARY_PATH
-# globally in this script — prepending a system lib dir shadowed the
-# setup-python interpreter's bundled libpython on GitHub runners and broke
-# `pio` (ModuleNotFoundError: platformio). Instead, detect a missing
-# libslirp AFTER the build and scope the env override to the QEMU invocation
-# only (QEMU_ENV array).
-QEMU_ENV=()
+# Espressif's QEMU needs libslirp, SDL2 and friends. IMPORTANT: never export
+# LD_LIBRARY_PATH globally in this script — prepending a system lib dir
+# shadowed the setup-python interpreter's bundled libpython on GitHub runners
+# and broke `pio` (ModuleNotFoundError: platformio). The override below is
+# scoped: it only affects the ldd preflight and the QEMU invocation itself.
+LDP_QEMU="$LD_LIBRARY_PATH"
 if ldd "$QEMU" 2>/dev/null | grep -q "libslirp.*not found"; then
   for d in "$ROOT/../tools/deps/usr/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu" "/usr/lib64"; do
     if ls "$d"/libslirp.so.0* >/dev/null 2>&1; then
-      QEMU_ENV=(env "LD_LIBRARY_PATH=$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+      LDP_QEMU="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
       break
     fi
   done
+fi
+
+# --- preflight: every shared library must resolve BEFORE the long build -----
+MISSING="$(env ${LDP_QEMU:+LD_LIBRARY_PATH="$LDP_QEMU"} ldd "$QEMU" 2>/dev/null | awk '/not found/{print $1}' | sort -u || true)"
+if [ -n "$MISSING" ]; then
+  echo "ERROR: $QEMU has unresolved shared libraries:" >&2
+  echo "$MISSING" >&2
+  echo "On Debian/Ubuntu: sudo apt-get install libslirp0 libsdl2-2.0-0 libpixman-1-0" >&2
+  exit 2
 fi
 
 # --- build (unless SKIP_BUILD=1) --------------------------------------------
@@ -79,7 +87,7 @@ echo "[qemu-run] booting $IMG with $QEMU (up to ${RUN_SECONDS}s) ..."
 rm -f "$LOG"
 set +e
 timeout --signal=INT --kill-after=5 "$RUN_SECONDS" \
-  "${QEMU_ENV[@]}" "$QEMU" -machine esp32s3 \
+  env ${LDP_QEMU:+LD_LIBRARY_PATH="$LDP_QEMU"} "$QEMU" -machine esp32s3 \
           -drive file="$IMG",if=mtd,format=raw \
           -display none -monitor none \
           -serial file:"$LOG"
