@@ -8,7 +8,9 @@
  *   GET  /api/version     {"version","proto"}
  *   GET  /api/schedule    schedule JSON array (open)
  *   PUT  /api/schedule    token; 400 bad JSON/size, 202 accepted (loop applies)
- *   POST /api/feed        token; {"seconds":1-30} optional; 202 queued
+ *   POST /api/feed        token; {"seconds":1-30,"tanks":1-15} optional; 202
+ *   GET  /api/history     feed-event ring JSON (open)          [v1.9.0]
+ *   GET  /api/stats       counters + food + policy summary     [v1.9.0]
  *   POST /api/update      token; multipart firmware upload -> Update.h
  */
 #include "web_server.h"
@@ -85,6 +87,10 @@ void handleStatus() {
   doc["pulse"] = s_snap.pulse;
   doc["schedCount"] = s_snap.schedCount;
   doc["clockValid"] = s_snap.clockValid;
+  doc["clockSrc"] = s_snap.clockSrc;  // v1.9.0 (B2): "none"/"rtc"/"ntp"
+  doc["vacation"] = s_snap.vacation;  // v1.9.0 (A5)
+  doc["feedsOkToday"] = s_snap.feedsOkToday;     // v1.9.0 (C3)
+  doc["feedsFailToday"] = s_snap.feedsFailToday; // v1.9.0 (C3)
   doc["hour12"] = s_snap.hour12; // v1.6.0: format "nextFeed"/last-feed for display
   doc["version"] = s_snap.version;
   doc["mqtt"] = s_snap.mqtt;
@@ -102,6 +108,8 @@ void handleStatus() {
     t["online"] = s_snap.tankOnline[i];
     t["feeding"] = s_snap.tankFeeding[i];
     t["ip"] = s_snap.tankIp[i];
+    t["foodPct"] = s_snap.tankFoodPct[i]; // v1.9.0 (D1), 255 = unknown
+    t["gps"] = s_snap.tankGps[i];         // v1.9.0 (A3)
   }
   String out;
   serializeJson(doc, out);
@@ -174,8 +182,43 @@ void handleFeed() {
   ev.flag = true; // manual (shows the on-device "Feeding fish..." toast too)
   ev.a = secs ? secs : prefs::getDefaultPulse();
   ev.tankMask = mask;
+  ev.feedSrc = 1; // v1.9.0: REMOTE for the policy gate (F3: vacation/gap/cap)
   if (!ui::ui_event_send(ev)) return sendErr(503, "busy");
   s_srv.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
+}
+
+// v1.9.0 (C1): on-device history ring as JSON (open read; LAN appliance).
+void handleHistory() {
+  // The snapshot copy races loop() writers only across whole-field copies of
+  // rarely-changing data — same accepted model as every other snapshot field.
+  s_srv.send(200, "application/json",
+             s_snap.historyJson[0] ? String(s_snap.historyJson)
+                                   : String("[]"));
+}
+
+// v1.9.0 (C2/C3/D1/A5): counters + estimator + policy summary.
+void handleStats() {
+  JsonDocument doc;
+  doc["ok"] = s_snap.feedsOkToday;
+  doc["fail"] = s_snap.feedsFailToday;
+  doc["total"] = s_snap.totalFeeds;
+  doc["vacation"] = s_snap.vacation;
+  doc["clockSrc"] = s_snap.clockSrc;
+  doc["version"] = s_snap.version;
+  uint8_t count = s_snap.tankCount;
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  JsonArray food = doc["food"].to<JsonArray>();
+  for (uint8_t i = 0; i < count; i++) {
+    JsonObject t = food.add<JsonObject>();
+    t["tank"] = i + 1;
+    t["name"] = s_snap.tankName[i];
+    t["pct"] = s_snap.tankFoodPct[i]; // 255 = unknown
+    t["gps"] = s_snap.tankGps[i];
+  }
+  String out;
+  serializeJson(doc, out);
+  s_srv.send(200, "application/json", out);
 }
 
 // ------------------------------------------------------------ firmware OTA
@@ -238,6 +281,8 @@ void webTask(void * /*param*/) {
   s_srv.on("/api/schedule", HTTP_GET, handleScheduleGet);
   s_srv.on("/api/schedule", HTTP_PUT, handleSchedulePut);
   s_srv.on("/api/feed", HTTP_POST, handleFeed);
+  s_srv.on("/api/history", HTTP_GET, handleHistory); // v1.9.0 (C1)
+  s_srv.on("/api/stats", HTTP_GET, handleStats);     // v1.9.0 (C2/C3)
   s_srv.on("/api/update", HTTP_POST, handleUpdatePost, updUploadCb);
   s_srv.onNotFound([] { sendErr(404, "not_found"); });
 

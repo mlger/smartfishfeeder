@@ -31,12 +31,16 @@ struct Cmd {
     CMD_SCAN_TANKS, // P5: UDP-scan the LAN and bind unassigned tanks
   };
   Type type = CMD_FEED;
-  uint8_t seconds = 0; // FEED: pulse duration
+  uint8_t seconds = 0; // FEED: pulse duration (shared / fallback)
   bool manual = false; // FEED: manual vs scheduled
   bool retry = false;  // FEED: this attempt IS the scheduled-feed retry
+  bool catchup = false; // v1.9.0 (A4): this attempt is a missed-feed catch-up
   uint8_t hour = 0;    // FEED: scheduled entry time (0 for manual)
   uint8_t minute = 0;
+  // v1.9.0 (A2): per-tank pulse override, index t-1, 0 = use `seconds`.
+  uint8_t secTank[4] = {0, 0, 0, 0};
   bool report = false; // PROBE: toast the outcome
+  bool verify = false; // v1.9.0 (B3): probe runs inside the pulse-verify window
   char token[CATFISH_TOKEN_LEN] = {0}; // TOKEN_ROTATE: new token for the relay
   // Multi-tank (P5)
   uint8_t tankMask = 0; // FEED: target tanks (bit i = tank i+1); 0 = tank 1
@@ -56,6 +60,7 @@ struct Result {
   // FEED echo
   bool manual = false;
   bool retry = false;
+  bool catchup = false; // v1.9.0 (A4)
   uint8_t hour = 0;
   uint8_t minute = 0;
   uint8_t seconds = 0; // applied pulse seconds (relay may have clamped)
@@ -63,12 +68,15 @@ struct Result {
   char note[64] = {0}; // relay clamp note text ("")
   uint8_t tanksOk = 0;   // P5: bitmask of tanks fed successfully
   uint8_t tanksFail = 0; // P5: bitmask of tanks whose feed failed
+  // v1.9.0 (A2): per-tank applied seconds (relay may clamp); 0 = not fed
+  uint8_t secOk[4] = {0, 0, 0, 0};
   // PROBE / MECH / TOKEN echo
   uint8_t tankId = 0; // 1-based tank this result belongs to
   // PROBE
   bool online = false;
   bool feeding = false;
   bool report = false;
+  bool verify = false; // v1.9.0 (B3): result is inside the verify window
   bool protoMismatch = false; // relay "proto" != CATFISH_PROTOCOL_VERSION
   char mech[10] = {0}; // relay "mechanism" ("motor"/"servo"/"stepper"; "" = pre-P4)
   int16_t mechRest = -1; // servo rest angle from /status (-1 = unknown/pre-P4)
@@ -89,13 +97,15 @@ bool begin();
 
 /**
  * Queue a feed request. @p tankMask bit i = tank i+1; 0 = tank 1.
+ * @p secTank per-tank pulse override (0 = use @p seconds), may be nullptr.
  * @return false when the command queue is full.
  */
 bool enqueueFeed(uint8_t seconds, bool manual, uint8_t hour, uint8_t minute,
-                 bool retry, uint8_t tankMask);
+                 bool retry, uint8_t tankMask, const uint8_t *secTank = nullptr,
+                 bool catchup = false);
 
 /** Queue a per-tank relay probe (discover-if-needed + GET /status). */
-bool enqueueProbe(bool report, uint8_t tank1);
+bool enqueueProbe(bool report, uint8_t tank1, bool verify = false);
 
 /**
  * Ask a tank's relay to rotate its token to @p newToken via POST /config.

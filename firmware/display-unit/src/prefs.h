@@ -103,6 +103,50 @@ void setHour12(bool h12);
 uint32_t getLastFedEpoch();
 void setLastFedEpoch(uint32_t epoch);
 
+// ---- Feeding state (v1.9.0): owned by feed_state, persisted as JSON blobs ----
+// All getters/setters are loop()-context only (single writer), same discipline
+// as every other section. The retry journal / fired-map / stats / hopper blobs
+// are small JSON strings; feed_state is the only reader.
+/** Pending scheduled-feed retry slots (JSON array, "" = none). */
+String getRetryJson();
+bool setRetryJson(const String &json);
+/** Per-entry (HH:MM identity) last-fired epoch map (JSON array, "" = none). */
+String getFiredJson();
+bool setFiredJson(const String &json);
+/** Daily counters {day,ok,fail,tot,sec} (JSON object, "" = fresh). */
+String getStatsJson();
+bool setStatsJson(const String &json);
+/** Per-tank hopper usage in pulse-seconds (JSON array of 4, "" = fresh). */
+String getHopperJson();
+bool setHopperJson(const String &json);
+
+/** Skip-next marker: minute-of-day to skip once, 0xFFFF = none. */
+uint32_t getSkipMinute();
+void setSkipMinute(uint32_t minOfDay);
+
+// ---- Feeding policy (v1.9.0) ----
+/** Vacation mode: suppress scheduled/catch-up/remote feeds (on-device manual stays live). */
+bool getVacation();
+void setVacation(bool on);
+/** Minimum gap between feeds in minutes (0 = off). */
+uint8_t getMinGapMin();
+void setMinGapMin(uint8_t minutes);
+/** Max successful feeds per day (0 = unlimited). */
+uint8_t getMaxFeedsDay();
+void setMaxFeedsDay(uint8_t maxFeeds);
+/** Missed-feed catch-up window in minutes (0 = disabled, default 10). */
+uint8_t getCatchupWin();
+void setCatchupWin(uint8_t minutes);
+/** Low-food alert threshold in percent (5..90, default 20). */
+uint8_t getHopperLowPct();
+void setHopperLowPct(uint8_t pct);
+/** Per-tank food rate in grams/second for portion display (0 = off). */
+uint16_t getTankGps(uint8_t tank1);
+void setTankGps(uint8_t tank1, uint16_t gps);
+/** Per-tank hopper capacity in pulse-seconds (0 = unknown -> no level bar). */
+uint16_t getTankHopperCap(uint8_t tank1);
+void setTankHopperCap(uint8_t tank1, uint16_t capSec);
+
 } // namespace prefs
 
 #endif // CATFISH_PREFS_H

@@ -10,8 +10,13 @@
 namespace {
 
 FeedTime s_entries[feed_scheduler::MAX_FEED_TIMES];
-// minute-of-day when each entry last fired (0xFFFF = never this minute)
-uint16_t s_last_fired[feed_scheduler::MAX_FEED_TIMES];
+// v1.9.0 FIX: absolute epoch-minute of the last fire per entry (0 = never).
+// Previously this stored the MINUTE-OF-DAY, which never re-fired the same
+// HH:MM on later days of an uptime (a 24/7 device fed each entry at most once
+// per boot; the v1.9.0 catch-up scan masked it by firing 0-10 min late).
+// epoch/60 is monotonic and day-agnostic: blocks re-fires within the same
+// calendar minute, allows them across days and midnight.
+uint32_t s_last_fired[feed_scheduler::MAX_FEED_TIMES];
 int s_count = 0;
 bool s_dirty = false;
 
@@ -21,7 +26,7 @@ time_t (*s_time_fn)() = nullptr;
 time_t nowTime() { return s_time_fn ? s_time_fn() : time(nullptr); }
 
 void resetFireTracking() {
-  for (int i = 0; i < feed_scheduler::MAX_FEED_TIMES; i++) s_last_fired[i] = 0xFFFF;
+  for (int i = 0; i < feed_scheduler::MAX_FEED_TIMES; i++) s_last_fired[i] = 0;
 }
 
 void clampEntry(FeedTime &t) {
@@ -31,6 +36,10 @@ void clampEntry(FeedTime &t) {
   if (t.seconds > 30) t.seconds = 30;
   t.tanks &= 0x0F;      // P5: only tanks 1..4 exist
   if (t.tanks == 0) t.tanks = 0x01;
+  if (t.days == 0) t.days = 0x7F; // v1.9.0: empty mask = every day
+  for (int i = 0; i < 4; i++) {
+    if (t.secTank[i] > 30) t.secTank[i] = 30; // 0 = inherit the shared seconds
+  }
 }
 
 /** Serialize + write to NVS now (call only from loop()/init context). */
@@ -44,6 +53,9 @@ bool persistNow() {
     o["e"] = s_entries[i].enabled;
     o["s"] = s_entries[i].seconds;
     o["t"] = s_entries[i].tanks; // P5: target-tank bitmask
+    o["d"] = s_entries[i].days;  // v1.9.0: weekday mask (0x7F = daily)
+    JsonArray st = o["st"].to<JsonArray>(); // v1.9.0: per-tank seconds (0 = shared)
+    for (int k = 0; k < 4; k++) st.add(s_entries[i].secTank[k]);
   }
   String out;
   serializeJson(doc, out);
@@ -64,6 +76,25 @@ void seedDefaults() {
   resetFireTracking();
   s_dirty = true;
   Serial.println("[FEED] first boot: seeded default schedule 07:30 + 17:30 (3 s)");
+}
+
+/** Parse one schedule entry from JSON with v1.9.0 defaults (legacy-safe). */
+void parseEntry(JsonVariant v, FeedTime &t) {
+  t.hour = (uint8_t)(v["h"] | 0);
+  t.minute = (uint8_t)(v["m"] | 0);
+  t.enabled = (bool)(v["e"] | true);
+  t.seconds = (uint8_t)(v["s"] | 3);
+  t.tanks = (uint8_t)(v["t"] | 1); // P5: missing key = legacy blob = tank 1
+  t.days = (uint8_t)(v["d"] | 0x7F); // v1.9.0: absent = every day
+  for (int k = 0; k < 4; k++) t.secTank[k] = 0;
+  if (v["st"].is<JsonArray>()) {
+    int k = 0;
+    for (JsonVariant s : v["st"].as<JsonArray>()) {
+      if (k >= 4) break;
+      t.secTank[k++] = (uint8_t)(s | 0);
+    }
+  }
+  clampEntry(t);
 }
 
 } // anonymous namespace
@@ -90,12 +121,7 @@ bool init() {
   for (JsonVariant v : doc.as<JsonArray>()) {
     if (s_count >= MAX_FEED_TIMES) break;
     FeedTime t;
-    t.hour = (uint8_t)(v["h"] | 0);
-    t.minute = (uint8_t)(v["m"] | 0);
-    t.enabled = (bool)(v["e"] | true);
-    t.seconds = (uint8_t)(v["s"] | 3);
-    t.tanks = (uint8_t)(v["t"] | 1); // P5: missing key = legacy blob = tank 1
-    clampEntry(t);
+    parseEntry(v, t);
     s_last_fired[s_count] = 0xFFFF;
     s_entries[s_count++] = t;
   }
@@ -192,12 +218,7 @@ bool replaceAll(const String &json) {
   for (JsonVariant v : doc.as<JsonArray>()) {
     if (n >= MAX_FEED_TIMES) return false; // oversize payload rejected whole
     FeedTime t;
-    t.hour = (uint8_t)(v["h"] | 0);
-    t.minute = (uint8_t)(v["m"] | 0);
-    t.enabled = (bool)(v["e"] | true);
-    t.seconds = (uint8_t)(v["s"] | 3);
-    t.tanks = (uint8_t)(v["t"] | 1); // P5
-    clampEntry(t);
+    parseEntry(v, t);
     for (int i = 0; i < n; i++) {
       if (tmp[i].hour == t.hour && tmp[i].minute == t.minute) return false;
     }
@@ -222,7 +243,8 @@ bool timeValid() {
 }
 
 FeedTime tick() {
-  const FeedTime none = FeedTime{0, 0, false, 0};
+  FeedTime none{};
+  none.enabled = false;
 
   if (!timeValid() || s_count == 0) return none;
 
@@ -236,19 +258,26 @@ FeedTime tick() {
   for (int i = 0; i < s_count; i++) {
     const FeedTime &e = s_entries[i];
     if (!e.enabled) continue;
+    if (!entryCoversWday(e, lt.tm_wday)) continue; // v1.9.0: weekday mask
     const int entry_min = e.hour * 60 + e.minute;
-    if (entry_min == now_min_of_day &&
-        s_last_fired[i] != (uint16_t)now_min_of_day) {
-      // fire at most once per calendar minute per entry
-      s_last_fired[i] = (uint16_t)now_min_of_day;
-      Serial.printf("[FEED] due entry %d: %02u:%02u (%u s)\n", i,
-                    (unsigned)e.hour, (unsigned)e.minute, (unsigned)e.seconds);
+    // v1.9.0: fire at most once per calendar minute, forever (epoch/60 stamp)
+    const uint32_t now_abs_min = (uint32_t)(now / 60);
+    if (entry_min == now_min_of_day && s_last_fired[i] != now_abs_min) {
+      s_last_fired[i] = now_abs_min;
+      Serial.printf("[FEED] due entry %d: %02u:%02u (%u s, days 0x%02X)\n", i,
+                    (unsigned)e.hour, (unsigned)e.minute, (unsigned)e.seconds,
+                    (unsigned)e.days);
       return e;
     }
   }
   return none;
 }
 
+/**
+ * v1.9.0: weekday-aware next occurrence. With weekday masks the next feed can
+ * be several days out (e.g. a Mon-only entry seen on a Tuesday), so this scans
+ * up to 8 days ahead instead of only today/tomorrow.
+ */
 NextFeed nextOccurrence() {
   NextFeed out{};
   out.valid = false;
@@ -256,6 +285,7 @@ NextFeed nextOccurrence() {
   out.hour = 0;
   out.minute = 0;
   out.seconds = 0;
+  out.daysAhead = 0;
 
   if (!timeValid() || s_count == 0) return out;
 
@@ -265,39 +295,32 @@ NextFeed nextOccurrence() {
 
   const int now_min = lt.tm_hour * 60 + lt.tm_min;
 
-  int best_today = -1, best_tomorrow = -1;
-  uint8_t th = 0, tm_ = 0, ws = 0, wh = 0, wm = 0, ws2 = 0;
-
-  for (int i = 0; i < s_count; i++) {
-    const FeedTime &e = s_entries[i];
-    if (!e.enabled) continue;
-    const int em = e.hour * 60 + e.minute;
-    if (em > now_min && (best_today < 0 || em < best_today)) {
-      best_today = em;
-      th = e.hour;
-      tm_ = e.minute;
-      ws = e.seconds;
+  for (int d = 0; d < 8; d++) {
+    const int wday = (lt.tm_wday + d) % 7;
+    int best = -1;
+    uint8_t bh = 0, bm = 0, bs = 0;
+    for (int i = 0; i < s_count; i++) {
+      const FeedTime &e = s_entries[i];
+      if (!e.enabled) continue;
+      if (!entryCoversWday(e, wday)) continue;
+      const int em = e.hour * 60 + e.minute;
+      if (d == 0 && em <= now_min) continue; // today: strictly in the future
+      if (best < 0 || em < best) {
+        best = em;
+        bh = e.hour;
+        bm = e.minute;
+        bs = e.seconds;
+      }
     }
-    if (best_tomorrow < 0 || em < best_tomorrow) {
-      best_tomorrow = em;
-      wh = e.hour;
-      wm = e.minute;
-      ws2 = e.seconds;
+    if (best >= 0) {
+      out.valid = true;
+      out.tomorrow = (d > 0);
+      out.daysAhead = (uint8_t)d;
+      out.hour = bh;
+      out.minute = bm;
+      out.seconds = bs;
+      return out;
     }
-  }
-
-  if (best_today >= 0) {
-    out.valid = true;
-    out.tomorrow = false;
-    out.hour = th;
-    out.minute = tm_;
-    out.seconds = ws;
-  } else if (best_tomorrow >= 0) {
-    out.valid = true;
-    out.tomorrow = true;
-    out.hour = wh;
-    out.minute = wm;
-    out.seconds = ws2;
   }
   return out;
 }

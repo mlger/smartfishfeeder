@@ -39,6 +39,20 @@ char s_mq_user[CATFISH_MQTT_USER_LEN] = {0};
 char s_mq_pass[CATFISH_MQTT_PASS_LEN] = {0};
 char s_mq_prefix[CATFISH_MQTT_PREFIX_LEN] = CATFISH_MQTT_PREFIX;
 
+// Feeding state (v1.9.0): JSON blobs + policy scalars, all loop()-context only
+char s_retry[256] = {0};
+char s_fired[512] = {0};
+char s_stats[192] = {0};
+char s_hopper[192] = {0};
+uint32_t s_skip_min = 0xFFFF; // 0xFFFF = none
+bool s_vacation = false;
+uint8_t s_gap_min = 0;    // 0 = off
+uint8_t s_max_day = 0;    // 0 = unlimited
+uint8_t s_ctch_win = 10;  // minutes; 0 = disabled
+uint8_t s_hop_low = 20;   // percent
+uint16_t s_tank_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0}; // g/second per tank
+uint16_t s_tank_hcap[CATFISH_MAX_TANKS] = {0, 0, 0, 0}; // hopper capacity (pulse-seconds)
+
 // Guards s_token: written by loop(), read by the net worker task.
 portMUX_TYPE s_token_mux = portMUX_INITIALIZER_UNLOCKED;
 // v1.8.2: guards the shared char-blob buffers (schedule JSON, tank names /
@@ -125,6 +139,30 @@ bool begin() {
     strlcpy(s_tank_ip[0], s_relay_ip, sizeof(s_tank_ip[0]));
     if (s_nvs.putString("tIp1", s_tank_ip[0]) == 0) nvsLogFail("tIp1");
   }
+
+  // ---- feeding state + policy (v1.9.0) ----
+  v = s_nvs.getString("retry", "");
+  strlcpy(s_retry, v.c_str(), sizeof(s_retry));
+  v = s_nvs.getString("fired", "");
+  strlcpy(s_fired, v.c_str(), sizeof(s_fired));
+  v = s_nvs.getString("stats", "");
+  strlcpy(s_stats, v.c_str(), sizeof(s_stats));
+  v = s_nvs.getString("hopper", "");
+  strlcpy(s_hopper, v.c_str(), sizeof(s_hopper));
+  s_skip_min = s_nvs.getULong("skipMin", 0xFFFF);
+  s_vacation = s_nvs.getBool("vacation", false);
+  s_gap_min = s_nvs.getUChar("gapMin", 0);
+  s_max_day = s_nvs.getUChar("maxDay", 0);
+  s_ctch_win = s_nvs.getUChar("ctchWin", 10);
+  s_hop_low = s_nvs.getUChar("hopLow", 20);
+  for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "gps%d", i + 1);
+    s_tank_gps[i] = s_nvs.getUShort(key, 0);
+    snprintf(key, sizeof(key), "hcap%d", i + 1);
+    s_tank_hcap[i] = s_nvs.getUShort(key, 0);
+  }
+  if (s_hop_low < 5 || s_hop_low > 90) s_hop_low = 20;
 
   s_loaded = true;
   Serial.printf("[SYS] prefs loaded from NVS (namespace 'catfish', %u tank%s)\n",
@@ -264,6 +302,126 @@ uint32_t getLastFedEpoch() { return s_last_fed; }
 void setLastFedEpoch(uint32_t epoch) {
   s_last_fed = epoch;
   if (s_loaded && s_nvs.putULong("lastFed", epoch) == 0) nvsLogFail("lastFed");
+}
+
+// ----------------------------------------------- feeding state blobs (v1.9.0)
+String getRetryJson() { return blobCopy(s_retry, sizeof(s_retry)); }
+
+bool setRetryJson(const String &json) {
+  if (json.length() >= sizeof(s_retry)) return false;
+  portENTER_CRITICAL(&s_blob_mux);
+  strlcpy(s_retry, json.c_str(), sizeof(s_retry));
+  portEXIT_CRITICAL(&s_blob_mux);
+  if (s_loaded && s_nvs.putString("retry", json) == 0) nvsLogFail("retry");
+  return true;
+}
+
+String getFiredJson() { return blobCopy(s_fired, sizeof(s_fired)); }
+
+bool setFiredJson(const String &json) {
+  if (json.length() >= sizeof(s_fired)) return false;
+  portENTER_CRITICAL(&s_blob_mux);
+  strlcpy(s_fired, json.c_str(), sizeof(s_fired));
+  portEXIT_CRITICAL(&s_blob_mux);
+  if (s_loaded && s_nvs.putString("fired", json) == 0) nvsLogFail("fired");
+  return true;
+}
+
+String getStatsJson() { return blobCopy(s_stats, sizeof(s_stats)); }
+
+bool setStatsJson(const String &json) {
+  if (json.length() >= sizeof(s_stats)) return false;
+  portENTER_CRITICAL(&s_blob_mux);
+  strlcpy(s_stats, json.c_str(), sizeof(s_stats));
+  portEXIT_CRITICAL(&s_blob_mux);
+  if (s_loaded && s_nvs.putString("stats", json) == 0) nvsLogFail("stats");
+  return true;
+}
+
+String getHopperJson() { return blobCopy(s_hopper, sizeof(s_hopper)); }
+
+bool setHopperJson(const String &json) {
+  if (json.length() >= sizeof(s_hopper)) return false;
+  portENTER_CRITICAL(&s_blob_mux);
+  strlcpy(s_hopper, json.c_str(), sizeof(s_hopper));
+  portEXIT_CRITICAL(&s_blob_mux);
+  if (s_loaded && s_nvs.putString("hopper", json) == 0) nvsLogFail("hopper");
+  return true;
+}
+
+uint32_t getSkipMinute() { return s_skip_min; }
+
+void setSkipMinute(uint32_t minOfDay) {
+  if (minOfDay > 24 * 60) minOfDay = 0xFFFF; // anything past midnight = none
+  s_skip_min = minOfDay;
+  if (s_loaded && s_nvs.putULong("skipMin", s_skip_min) == 0) nvsLogFail("skipMin");
+}
+
+// ------------------------------------------------------ feeding policy (v1.9.0)
+bool getVacation() { return s_vacation; }
+
+void setVacation(bool on) {
+  s_vacation = on;
+  if (s_loaded && !s_nvs.putBool("vacation", on)) nvsLogFail("vacation");
+}
+
+uint8_t getMinGapMin() { return s_gap_min; }
+
+void setMinGapMin(uint8_t minutes) {
+  s_gap_min = minutes;
+  if (s_loaded && s_nvs.putUChar("gapMin", s_gap_min) == 0) nvsLogFail("gapMin");
+}
+
+uint8_t getMaxFeedsDay() { return s_max_day; }
+
+void setMaxFeedsDay(uint8_t maxFeeds) {
+  s_max_day = maxFeeds;
+  if (s_loaded && s_nvs.putUChar("maxDay", s_max_day) == 0) nvsLogFail("maxDay");
+}
+
+uint8_t getCatchupWin() { return s_ctch_win; }
+
+void setCatchupWin(uint8_t minutes) {
+  if (minutes > 120) minutes = 120;
+  s_ctch_win = minutes;
+  if (s_loaded && s_nvs.putUChar("ctchWin", s_ctch_win) == 0) nvsLogFail("ctchWin");
+}
+
+uint8_t getHopperLowPct() { return s_hop_low; }
+
+void setHopperLowPct(uint8_t pct) {
+  if (pct < 5) pct = 5;
+  if (pct > 90) pct = 90;
+  s_hop_low = pct;
+  if (s_loaded && s_nvs.putUChar("hopLow", s_hop_low) == 0) nvsLogFail("hopLow");
+}
+
+uint16_t getTankGps(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  return (i < 0) ? 0 : s_tank_gps[i];
+}
+
+void setTankGps(uint8_t tank1, uint16_t gps) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return;
+  s_tank_gps[i] = gps;
+  char key[8];
+  snprintf(key, sizeof(key), "gps%d", i + 1);
+  if (s_loaded && s_nvs.putUShort(key, gps) == 0) nvsLogFail(key);
+}
+
+uint16_t getTankHopperCap(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  return (i < 0) ? 0 : s_tank_hcap[i];
+}
+
+void setTankHopperCap(uint8_t tank1, uint16_t capSec) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return;
+  s_tank_hcap[i] = capSec;
+  char key[8];
+  snprintf(key, sizeof(key), "hcap%d", i + 1);
+  if (s_loaded && s_nvs.putUShort(key, capSec) == 0) nvsLogFail(key);
 }
 
 bool getBacklightOn() { return s_bl_on; }

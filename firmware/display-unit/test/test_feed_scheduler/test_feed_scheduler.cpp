@@ -383,6 +383,243 @@ void test_tick_preserves_tank_mask(void) {
   TEST_ASSERT_EQUAL_UINT8(0x05, due.tanks);
 }
 
+// ---------------------------------------------------------------------------
+// v1.9.0: weekday masks (calendar used below: 2025-06-15 = Sunday,
+// 2025-06-16 = Monday, 2025-06-17 = Tuesday, 2025-06-18 = Wednesday)
+// ---------------------------------------------------------------------------
+void test_entry_covers_wday_bit_mapping(void) {
+  FeedTime mon{7, 30, true, 3, 0x01};
+  mon.days = 0x01; // bit0 = Monday
+  TEST_ASSERT_TRUE(entryCoversWday(mon, 1));  // tm_wday 1 = Monday
+  TEST_ASSERT_FALSE(entryCoversWday(mon, 0)); // Sunday
+  TEST_ASSERT_FALSE(entryCoversWday(mon, 6)); // Saturday
+
+  FeedTime all{7, 30, true, 3}; // default member init = 0x7F
+  TEST_ASSERT_EQUAL_UINT8(0x7F, all.days);
+  for (int w = 0; w <= 6; w++) TEST_ASSERT_TRUE(entryCoversWday(all, w));
+
+  FeedTime sun{7, 30, true, 3};
+  sun.days = 0x40; // bit6 = Sunday
+  TEST_ASSERT_TRUE(entryCoversWday(sun, 0));
+  TEST_ASSERT_FALSE(entryCoversWday(sun, 1));
+}
+
+void test_tick_weekday_mask_monday_only(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3,"d":1}])");
+  g_now = makeLocalTime(2025, 6, 16, 7, 30, 0); // Monday
+  const FeedTime due = feed_scheduler::tick();
+  TEST_ASSERT_TRUE(due.enabled);
+  TEST_ASSERT_EQUAL_UINT8(7, due.hour);
+  TEST_ASSERT_EQUAL_UINT8(0x01, due.days);
+
+  // same wall time on Tuesday: the mask keeps it silent
+  g_now = makeLocalTime(2025, 6, 17, 7, 30, 0); // Tuesday
+  TEST_ASSERT_FALSE(feed_scheduler::tick().enabled);
+}
+
+void test_tick_default_mask_fires_every_day(void) {
+  // no "d" key -> legacy blob -> every-day (0x7F)
+  const char *json = R"([{"h":7,"m":30,"e":true,"s":3}])";
+  loadSchedule(json);
+  g_now = makeLocalTime(2025, 6, 17, 7, 30, 0); // Tuesday
+  TEST_ASSERT_TRUE(feed_scheduler::tick().enabled);
+
+  // A reload (== reboot) clears fire tracking, so the next calendar day
+  // fires again at the same HH:MM. NOTE: within ONE process the fire
+  // tracker is minute-of-day only and does NOT re-fire on consecutive
+  // days (no midnight rollover in feed_scheduler.cpp) — reported as a
+  // v1.9.0 finding in the worklog, deliberately not asserted here.
+  loadSchedule(json);
+  g_now = makeLocalTime(2025, 6, 18, 7, 30, 0); // Wednesday
+  TEST_ASSERT_TRUE(feed_scheduler::tick().enabled);
+}
+
+// ---------------------------------------------------------------------------
+// v1.9.0: clamping (days 0 -> 0x7F, secTank > 30 -> 30)
+// ---------------------------------------------------------------------------
+void test_days_zero_clamps_to_daily(void) {
+  // stored blob with an empty mask
+  loadSchedule(R"([{"h":8,"m":0,"e":true,"s":3,"d":0}])");
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x7F, out.days);
+
+  // add() with days = 0 (user cleared every checkbox)
+  loadSchedule("[]");
+  FeedTime t{8, 1, true, 3, 0x01};
+  t.days = 0;
+  TEST_ASSERT_TRUE(feed_scheduler::add(t));
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x7F, out.days);
+
+  // and the clamped value is what gets persisted
+  TEST_ASSERT_TRUE(feed_scheduler::flushIfDirty());
+  TEST_ASSERT_NOT_NULL(strstr(prefs::g_sched.c_str(), "\"d\":127"));
+}
+
+void test_sectank_clamps_over_30(void) {
+  loadSchedule(R"([{"h":8,"m":0,"e":true,"s":3,"st":[40,0,0,0]}])");
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(30, out.secTank[0]); // 40 -> 30
+  TEST_ASSERT_EQUAL_UINT8(0, out.secTank[1]);  // 0 = inherit shared
+  TEST_ASSERT_EQUAL_UINT8(3, out.seconds);
+
+  loadSchedule("[]");
+  FeedTime t{8, 1, true, 5, 0x0F};
+  t.secTank[0] = 40;
+  t.secTank[3] = 31;
+  TEST_ASSERT_TRUE(feed_scheduler::add(t));
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(30, out.secTank[0]);
+  TEST_ASSERT_EQUAL_UINT8(30, out.secTank[3]);
+}
+
+void test_entry_seconds_for_tank_fallback_and_override(void) {
+  FeedTime e{7, 30, true, 5, 0x0F}; // shared 5 s, no per-tank overrides
+  TEST_ASSERT_EQUAL_UINT8(5, entrySecondsForTank(e, 1));
+  TEST_ASSERT_EQUAL_UINT8(5, entrySecondsForTank(e, 4));
+
+  e.secTank[0] = 12;
+  e.secTank[1] = 8;
+  TEST_ASSERT_EQUAL_UINT8(12, entrySecondsForTank(e, 1)); // override tank 1
+  TEST_ASSERT_EQUAL_UINT8(8, entrySecondsForTank(e, 2));  // override tank 2
+  TEST_ASSERT_EQUAL_UINT8(5, entrySecondsForTank(e, 3));  // 0 -> shared
+  TEST_ASSERT_EQUAL_UINT8(5, entrySecondsForTank(e, 5));  // out of range -> shared
+}
+
+// ---------------------------------------------------------------------------
+// v1.9.0: JSON roundtrip (d + st survive), legacy blobs without d/st
+// ---------------------------------------------------------------------------
+void test_v190_json_roundtrip_days_and_sectank(void) {
+  loadSchedule("[]");
+  FeedTime t{6, 15, true, 4, 0x03};
+  t.days = 0x02; // Tuesday only
+  t.secTank[0] = 12;
+  t.secTank[1] = 8;
+  TEST_ASSERT_TRUE(feed_scheduler::add(t));
+  TEST_ASSERT_TRUE(feed_scheduler::flushIfDirty());
+  TEST_ASSERT_NOT_NULL(strstr(prefs::g_sched.c_str(), "\"d\":2"));
+  TEST_ASSERT_NOT_NULL(strstr(prefs::g_sched.c_str(), "\"st\":[12,8,0,0]"));
+
+  // reload the exact blob the "NVS" now holds
+  const std::string blob = prefs::g_sched;
+  loadSchedule(blob.c_str());
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x02, out.days);
+  TEST_ASSERT_EQUAL_UINT8(12, out.secTank[0]);
+  TEST_ASSERT_EQUAL_UINT8(8, out.secTank[1]);
+  TEST_ASSERT_EQUAL_UINT8(0, out.secTank[2]);
+  TEST_ASSERT_EQUAL_UINT8(4, out.seconds);
+  TEST_ASSERT_EQUAL_UINT8(0x03, out.tanks);
+}
+
+void test_legacy_blob_without_d_st_loads_daily_and_shared(void) {
+  // pre-v1.9.0 blob: no "d", no "st"
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3,"t":5}])");
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(0x7F, out.days); // absent -> every day
+  for (int i = 0; i < 4; i++) {
+    TEST_ASSERT_EQUAL_UINT8(0, out.secTank[i]); // absent -> shared seconds
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.9.0: nextOccurrence() scans up to 8 days ahead
+// ---------------------------------------------------------------------------
+void test_next_occurrence_mon_only_from_tuesday(void) {
+  // Tuesday 08:00; Mon-only 07:30 -> next Monday is 6 days out
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3,"d":1}])");
+  g_now = makeLocalTime(2025, 6, 17, 8, 0, 0); // Tuesday
+  const feed_scheduler::NextFeed nf = feed_scheduler::nextOccurrence();
+  TEST_ASSERT_TRUE(nf.valid);
+  TEST_ASSERT_TRUE(nf.tomorrow);
+  TEST_ASSERT_EQUAL_UINT8(6, nf.daysAhead);
+  TEST_ASSERT_EQUAL_UINT8(7, nf.hour);
+  TEST_ASSERT_EQUAL_UINT8(30, nf.minute);
+  TEST_ASSERT_EQUAL_UINT8(3, nf.seconds);
+}
+
+void test_next_occurrence_mon_only_from_sunday_is_tomorrow(void) {
+  // Sunday 08:00 (after the 07:30 slot); next Monday = +1 day
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3,"d":1}])");
+  g_now = makeLocalTime(2025, 6, 15, 8, 0, 0); // Sunday
+  const feed_scheduler::NextFeed nf = feed_scheduler::nextOccurrence();
+  TEST_ASSERT_TRUE(nf.valid);
+  TEST_ASSERT_TRUE(nf.tomorrow);
+  TEST_ASSERT_EQUAL_UINT8(1, nf.daysAhead);
+}
+
+void test_next_occurrence_today_future_days_ahead_zero(void) {
+  loadSchedule(R"([{"h":17,"m":30,"e":true,"s":3}])");
+  g_now = makeLocalTime(2025, 6, 15, 8, 0, 0); // Sunday morning
+  const feed_scheduler::NextFeed nf = feed_scheduler::nextOccurrence();
+  TEST_ASSERT_TRUE(nf.valid);
+  TEST_ASSERT_FALSE(nf.tomorrow);
+  TEST_ASSERT_EQUAL_UINT8(0, nf.daysAhead);
+}
+
+// ---------------------------------------------------------------------------
+// v1.9.0 (E3): hasNearDuplicate() — gap, midnight wrap, disjoint days
+// ---------------------------------------------------------------------------
+void test_has_near_duplicate_detection(void) {
+  FeedTime a{7, 0, true, 3};  // daily 07:00
+  FeedTime b{7, 5, true, 3};  // daily 07:05
+  FeedTime pair[2] = {a, b};
+  TEST_ASSERT_TRUE(hasNearDuplicate(pair, 2, 10));   // 5 < 10
+  TEST_ASSERT_FALSE(hasNearDuplicate(pair, 2, 5));   // 5 is not < 5
+  TEST_ASSERT_FALSE(hasNearDuplicate(pair, 2, 0));   // gap disabled
+  TEST_ASSERT_FALSE(hasNearDuplicate(nullptr, 2, 10));
+
+  // circular distance over midnight: 23:55 + 00:05 -> 10 min apart
+  FeedTime n1{23, 55, true, 3};
+  FeedTime n2{0, 5, true, 3};
+  FeedTime wrap[2] = {n1, n2};
+  TEST_ASSERT_TRUE(hasNearDuplicate(wrap, 2, 15));
+  TEST_ASSERT_FALSE(hasNearDuplicate(wrap, 2, 10)); // 10 is not < 10
+
+  // disjoint weekday masks never share a day -> no warning
+  FeedTime mon{7, 0, true, 3};
+  mon.days = 0x01;
+  FeedTime tue{7, 5, true, 3};
+  tue.days = 0x02;
+  FeedTime disjoint[2] = {mon, tue};
+  TEST_ASSERT_FALSE(hasNearDuplicate(disjoint, 2, 10));
+
+  // disabled entries are ignored
+  FeedTime off{7, 1, false, 3};
+  FeedTime withOff[2] = {a, off};
+  TEST_ASSERT_FALSE(hasNearDuplicate(withOff, 2, 10));
+}
+
+// v1.9.0 regression: the same HH:MM must re-fire on LATER days of one uptime.
+// The old minute-of-day fire stamp blocked day-2+ fires entirely (the catch-up
+// scan masked it by feeding 0-10 min late); the epoch-minute stamp fixes it.
+static void test_tick_refires_same_hhmm_next_day(void) {
+  // 2026-01-05 is a Monday; 07:30 entry, two consecutive days, same uptime.
+  loadSchedule("[{\"h\":7,\"m\":30,\"e\":true,\"s\":3,\"t\":1,\"d\":127}]");
+  g_now = makeLocalTime(2026, 1, 5, 7, 30, 30); // Monday
+  FeedTime due = feed_scheduler::tick();
+  TEST_ASSERT_TRUE(due.enabled);
+
+  g_now = makeLocalTime(2026, 1, 5, 7, 31, 0);
+  due = feed_scheduler::tick();
+  TEST_ASSERT_FALSE(due.enabled); // same minute is exhausted
+
+  g_now = makeLocalTime(2026, 1, 6, 7, 30, 30); // Tuesday, NEXT DAY
+  due = feed_scheduler::tick();
+  TEST_ASSERT_TRUE(due.enabled); // must fire again on day 2
+
+  // midnight wrap: 00:05 entry seen at 00:05 on two consecutive days
+  loadSchedule("[{\"h\":0,\"m\":5,\"e\":true,\"s\":3,\"t\":1,\"d\":127}]");
+  g_now = makeLocalTime(2026, 1, 6, 0, 5, 30);
+  TEST_ASSERT_TRUE(feed_scheduler::tick().enabled);
+  g_now = makeLocalTime(2026, 1, 7, 0, 5, 30);
+  TEST_ASSERT_TRUE(feed_scheduler::tick().enabled);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_add_clamps_out_of_range_entry);
@@ -410,5 +647,18 @@ int main(void) {
   RUN_TEST(test_replace_all_parses_tank_mask);
   RUN_TEST(test_effective_tank_mask_clamps_to_configured);
   RUN_TEST(test_tick_preserves_tank_mask);
+  RUN_TEST(test_entry_covers_wday_bit_mapping);
+  RUN_TEST(test_tick_weekday_mask_monday_only);
+  RUN_TEST(test_tick_default_mask_fires_every_day);
+  RUN_TEST(test_days_zero_clamps_to_daily);
+  RUN_TEST(test_sectank_clamps_over_30);
+  RUN_TEST(test_entry_seconds_for_tank_fallback_and_override);
+  RUN_TEST(test_v190_json_roundtrip_days_and_sectank);
+  RUN_TEST(test_legacy_blob_without_d_st_loads_daily_and_shared);
+  RUN_TEST(test_next_occurrence_mon_only_from_tuesday);
+  RUN_TEST(test_next_occurrence_mon_only_from_sunday_is_tomorrow);
+  RUN_TEST(test_next_occurrence_today_future_days_ahead_zero);
+  RUN_TEST(test_has_near_duplicate_detection);
+  RUN_TEST(test_tick_refires_same_hhmm_next_day);
   return UNITY_END();
 }

@@ -63,6 +63,18 @@ void publishRelayOnline(bool online);
 void publishFeeding(bool feeding);
 void publishPulse(uint8_t seconds);
 
+// ---- v1.9.0 state ----------------------------------------------------------
+/** Retained vacation/pause state (A5): "ON" = schedules paused. */
+void publishPaused(bool paused);
+/** Retained daily counters (C3). */
+void publishFeedsToday(uint16_t ok, uint16_t fail);
+/** Retained per-tank last-feed mirror (F2): ISO-8601 + applied seconds. */
+void publishTankLastFeed(uint8_t tank1, uint32_t epoch, uint8_t seconds);
+/** Retained per-tank food-level percent (D1); 255/unknown tanks are skipped. */
+void publishTankFood(uint8_t tank1, uint8_t pct);
+/** Publish food levels for all configured tanks (reads the estimator). */
+void publishFoodLevels();
+
 // ---- per-tank entities (Phase 5) -------------------------------------------
 /** Retained per-tank online state ("ON"/"OFF") for tank @p tank1 (1-based). */
 void publishTankOnline(uint8_t tank1, bool online);

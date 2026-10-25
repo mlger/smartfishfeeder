@@ -296,6 +296,94 @@ the library sources, plus hardening for marginal SD setups:
   must be FAT-formatted (FAT32 for ≤ 32 GB); if an SDXC card still refuses,
   re-format it FAT32 on a PC.
 
+## Feeding feature pack (v1.9.0)
+
+Implements the full v1.9.0 suggestion backlog (schedule/dosing, reliability,
+insights, UX, integrations) **entirely on the display unit** — the relay wire
+format ("feed for N seconds") and `CATFISH_PROTOCOL_VERSION 1` are untouched.
+
+**Schedule & dosing**
+
+- **Weekday masks (A1)** — every schedule entry carries a Mon–Sun mask
+  (`d` in the schedule JSON, bit0=Mon..bit6=Sun; absent/0x7F = daily).
+  `nextOccurrence()` scans up to 8 days ahead, so the countdown is correct
+  even when the next feed is days out ("T+3d 07:30"). The editor (screen and
+  dashboard) has day chips; empty mask clamps back to daily.
+- **Per-tank seconds (A2)** — an entry can override the pulse per target tank
+  (`st` = [t1..t4], 0 = inherit the shared seconds). Fan-out happens in the
+  net worker (one `/feed` call per tank with its own seconds); no protocol
+  change.
+- **Portion presets (A3)** — S/M/L chips map to 2/5/10 s. Optional per-tank
+  food-rate (g/s, TANKS editor) turns seconds into grams for the food-level
+  readout.
+- **Missed-feed catch-up (A4)** — while the unit was off/unreachable, missed
+  entries inside the catch-up window (Settings > Feeding policy, default
+  10 min, 0 = off) are fed once when the clock first becomes valid (RTC boot
+  restore or first NTP sync). The fired-map (NVS) prevents double-fires.
+- **Vacation mode (A5)** — Settings switch + Home badge. Pauses scheduled,
+  catch-up and remote (web/MQTT) feeds; the on-device FEED NOW button and the
+  wireless node buttons stay live (a human is present). Retained MQTT topic
+  `<prefix>/paused`.
+
+**Reliability**
+
+- **Persistent retry journal (B1)** — a failed scheduled/catch-up feed is
+  retried from an NVS-backed journal (2 slots, up to 3 retries at
+  30 s / 5 min / 15 min backoff) that **survives power cycles**; blocked
+  retries (e.g. vacation flipped on meanwhile) give up cleanly instead of
+  looping.
+- **RTC-time feeding (B2)** — scheduled feeds run on the battery-backed RTC
+  whenever the wall clock is plausible; `/api/status` reports the source
+  (`clockSrc`: ntp / rtc / none) and the Settings RTC line shows it.
+- **Post-feed pulse verification (B3)** — for pulses ≥ 3 s a mid-pulse
+  `/status` probe confirms the relay actually reports *feeding*; an
+  online-but-not-pulsing relay raises a "not pulsing? (check food)" toast and
+  a VERIFY row in the history (stall/empty-hopper hint).
+
+**Insights & level**
+
+- **On-device history (C1)** — Schedule > HISTORY shows the newest 24 events
+  (OK/FAIL, tanks, seconds, manual/catch-up/retry/verify/blocked/skipped).
+  RAM ring, works without an SD card (the SD CSV remains the durable copy).
+- **`GET /api/history` + `GET /api/stats` (C2)** — the dashboard gains a
+  history panel, "Today: N fed / M failed" and per-tank food bars.
+- **Daily counters (C3)** — feeds/fails today + lifetime totals in NVS
+  (day-rolled), mirrored to MQTT (`feeds_today`, `fails_today`).
+- **Software hopper estimator (D1)** — per-tank "used seconds since refill"
+  with an optional hopper size (TANKS editor) → level bar on Home, a FOOD
+  card with per-tank refill buttons, a low-food threshold (red bar + MQTT
+  `<prefix>/tankN/food`). The **hardware** level sensor (D2) remains a
+  documented future item.
+
+**UX**
+
+- **Skip-next (E4)** — the "−" button on a schedule row skips that entry's
+  next occurrence exactly once (persisted; consumed by the fire path).
+- The next-feed countdown (E2), feed dose picker (E1: S/M/L + per-tank
+  seconds) and near-duplicate schedule warning (E3, `hasNearDuplicate`) are
+  part of the editor/list rework.
+
+**Integrations & safety**
+
+- **MQTT `feed/cmd` JSON (F1)** — accepts `{"seconds":1..30,"tanks":1..15}`
+  next to the legacy `"ON"`; per-tank buttons unchanged.
+- **Per-tank HA sensors (F2)** — `<prefix>/tankN/last_feed` (timestamp) +
+  `<prefix>/tankN/seconds`, with auto-discovery.
+- **Anti-spam guards (F3)** — minimum gap between feeds (minutes) and a
+  max-feeds-per-day cap (Settings > Feeding policy; 0 = off). Applied to
+  scheduled/catch-up/remote feeds; blocked attempts land in the history as
+  *blocked*.
+
+**Also fixed in v1.9.0 (found by the new test suite):** `tick()` fire-tracking
+stored a minute-of-day stamp, so a daily entry never re-fired on later days of
+one uptime (the catch-up scan masked it by feeding 0–10 min late). Fire stamps
+are now absolute epoch-minutes — same HH:MM re-fires every day, still at most
+once per calendar minute.
+
+Native suite: **109 tests** (scheduler 40, feed_state 25, mqtt payloads 21,
+mech/time/rfnode 23). QEMU smoke extended: vacation toggle + skip-next +
+restore.
+
 ## OTA updates
 
 **Both units run ArduinoOTA**, so firmware updates need no cable once they are on the network:
