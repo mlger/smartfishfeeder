@@ -160,9 +160,63 @@ jobs:
           path: staging/*
           if-no-files-found: error
 
+  # Boots the headless QEMU build (env:display-unit-qemu) in Espressif's
+  # QEMU and runs the scripted UI-event smoke sequence. Catches boot-time
+  # crashes and event-pipeline regressions without hardware (see
+  # scripts/qemu_run.sh and docs/tooling.md).
+  qemu-smoke:
+    name: QEMU smoke test (headless display-unit boot)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO (pinned for reproducible builds)
+        run: pip install platformio==6.2.0
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: pio-display-unit-qemu-${{ runner.os }}-${{ hashFiles('firmware/display-unit/platformio.ini') }}
+          restore-keys: |
+            pio-display-unit-qemu-${{ runner.os }}-
+
+      - name: Install QEMU runtime dependency
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libslirp0
+
+      - name: Download Espressif QEMU (pinned esp32s3-capable release)
+        run: |
+          QEMU_TAG=esp-develop-9.2.2-20260417
+          curl -sL --retry 3 -o /tmp/qemu-xtensa.tar.xz \
+            "https://github.com/espressif/qemu/releases/download/${QEMU_TAG}/qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz"
+          mkdir -p "$HOME/tools"
+          tar -xJf /tmp/qemu-xtensa.tar.xz -C "$HOME/tools"
+          echo "QEMU_BIN=$HOME/tools/qemu/bin/qemu-system-xtensa" >> "$GITHUB_ENV"
+
+      - name: Boot headless and run the UI-event smoke test
+        run: scripts/qemu_run.sh
+
+      - name: Upload serial log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-serial-log-${{ github.sha }}
+          path: firmware/display-unit/.pio/build/display-unit-qemu/qemu-serial.log
+          if-no-files-found: ignore
+
   deploy-pages:
     name: Deploy web flasher to GitHub Pages
-    needs: [build-display-unit, build-relay-unit]
+    needs: [build-display-unit, build-relay-unit, qemu-smoke]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -263,7 +317,7 @@ jobs:
 
   release:
     name: Attach firmware to GitHub release
-    needs: [build-display-unit, build-relay-unit]
+    needs: [build-display-unit, build-relay-unit, qemu-smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -305,7 +359,7 @@ jobs:
   # names would accumulate stale assets on every push).
   release-latest:
     name: Publish rolling latest firmware prerelease
-    needs: [build-display-unit, build-relay-unit]
+    needs: [build-display-unit, build-relay-unit, qemu-smoke]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

@@ -178,6 +178,26 @@ char s_tank_names[CATFISH_MAX_TANKS][CATFISH_TANK_NAME_LEN] = {
 lv_obj_t *s_tank_chip_btns[CATFISH_MAX_TANKS + 1] = {nullptr, nullptr, nullptr,
                                                      nullptr, nullptr}; // + "All"
 
+// ---------------------------------------------------------------------------
+// Programmatic-input guard (spinbox event storm fix, v1.8.3).
+// LVGL 8.4 quirk: lv_spinbox_set_value() ends in lv_textarea_set_text(),
+// which fires LV_EVENT_VALUE_CHANGED UNCONDITIONALLY - even when the value
+// did not change. Programmatic updates (rebuilds, overlay prefill,
+// Home-Assistant-driven ui_set_*) therefore re-enter the spinbox callbacks
+// and re-enqueue their UiEvents: an unbounded feedback loop (boot storm on
+// the tank-count spinbox; endless NVS writes + MQTT republishes after every
+// externally applied pulse). ALL programmatic spinbox writes go through
+// spinSetValueQuiet(); user-driven events never run under the guard.
+// ---------------------------------------------------------------------------
+static bool s_spin_prog = false;
+
+static void spinSetValueQuiet(lv_obj_t *sb, int32_t v) {
+  if (!sb) return;
+  s_spin_prog = true;
+  lv_spinbox_set_value(sb, v);
+  s_spin_prog = false;
+}
+
 // Backlight idle timeout (M6): auto-dim after this much touch inactivity.
 // Touching the screen wakes it again; the user's on/off preference in
 // Settings is separate and persisted.
@@ -334,7 +354,7 @@ lv_obj_t *makeSpinbox(lv_obj_t *parent, int32_t mn, int32_t mx, int32_t val,
   lv_obj_t *sb = lv_spinbox_create(parent);
   lv_spinbox_set_range(sb, mn, mx);
   lv_spinbox_set_digit_format(sb, 2, 0);
-  lv_spinbox_set_value(sb, val);
+  spinSetValueQuiet(sb, val);
   lv_obj_set_size(sb, w, h);
   lv_obj_set_style_bg_color(sb, lv_color_hex(C_BG_DARK), 0);
   lv_obj_set_style_bg_opa(sb, LV_OPA_COVER, 0);
@@ -560,6 +580,7 @@ void editorCancelCb(lv_event_t *e) {
 }
 
 void pulseSpinCb(lv_event_t *e) {
+  if (s_spin_prog) return; // programmatic ui_set_pulse() replay (see guard note)
   lv_obj_t *sb = (lv_obj_t *)lv_event_get_target(e);
   UiEvent ev;
   ev.type = UI_EVT_SET_PULSE;
@@ -838,7 +859,7 @@ void openEditor() {
   if (!s_editor) return;
   lv_roller_set_selected(s_r_hour, 7, LV_ANIM_OFF);
   lv_roller_set_selected(s_r_min, 30, LV_ANIM_OFF);
-  lv_spinbox_set_value(s_sb_sec, prefs::getDefaultPulse());
+  spinSetValueQuiet(s_sb_sec, prefs::getDefaultPulse());
 
   // P5: rebuild the tank checkbox column for the current count (all checked
   // = "feed every configured tank"; hidden entirely for a single tank).
@@ -1708,7 +1729,7 @@ void buildMqttOverlay() {
 void openMqttOverlay() {
   if (!s_mq_overlay) return;
   lv_textarea_set_text(s_mq_ta_host, prefs::getMqttHost().c_str());
-  lv_spinbox_set_value(s_mq_sb_port, prefs::getMqttPort());
+  spinSetValueQuiet(s_mq_sb_port, prefs::getMqttPort());
   lv_textarea_set_text(s_mq_ta_prefix, prefs::getMqttPrefix().c_str());
   lv_textarea_set_text(s_mq_ta_user, prefs::getMqttUser().c_str());
   lv_textarea_set_text(s_mq_ta_pass, prefs::getMqttPass().c_str());
@@ -1841,12 +1862,12 @@ void openMechOverlay() {
   // prefill from the last /status probe (falls back to shared defaults)
   const uint8_t id = s_mech_reported ? s_mech_id : CATFISH_MECH_DEFAULT;
   lv_roller_set_selected(s_mech_roller, id, LV_ANIM_OFF);
-  lv_spinbox_set_value(s_mech_sb_rest,
-                       (s_mech_rest >= 0) ? s_mech_rest : CATFISH_SERVO_REST_DEFAULT);
-  lv_spinbox_set_value(s_mech_sb_feed,
-                       (s_mech_feed >= 0) ? s_mech_feed : CATFISH_SERVO_FEED_DEFAULT);
-  lv_spinbox_set_value(s_mech_sb_hz,
-                       (s_mech_hz >= 0) ? s_mech_hz : CATFISH_STEP_HZ_DEFAULT);
+  spinSetValueQuiet(s_mech_sb_rest,
+                    (s_mech_rest >= 0) ? s_mech_rest : CATFISH_SERVO_REST_DEFAULT);
+  spinSetValueQuiet(s_mech_sb_feed,
+                    (s_mech_feed >= 0) ? s_mech_feed : CATFISH_SERVO_FEED_DEFAULT);
+  spinSetValueQuiet(s_mech_sb_hz,
+                    (s_mech_hz >= 0) ? s_mech_hz : CATFISH_STEP_HZ_DEFAULT);
   lv_obj_clear_state(s_mech_sw_dir, LV_STATE_CHECKED); // DIR level not reported; default low
   mechSyncRows();
   lv_obj_clear_flag(s_mech_overlay, LV_OBJ_FLAG_HIDDEN);
@@ -1871,6 +1892,7 @@ void tankChipCb(lv_event_t *e) {
 void tankCountSpinCb(lv_event_t *e) {
   (void)e;
   if (!s_tank_sb_count) return;
+  if (s_spin_prog) return; // programmatic ui_tanks_rebuild() replay (see guard note)
   UiEvent ev;
   ev.type = UI_EVT_TANK_COUNT;
   ev.a = (uint8_t)lv_spinbox_get_value(s_tank_sb_count);
@@ -2342,7 +2364,7 @@ void ui_tanks_rebuild(uint8_t count, const String names[CATFISH_MAX_TANKS],
       snprintf(s_tank_names[i], sizeof(s_tank_names[i]), "Tank %u",
                (unsigned)(i + 1));
   }
-  if (s_tank_sb_count) lv_spinbox_set_value(s_tank_sb_count, s_tank_count);
+  if (s_tank_sb_count) spinSetValueQuiet(s_tank_sb_count, s_tank_count);
   rebuildTankChips();
   rebuildTankRows();
   rebuildScheduleList(); // entry labels carry tank tags when count > 1
@@ -2385,7 +2407,7 @@ void ui_set_mqtt_broker(const String &text) {
 }
 
 void ui_set_pulse(uint8_t seconds) {
-  if (s_sb_pulse) lv_spinbox_set_value(s_sb_pulse, seconds);
+  spinSetValueQuiet(s_sb_pulse, seconds);
 }
 
 void ui_set_hour12(bool h12) {

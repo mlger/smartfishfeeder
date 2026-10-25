@@ -109,3 +109,58 @@ Settings live in `~/.claude-mem/settings.json` (user-local, never committed).
   "Erase device" checkbox in the install dialog. ESP32 (IDF v4+/Arduino 3.x)
   firmware must be pre-merged — ESP Web Tools cannot patch flash parameters
   on the fly.
+
+## QEMU emulator (headless firmware testing)
+
+The display unit boots and runs **without hardware** in Espressif's QEMU fork
+(machine `esp32s3`, supported by the [IDF QEMU
+docs](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/tools/qemu.html)).
+`env:display-unit-qemu` (`-DCATFISH_QEMU=1`) compiles the full application —
+LVGL UI, feed scheduler, prefs, web/MQTT managers, the whole `UiEvent`
+pipeline — with the board layer emulated away:
+
+| Hardware | QEMU behaviour |
+| --- | --- |
+| RGB panel + GT911 touch | LVGL registers an 800x480 RAM framebuffer (layout, timers and animations fully exercised; final blit is a no-op) |
+| PCF85063 RTC / CH422G / I2C | skipped; a fixed wall clock (2025-02-07 07:45 UTC — between the two seeded schedule entries) is injected via `settimeofday()` |
+| TF card, nRF24L01 (SPI) | skipped |
+| WiFi / ESP-NOW | wifi-task not started; the app deliberately exercises its documented offline paths |
+
+`loop()` pumps a scripted smoke sequence through the *same* `UiEvent` queue
+the touch UI uses — pulse set → schedule add → manual feed without WiFi →
+12-hour clock toggle → "All tanks" selection — and asserts each side effect
+(NVS persist, scheduler state, WiFi-down abort accounting). Run it:
+
+```sh
+scripts/qemu_run.sh                                 # build + boot + verdict
+SKIP_BUILD=1 scripts/qemu_run.sh                    # reuse the last build
+QEMU_RUN_SECONDS=120 scripts/qemu_run.sh mylog.txt  # longer run / log path
+```
+
+PASS requires `[QEMU] SMOKE PASS` in the serial log and **no** crash markers
+(`Guru Meditation`, panic, assert, abort), no `[QEMU] FAIL` lines and no
+reboot loop; otherwise the script prints the tail of the serial log and exits
+non-zero. CI runs the same script in the **"QEMU smoke test"** job (QEMU
+release pinned to `esp-develop-9.2.2-20260417`; serial log uploaded as an
+artifact on failure).
+
+One-time setup (Linux x86_64; the script also finds `QEMU_BIN` from the
+environment):
+
+```sh
+mkdir -p tools && curl -sL -o /tmp/qemu.tar.xz \
+  https://github.com/espressif/qemu/releases/download/esp-develop-9.2.2-20260417/qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz
+tar -xJf /tmp/qemu.tar.xz -C tools/   # -> tools/qemu/bin/qemu-system-xtensa
+sudo apt-get install libslirp0        # only runtime dependency
+```
+
+Notes:
+
+- **Never flash `display-unit-qemu` to hardware** — it skips panel/RTC/SD/nRF24
+  bring-up by design. Hardware env: `display-unit` (unchanged).
+- PSRAM is not emulated here; the headless build doesn't need it (LVGL draw
+  buffer is 32 KB internal RAM, LVGL pool is a static array).
+- The **relay unit (ESP8266) cannot use this emulator** — Espressif's QEMU
+  covers the ESP32 family only. Relay logic stays covered by the hardware
+  build plus the shared native test suite (`pio test -d firmware/display-unit
+  -e native`).

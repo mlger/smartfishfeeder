@@ -241,6 +241,31 @@ A full-codebase audit and fix round. User-visible fixes:
 - **Lock hygiene**: `ui_set_pulse` (Home Assistant path) and three probe-result toasts now hold the LVGL lock; cross-task prefs/relay-IP string access is bounded and guarded (web task / LVGL task vs loop vs net-worker).
 - **Misc**: constant-time dashboard token compare; OTA upload abort cleans the Update session; SD rotation counter starts at the existing file size (2 MB cap is real now); LVGL pool 64→96 KB (long-session "Out of memory" skips); `setEnabledByIdentity` (queued schedule toggles survive index shifts, unit-tested); mDNS on the relay is pumped explicitly instead of relying on ArduinoOTA; embedded dashboard gzip is byte-deterministic; web-flasher pins esp-web-tools 10.4.0; known-glyph placeholders replace two characters Montserrat renders as tofu.
 
+## Stability fixes (v1.8.3)
+
+Found by the new headless **QEMU smoke test** (see [tooling.md](tooling.md)) on
+its very first run — both bugs are live on hardware, not emulator artifacts:
+
+- **Endless event storm from programmatic spinbox updates** (LVGL 8.4 quirk):
+  `lv_spinbox_set_value()` always fires `VALUE_CHANGED` because it ends in
+  `lv_textarea_set_text()`, which re-emits the event unconditionally. Every
+  programmatic update therefore re-entered the spinbox callbacks and
+  re-enqueued their `UiEvent`s — two unbounded feedback loops:
+  - the Settings tank-count spinbox rebuilt the whole tank UI in an endless
+    boot loop (the serial log flooded with `tank count 1 -> 1` on every boot
+    since v1.5.0, with a permanently re-triggered "Tanks set to N" toast),
+  - every externally applied pulse (Home Assistant / dashboard) re-enqueued
+    `SET_PULSE` forever after the first change — endless NVS flash writes and
+    retained MQTT republishes since v1.3.0.
+  All programmatic spinbox writes now go through a guarded quiet setter
+  (`spinSetValueQuiet`), the two live callbacks ignore guarded updates, and
+  the loop-side handlers treat same-value events as no-ops.
+- **QEMU tooling**: `env:display-unit-qemu` + `scripts/qemu_run.sh` boot the
+  full application headless in Espressif's QEMU (`esp32s3` machine), inject a
+  wall clock, script real UI events through the production event queue and
+  assert the effects (NVS persist, scheduler state, WiFi-down abort). Runs in
+  CI on every push/PR as the "QEMU smoke test" job.
+
 ## OTA updates
 
 **Both units run ArduinoOTA**, so firmware updates need no cable once they are on the network:
