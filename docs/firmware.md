@@ -226,6 +226,21 @@ Battery "pucks" (any ESP8266/ESP32 + button) can trigger a feed wirelessly. Both
 
 **SPI sharing**: the nRF24 and the TF card sit on the same SPI pins; every SD and radio operation is serialized by `src/spi_bus_guard.h`, so both features can be enabled together. Remove a `-DCATFISH_FEATURE_*` line in `platformio.ini` to build a radio-free image — each feature degrades to a status line ("disabled"/"not found").
 
+## Stability audit (v1.8.2)
+
+A full-codebase audit and fix round. User-visible fixes:
+
+- **Display tearing/flicker**: the anti-tearing configuration needs **two** RGB frame buffers, but only one was ever allocated (the vendor port expects the app to request the count before `Board::begin()`). LVGL then rendered straight into the buffer the panel was scanning — clock/countdown/toast updates sheared. Both buffers are now allocated (extra 768 KB in PSRAM).
+- **MQTT could crash / never connect**: the MQTT library stores raw `const char*` config pointers; the hub passed temporary strings, which died at the end of `applyConfig()`. Config is now copied into stable buffers. Credentials can also be *cleared* (auth off) now, retained stray `ON` commands no longer replay a feed on every reconnect, and a disabled client no longer reports "offline - retrying".
+- **RTC probe always failed**: the zero-byte I2C probe was rejected by ESP-IDF ≥ 5.4 (`i2c_master_write` rejects NULL data at any length), so a fitted CR927 was never detected. Fixed (1-byte register-pointer probe) — *this also silently fixes the v1.6.0 feature on hardware*.
+- **Token rotation broke feeds until reboot**: the relay-token snapshot used for feeds was not refreshed after a successful rotation. It is now.
+- **Relay unit safety**: changing the mechanism *during* a feed no longer latches the motor relay ON forever (stop path is now idempotent ALL-OFF, and `/config` rejects mechanism changes while feeding with `409 busy_feeding`); `/config` applies all-or-nothing (a bad `pulseS` no longer keeps a RAM-only new token).
+- **Scheduled feeds are never silently dropped**: queue-full and partial multi-tank failures now arm the 30 s retry instead of vanishing with a toast.
+- **Wireless feed nodes**: nRF24 hub now uses a static 12-byte payload (32-byte default desynchronized reads); the dedup ring no longer permanently rejects a node's very first `seq == 0` broadcast.
+- **Dashboard**: schedule save no longer races its own re-fetch (looked like "save lost"); pulse stepper no longer snaps back within 3 s; token dialog no longer throws when already open; FEED omits `tanks` until the tank list has loaded (device default = all configured).
+- **Lock hygiene**: `ui_set_pulse` (Home Assistant path) and three probe-result toasts now hold the LVGL lock; cross-task prefs/relay-IP string access is bounded and guarded (web task / LVGL task vs loop vs net-worker).
+- **Misc**: constant-time dashboard token compare; OTA upload abort cleans the Update session; SD rotation counter starts at the existing file size (2 MB cap is real now); LVGL pool 64→96 KB (long-session "Out of memory" skips); `setEnabledByIdentity` (queued schedule toggles survive index shifts, unit-tested); mDNS on the relay is pumped explicitly instead of relying on ArduinoOTA; embedded dashboard gzip is byte-deterministic; web-flasher pins esp-web-tools 10.4.0; known-glyph placeholders replace two characters Montserrat renders as tofu.
+
 ## OTA updates
 
 **Both units run ArduinoOTA**, so firmware updates need no cable once they are on the network:

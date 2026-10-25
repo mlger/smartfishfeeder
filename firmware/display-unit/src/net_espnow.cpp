@@ -28,7 +28,11 @@ uint32_t s_rejected = 0;
 
 // Small dedup ring: a puck retry often re-broadcasts the same seq.
 constexpr size_t SEQ_RING = 8;
-uint16_t s_seen[SEQ_RING] = {0};
+// Pre-filled with 0xFFFF (v1.8.2): a {0}-initialized ring permanently
+// rejected the very first seq==0 broadcast of any node (a zero slot
+// always 'matched' and was never replaced).
+uint16_t s_seen[SEQ_RING] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+                             0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 uint8_t s_seen_idx = 0;
 
 bool seqSeen(uint16_t seq) {

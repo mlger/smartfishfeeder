@@ -130,7 +130,7 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
 "use strict";
 const $=id=>document.getElementById(id);
 let token=localStorage.catfishToken||"";
-let pulse=3, schedule=[], dirty=false, feedBusy=false;
+let pulse=3, schedule=[], dirty=false, feedBusy=false, pulseDirty=false;
 let tanks=[], selTank=0; // selTank: 0-based index or "all"
 let hour12=false; // v1.6.0: presentation only, from /api/status
 let lastHour12=null;
@@ -146,7 +146,7 @@ function maskTag(m){const p=[];for(let i=0;i<4;i++)if(m&(1<<i))p.push(i+1);retur
 
 async function api(path,opt={}){
   const r=await fetch(path,{...opt,headers:{...(opt.headers||{}),"X-Catfish-Token":token}});
-  if(r.status===403){$("tokDlg").showModal();throw new Error("bad token")}
+  if(r.status===403){if(!$('tokDlg').open)$("tokDlg").showModal();throw new Error("bad token")} // v1.8.2: showModal throws if already open (aborting the rest of refresh)
   const txt=await r.text();try{return JSON.parse(txt)}catch(e){return{raw:txt}}
 }
 function mut(path,method,body){
@@ -202,21 +202,22 @@ async function refresh(){
     if(JSON.stringify(s.tanks||[])!==JSON.stringify(tanks)){tanks=s.tanks||[];renderTanks();renderAddTanks();renderSched()}
     else renderTanks();
     if(hour12!==lastHour12){lastHour12=hour12;renderSched()} // relabel once per format change
-    if(!dirty){pulse=s.pulse||3;renderPulse()}
+    if(!dirty&&!pulseDirty){pulse=s.pulse||3;renderPulse()} // v1.8.2: pulseDirty — the 3 s poll used to snap back a selection made seconds ago
   }catch(e){}
 }
 setInterval(refresh,3000);
 
 /* ---------- feed ---------- */
 function renderPulse(){$("pVal").textContent=pulse+" s"}
-$("pMinus").onclick=()=>{if(pulse>1){pulse--;renderPulse()}};
-$("pPlus").onclick=()=>{if(pulse<30){pulse++;renderPulse()}};
+$("pMinus").onclick=()=>{if(pulse>1){pulse--;pulseDirty=true;renderPulse()}};
+$("pPlus").onclick=()=>{if(pulse<30){pulse++;pulseDirty=true;renderPulse()}};
 $("feedBtn").onclick=async()=>{
   feedBusy=true;$("feedBtn").disabled=true;$("feedBtn").textContent="FEEDING...";
-  try{const r=await mut("/api/feed","POST",{seconds:pulse,tanks:maskOf(selTank,Math.max(tanks.length,1))});
+  try{const body={seconds:pulse};if(tanks.length)body.tanks=maskOf(selTank,tanks.length); // v1.8.2: omit tanks on first load so the device default (all configured) applies
+    const r=await mut("/api/feed","POST",body);
     if(r.ok)toast("Feeding fish...");else toast(r.error||"Failed",3000)}
   catch(e){toast(e.message,3000)}
-  feedBusy=false;setTimeout(refresh,800);
+  pulseDirty=false;feedBusy=false;setTimeout(refresh,800);
 };
 
 /* ---------- schedule ---------- */
@@ -257,7 +258,11 @@ $("addBtn").onclick=()=>{
 };
 $("saveBtn").onclick=async()=>{
   try{const r=await mut("/api/schedule","PUT",schedule);
-    if(r.ok){toast("Schedule saved");dirty=false;$("saveBtn").disabled=true;loadSched()}
+    if(r.ok){toast("Schedule saved");dirty=false;$("saveBtn").disabled=true;
+      // v1.8.2: /api/schedule returns 202 and the device applies the new
+      // array on its next loop pass — an immediate re-fetch raced that and
+      // could show the OLD schedule (making it look like the save was lost).
+      setTimeout(loadSched,2500)}
     else toast(r.error||"Rejected",3000)}
   catch(e){toast(e.message,3000)}
 };

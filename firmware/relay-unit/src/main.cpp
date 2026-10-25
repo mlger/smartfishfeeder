@@ -329,20 +329,14 @@ static void startFeedPulse(uint32_t seconds) {
 }
 
 static void stopFeedPulse() {
-  switch (g_mech.mechanism) {
-    case CATFISH_MECH_SERVO:
-      g_servo.write(g_mech.servoRestDeg);
-      g_servo.detach();  // cheap servos hold by detent; stops idle hum
-      break;
-    case CATFISH_MECH_STEPPER:
-      digitalWrite(STEP_PIN, LOW);
-      digitalWrite(DIR_PIN, LOW);
-      break;
-    case CATFISH_MECH_MOTOR:
-    default:
-      digitalWrite(RELAY_PIN, RELAY_OFF);
-      break;
-  }
+  // v1.8.2: idempotent ALL-OFF — this used to switch on g_mech.mechanism at
+  // stop time, so a mechanism change DURING a feed (e.g. motor -> servo via
+  // /config) skipped the RELAY off path and latched the motor ON forever.
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+  digitalWrite(STEP_PIN, LOW);
+  digitalWrite(DIR_PIN, LOW);
+  g_servo.write(g_mech.servoRestDeg);
+  g_servo.detach();  // cheap servos hold by detent; stops idle hum
   g_feeding = false;
   g_ledMode = LED_MODE_HEARTBEAT;
   LOG("feed END (%s idle)", catfishMechName(g_mech.mechanism));
@@ -646,10 +640,23 @@ static void handleConfig() {
     sendJsonError(400, "bad_mechanism");
     return;
   }
+  // v1.8.2: reject a mechanism CHANGE while a feed is running. Previously a
+  // switch mid-pulse made stopFeedPulse() take the NEW mechanism's stop path,
+  // leaving the motor relay latched ON until reboot.
+  if (g_feeding && doc["mechanism"].is<const char*>() &&
+      catfishMechFromName(doc["mechanism"].as<const char*>()) != g_mech.mechanism) {
+    sendJsonError(409, "busy_feeding");
+    return;
+  }
 
   bool changed = false;
 
-  // Optional: rotate the token ("newToken"; "token" stays the current credential).
+  // v1.8.2: validate EVERYTHING into locals first, mutate only after all
+  // checks pass. Previously newToken was written into g_cfg before the
+  // maxPulseS/pulseS validation, so a 400 response kept the RAM token while
+  // EEPROM still held the old one — the display then sent a token the relay
+  // rejected (and reboot was the only cure).
+  const char* newTok = nullptr;
   if (doc["newToken"].is<const char*>()) {
     const char* nt = doc["newToken"].as<const char*>();
     if (nt != nullptr && nt[0] != '\0') {
@@ -657,29 +664,45 @@ static void handleConfig() {
         sendJsonError(400, "token_too_long");
         return;
       }
-      snprintf(g_cfg.token, sizeof(g_cfg.token), "%s", nt);
-      changed = true;
+      newTok = nt;
     }
   }
-
+  bool hasMax = false;
+  uint8_t newMax = 0;
   if (doc["maxPulseS"].is<long>()) {
     const long v = doc["maxPulseS"].as<long>();
     if (v < 1 || v > (long)MAX_PULSE_LIMIT_S) {
       sendJsonError(400, "maxPulseS_range_1_60");
       return;
     }
-    g_cfg.maxPulseS = (uint8_t)v;
-    changed = true;
+    newMax = (uint8_t)v;
+    hasMax = true;
   }
-
+  bool hasPulse = false;
+  uint8_t newPulse = 0;
   if (doc["pulseS"].is<long>()) {
     long v = doc["pulseS"].as<long>();
     if (v < 1 || v > (long)PULSE_S_LIMIT) {
       sendJsonError(400, "pulseS_range_1_30");
       return;
     }
-    if (v > (long)g_cfg.maxPulseS) v = (long)g_cfg.maxPulseS;  // keep pulseS <= maxPulseS
-    g_cfg.pulseS = (uint8_t)v;
+    const uint8_t effMax = hasMax ? newMax : g_cfg.maxPulseS;
+    if (v > (long)effMax) v = (long)effMax;  // keep pulseS <= maxPulseS
+    newPulse = (uint8_t)v;
+    hasPulse = true;
+  }
+
+  // ---- all validation passed: apply ----
+  if (newTok != nullptr) {
+    snprintf(g_cfg.token, sizeof(g_cfg.token), "%s", newTok);
+    changed = true;
+  }
+  if (hasMax) {
+    g_cfg.maxPulseS = newMax;
+    changed = true;
+  }
+  if (hasPulse) {
+    g_cfg.pulseS = newPulse;
     changed = true;
   }
 
@@ -811,7 +834,10 @@ void setup() {
 
   configTime(NTP_TZ, NTP_SERVER_1, NTP_SERVER_2);  // "PHT-8" = UTC+8 (POSIX sign inverted)
 
-  // mDNS on ESP8266 runs from lwIP timers (unlike ESP32, no MDNS.update() call).
+  // mDNS on ESP8266: LEAmDNS answers queries only after probing completes,
+  // and probing advances ONLY inside MDNS.update(). Today ArduinoOTA.handle()
+  // happens to pump it; loop() calls it explicitly too so mDNS never silently
+  // dies if OTA is ever removed or gated (v1.8.2).
   if (MDNS.begin(HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);
     LOG("mDNS: http://%s.local", HOSTNAME);
@@ -849,6 +875,7 @@ void loop() {
   mechTick();          // P4: servo sweep / stepper pulses while feeding
   statusLedTick();
   factoryResetTick();  // FLASH button held -> wipe config + reboot
+  MDNS.update();       // v1.8.2: explicit pump (see setup comment)
   g_server.handleClient();
   ArduinoOTA.handle();
   discoveryPump();

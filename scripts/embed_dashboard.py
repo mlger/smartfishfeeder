@@ -19,7 +19,12 @@ try:
     PROJECT_DIR = env["PROJECT_DIR"]  # .../firmware/display-unit
     STANDALONE = False
 except (NameError, ImportError):
-    PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # v1.8.2: standalone mode used to resolve two levels too high (repo root
+    # instead of firmware/display-unit), silently checking/creating paths
+    # outside the repo. Derive the display-unit dir from the script location.
+    PROJECT_DIR = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "firmware", "display-unit"))
     STANDALONE = True
 
 SRC = os.path.normpath(os.path.join(PROJECT_DIR, "..", "..", "dashboard", "index.html"))
@@ -27,9 +32,16 @@ DST = os.path.normpath(os.path.join(PROJECT_DIR, "src", "dashboard_html.h"))
 
 
 def build() -> None:
+    if not os.path.exists(SRC):
+        # v1.8.2: fail loudly — silently skipping embedded a stale dashboard
+        # with zero warning when the source file was moved/renamed.
+        raise SystemExit("[embed_dashboard] ERROR: source not found: %s" % SRC)
     with open(SRC, "rb") as f:
         raw = f.read()
-    gz = gzip.compress(raw, 9)
+    # mtime=0 (v1.8.2): gzip embeds the wall-clock time in its header, which
+    # made every regeneration produce different bytes (non-reproducible
+    # firmware builds). mtime=0 makes the output a pure function of the input.
+    gz = gzip.compress(raw, 9, mtime=0)
     out = []
     out.append("#pragma once")
     out.append("// AUTO-GENERATED from dashboard/index.html by scripts/embed_dashboard.py")

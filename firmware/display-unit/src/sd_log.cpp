@@ -99,7 +99,18 @@ bool begin(esp_expander::Base *expander) {
     return false;
   }
   s_state = State::Mounted;
-  s_bytes_since_rotate = 0;
+  // v1.8.2: seed the rotation counter with the existing log size — starting
+  // at 0 let a card that already held ~2 MB grow to ~4 MB before rotating.
+  // (Still inside the spi_bus_guard taken above; CS asserted around the op.)
+  {
+    csSelect();
+    File f = SD.open(LOG_PATH, FILE_READ);
+    if (f) {
+      s_bytes_since_rotate = (uint32_t)f.size();
+      f.close();
+    }
+    csDeselect();
+  }
   writeHeaderIfEmpty();
   const uint64_t tot = SD.totalBytes(), used = SD.usedBytes();
   spi_bus_guard::give();

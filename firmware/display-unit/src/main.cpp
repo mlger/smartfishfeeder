@@ -401,9 +401,11 @@ static bool s_rtc_present = false;
 static bool s_rtc_ntp_synced = false;
 static String s_rtc_status = "not present";
 
-// "Plausible" floor: 2024-01-01 UTC. An RTC older than this was never set
-// (fresh board / battery just added) — don't restore garbage.
-static const time_t CATFISH_RTC_MIN_EPOCH = 1704067200;
+// "Plausible" floor: 2025-01-01 UTC, matching feed_scheduler::timeValid().
+// An RTC older than this was never set (fresh board / battery just added) —
+// don't restore garbage (v1.8.2: was 2024, which restored a clock the
+// scheduler still refused to trust).
+static const time_t CATFISH_RTC_MIN_EPOCH = 1735689600;
 
 static void rtcBootInit() {
   s_rtc_present = pcf85063::begin();
@@ -496,8 +498,15 @@ static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
     return;
   }
   if (!net_worker::enqueueFeed(seconds, manual, hour, minute, retry, tankMask)) {
-    uiToast("Too busy, try again");
-    Serial.println("[FEED] worker queue full, request dropped");
+    // v1.8.2: a scheduled feed dropped because the worker queue was full gets
+    // a retry slot instead of being lost with a misleading "try again" toast.
+    if (!manual && !retry && armRetry(hour, minute, seconds, 30000UL, tankMask)) {
+      uiToast("Feeder busy - feed will retry");
+      Serial.println("[FEED] worker queue full, scheduled feed retry armed");
+    } else {
+      uiToast("Too busy, try again");
+      Serial.println("[FEED] worker queue full, request dropped");
+    }
     return;
   }
   if (manual) {
@@ -560,7 +569,9 @@ static void handleUiEvent(const UiEvent &ev) {
 
     case UI_EVT_SET_PULSE:
       prefs::setDefaultPulse(ev.a);
+      lvgl_port_lock(-1);
       ui_set_pulse(ev.a); // also corrects the spinbox when set via Home Assistant
+      lvgl_port_unlock();
       mqtt_mgr::publishPulse(ev.a); // retained; no-op when disconnected
       Serial.printf("[FEED] default pulse set to %u s\n", (unsigned)ev.a);
       break;
@@ -625,7 +636,9 @@ static void handleUiEvent(const UiEvent &ev) {
       break;
 
     case UI_EVT_SCHED_PERSIST:
-      feed_scheduler::setEnabled(ev.a, ev.flag); // single-writer flip (loop ctx)
+      // v1.8.2: identity-packed (h/m/s in a/b/c) so a queued toggle survives
+      // index shifts from a dashboard replaceAll or a same-batch trash tap.
+      feed_scheduler::setEnabledByIdentity(ev.a, ev.b, ev.c, ev.flag);
       feed_scheduler::flushIfDirty();
       refreshNextFeedUi(); // enable/disable changes the next occurrence
       break;
@@ -679,6 +692,10 @@ static void handleUiEvent(const UiEvent &ev) {
           s_opt_feeding[i] = false;
         }
         mqtt_mgr::clearTankDiscovery(prev, nw);
+      } else if (nw > prev) {
+        // v1.8.2: grow — publish HA discovery for the new tanks right away
+        // instead of waiting for the next broker reconnect.
+        mqtt_mgr::publishDiscovery();
       }
       if (s_selected_tank != 0xFE && s_selected_tank >= nw) s_selected_tank = 0;
       syncTanksUi();
@@ -737,6 +754,8 @@ static void handleWorkerResult(const net_worker::Result &r) {
   if (r.kind == net_worker::Result::RES_TOKEN) {
     if (r.ok) {
       prefs::setRelayToken(String(r.token));
+      relay_client::applyTankTokens(); // v1.8.2: refresh the worker's token
+                                       // snapshot, or the next feed 403s
       rfNodeTokenChanged(); // rotation changed the global token -> re-key nodes
       uiToast("Relay token updated");
       Serial.printf("[NET] relay token rotated OK (ip %s)\n", r.ip);
@@ -811,9 +830,18 @@ static void handleWorkerResult(const net_worker::Result &r) {
 
       if (r.clamped)
         Serial.printf("[FEED] relay clamp note: %s\n", r.note);
-      if (r.tanksFail)
+      if (r.tanksFail) {
         Serial.printf("[FEED] partial feed: ok=0x%X fail=0x%X (%s)\n",
                       (unsigned)r.tanksOk, (unsigned)r.tanksFail, r.error);
+        // v1.8.2: partial scheduled feeds retry the failed tanks too — the
+        // success of tank 1 must not strand tank 2 without a retry (P5 intent).
+        if (!r.manual && !r.retry &&
+            armRetry(r.hour, r.minute, r.seconds, 30000UL, r.tanksFail)) {
+          uiToast("Some tanks failed - retrying in 30 s");
+          Serial.printf("[FEED] partial scheduled feed, retry armed (mask 0x%X)\n",
+                        (unsigned)r.tanksFail);
+        }
+      }
       // Retained MQTT mirror: the relay IS pulsing now (M2-consistent).
       recomputeAggregates();
       if (clock_ok) mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
@@ -890,15 +918,16 @@ static void handleWorkerResult(const net_worker::Result &r) {
     // Retained MQTT mirror of the relay state (no-ops when disconnected).
     mqtt_mgr::publishTankOnline(r.tankId, r.online);
     recomputeAggregates();
+    refreshSelectedTankCard(); // v1.8.2: keep the "All" card fresh after probes too
     if (r.report) {
       if (!net_wifi::wifi_is_connected())
-        ui_toast("WiFi not connected");
+        uiToast("WiFi not connected");
       else if (r.online) {
         String t = String("Tank ") + (int)r.tankId + " OK  v" + r.version;
         if (r.protoMismatch) t += " (protocol mismatch!)";
-        ui_toast(t);
+        uiToast(t);
       } else
-        ui_toast(String("Tank ") + (int)r.tankId + " unreachable");
+        uiToast(String("Tank ") + (int)r.tankId + " unreachable");
     }
     return;
   }
@@ -930,6 +959,15 @@ void setup() {
   // that driver. See esp_panel_board_custom_conf.h for the v1.8.1 rationale.
   s_board = new Board();
   s_board->init();
+  // v1.8.2 fix (flicker): avoid-tearing mode 3 needs TWO full frame buffers,
+  // but the RGB bus defaults to num_fbs=1 — the vendor port header explicitly
+  // says the app must request the buffer count BEFORE begin(). Without this,
+  // getFrameBufferByIndex(1) returned nullptr and LVGL rendered straight into
+  // the buffer the RGB peripheral was scanning (tearing on every partial
+  // update). Costs one extra 768 KB PSRAM buffer (8 MB available).
+  if (s_board->getLCD()) {
+    s_board->getLCD()->configFrameBufferNumber(LVGL_PORT_DISP_BUFFER_NUM);
+  }
   if (!s_board->begin()) {
     Serial.println("[SYS] ERROR: board begin() failed - halting");
     while (true) delay(1000);

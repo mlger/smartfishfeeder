@@ -75,6 +75,12 @@ bool removeByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds);
 /** Enable/disable an entry. Marks persistence dirty. */
 bool setEnabled(int index, bool enabled);
 
+/** Enable/disable the first entry matching h:m:s (identity-safe vs index
+ *  shifts — the UI queues toggles, and the list can change meanwhile).
+ *  @return false when not found. */
+bool setEnabledByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds,
+                          bool enabled);
+
 /** Flip an entry's enabled flag. Marks persistence dirty. */
 bool toggle(int index);
 
