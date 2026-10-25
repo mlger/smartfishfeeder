@@ -128,13 +128,35 @@ void wifiTask(void * /*param*/) {
       s_scan_req = 0;
       s_scan_state = net_wifi::SCAN_BUSY;
       Serial.println("[NET] UI scan request");
-      WiFi.scanNetworks(true /* async */);
-      const uint32_t t0 = millis();
-      int done = WIFI_SCAN_RUNNING;
-      while ((int32_t)(millis() - t0) < 12000) {
-        done = WiFi.scanComplete();
-        if (done != WIFI_SCAN_RUNNING) break;
-        vTaskDelay(pdMS_TO_TICKS(250));
+      // v1.10.1 FIX ("scanning of wifi failed"): esp_wifi_scan_start() is
+      // rejected with ESP_ERR_WIFI_STATE while the STA is mid-(re)connect,
+      // and WiFiScanClass then keeps reporting WIFI_SCAN_FAILED without ever
+      // setting its SCANNING flag — the UI showed "scan failed" exactly when
+      // the user needs the picker (device down, auto-reconnect in flight,
+      // first seconds after boot). Detach any in-flight connect attempt first
+      // (NVS credentials survive disconnect(false,false)), retry the start a
+      // few times, and honor the driver's answer instead of blind-polling.
+      if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect(false, false); // abort connecting; STA stays enabled
+        vTaskDelay(pdMS_TO_TICKS(120));
+      }
+      bool scanning = false;
+      for (uint8_t tries = 0; tries < 3 && !scanning; tries++) {
+        if (tries) {
+          vTaskDelay(pdMS_TO_TICKS(250));
+          if (WiFi.status() != WL_CONNECTED) WiFi.disconnect(false, false);
+        }
+        scanning = (WiFi.scanNetworks(true /* async */) ==
+                    (int16_t)WIFI_SCAN_RUNNING);
+      }
+      int done = scanning ? (int)WIFI_SCAN_RUNNING : (int)WIFI_SCAN_FAILED;
+      if (scanning) {
+        const uint32_t t0 = millis();
+        while ((int32_t)(millis() - t0) < 12000) {
+          done = WiFi.scanComplete();
+          if (done != WIFI_SCAN_RUNNING) break;
+          vTaskDelay(pdMS_TO_TICKS(250));
+        }
       }
       if (done >= 0) {
         uint8_t n = 0;

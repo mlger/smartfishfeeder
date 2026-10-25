@@ -335,6 +335,17 @@ display converts each tank's portion via the calibrated grams-per-second rate
   - *MQTT policy gate*: Home Assistant feeds (feedSrc 2) now correctly count
     as REMOTE for vacation / min-gap / daily-cap (the old `== 1` check
     bypassed all three).
+  - *WiFi scan failed*: tapping "Scan networks" could always fail when the
+    station was mid-(re)connect — `esp_wifi_scan_start()` is rejected with
+    `ESP_ERR_WIFI_STATE` in that state and the Arduino layer then keeps
+    reporting `WIFI_SCAN_FAILED`. The scan now detaches any in-flight connect
+    first (credentials stay in NVS), honors the driver's return value and
+    retries briefly, so the picker works while down / reconnecting / at boot.
+- **Boot splash** — the 4.3B's RGB panel reads WHITE from power-up until the
+  LCD peripheral starts scanning, and the backlight is already on during the
+  rest of setup. LVGL now comes up first and flushes a themed "CATFISH
+  FEEDER" splash (version + spinner) before the app screens are built; the
+  white flash is gone and the real UI swaps in as soon as it is ready.
 
 ## Feeding feature pack (v1.9.0)
 

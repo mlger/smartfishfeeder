@@ -2868,6 +2868,77 @@ void refreshFoodRows() {
 // ---------------------------------------------------------------------------
 // Public API (caller holds lvgl_port_lock unless running inside LVGL task)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// v1.10.1: boot splash. The 4.3B's RGB panel reads as WHITE from power-up
+// until the LCD peripheral starts scanning, and the backlight switches on
+// right inside board begin() — so without a splash the user stares at a white
+// slab while the rest of setup runs and all three app screens are built.
+// main.cpp loads the splash immediately after lvgl_port_init() and deletes it
+// once ui_init() has loaded the real UI.
+// ---------------------------------------------------------------------------
+static lv_obj_t *s_boot_scr = nullptr;
+
+void ui_boot_splash(const char *version) {
+  s_boot_scr = lv_obj_create(nullptr);
+  lv_obj_set_style_bg_color(s_boot_scr, lv_color_hex(C_BG), 0);
+  lv_obj_set_style_bg_opa(s_boot_scr, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(s_boot_scr, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *col = lv_obj_create(s_boot_scr);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_align(col, LV_ALIGN_CENTER, 0, -10);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(col, 16, 0);
+
+  lv_obj_t *title = lv_label_create(col);
+  lv_label_set_text(title, "CATFISH FEEDER");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 4, 0);
+
+  lv_obj_t *bar = lv_obj_create(col);
+  lv_obj_remove_style_all(bar);
+  lv_obj_set_size(bar, 96, 4);
+  lv_obj_set_style_radius(bar, 2, 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+  lv_obj_t *ver = lv_label_create(col);
+  lv_label_set_text_fmt(ver, "v%s", (version && version[0]) ? version : "");
+  lv_obj_set_style_text_font(ver, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ver, lv_color_hex(C_MUTED), 0);
+  lv_obj_set_style_text_letter_space(ver, 2, 0);
+
+  lv_obj_t *sp = lv_spinner_create(col, 1000, 60);
+  lv_obj_set_size(sp, 44, 44);
+  lv_obj_set_style_arc_width(sp, 5, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(sp, 5, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(sp, lv_color_hex(C_CARD_HI), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(sp, lv_color_hex(C_AMBER), LV_PART_INDICATOR);
+
+  lv_scr_load(s_boot_scr);
+  // Force one full refresh right now: the panel leaves the white no-signal
+  // state within milliseconds, long before the app screens exist.
+  lv_refr_now(nullptr);
+  Serial.println("[UI] boot splash shown");
+}
+
+void ui_boot_splash_done() {
+  if (!s_boot_scr) return;
+  lv_obj_t *scr = s_boot_scr;
+  s_boot_scr = nullptr;
+  if (lv_scr_act() == scr) {
+    // Should not happen (ui_init() loads the real screens first); never
+    // delete the active screen.
+    Serial.println("[UI] WARN: splash still active, keeping it");
+    return;
+  }
+  lv_obj_del(scr);
+}
+
 void ui_init() {
   if (!s_evt_queue) s_evt_queue = xQueueCreate(8, sizeof(UiEvent));
   buildRollerOptions();
