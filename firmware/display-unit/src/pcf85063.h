@@ -51,13 +51,18 @@ static const uint8_t MONTH_CENTURY = 0x80; // months bit7: 0 = 20xx, 1 = 19xx
 static const uint8_t HOUR_12H = 0x80;     // hours bit7 must stay 0 (24h mode)
 
 /**
- * @brief Probe the chip (address phase only). Returns false until the panel
- *        stack has installed the legacy I2C driver, i.e. call only after
- *        Board::begin() succeeded. Returns true when the chip ACKs (battery
- *        holder populated).
+ * @brief Probe the chip and park its register pointer on the seconds
+ *        register. Returns false until the panel stack has installed the
+ *        legacy I2C driver, i.e. call only after Board::begin() succeeded.
+ *        Returns true when the chip ACKs (battery holder populated).
+ *        v1.8.2: a 1-byte write (register address) instead of a zero-length
+ *        write — IDF's i2c_master_write rejects NULL data regardless of
+ *        length, so the old zero-byte probe ALWAYS failed and the RTC
+ *        feature silently never worked.
  */
 inline bool begin() {
-  return i2c_master_write_to_device(I2C_NUM, I2C_ADDR, nullptr, 0,
+  const uint8_t reg = REG_SEC;
+  return i2c_master_write_to_device(I2C_NUM, I2C_ADDR, &reg, 1,
                                     I2C_TIMEOUT) == ESP_OK;
 }
 

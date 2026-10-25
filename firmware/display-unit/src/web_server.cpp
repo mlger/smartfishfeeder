@@ -36,9 +36,25 @@ bool s_started = false; // listen socket up (needs WiFi first)
 bool s_updating = false;
 
 // ------------------------------------------------------------------ helpers
+// v1.8.2: constant-time token compare (the relay unit already does this).
+// A plain String== leaks length/prefix timing; on a LAN appliance the
+// practical risk is low, but this gates every mutating endpoint and OTA.
+bool tokenMatches(const String &supplied) {
+  const String expected = prefs::getRelayToken();
+  const size_t n = (supplied.length() > expected.length()) ? supplied.length()
+                                                           : expected.length();
+  uint8_t diff = (uint8_t)(supplied.length() ^ expected.length());
+  for (size_t i = 0; i < n; i++) {
+    const char a = (i < supplied.length()) ? supplied[i] : 0;
+    const char b = (i < expected.length()) ? expected[i] : 0;
+    diff |= (uint8_t)(a ^ b);
+  }
+  return diff == 0;
+}
+
 bool authOk() {
   return s_srv.hasHeader("X-Catfish-Token") &&
-         s_srv.header("X-Catfish-Token") == prefs::getRelayToken();
+         tokenMatches(s_srv.header("X-Catfish-Token"));
 }
 
 void sendErr(int code, const char *msg) {
@@ -189,6 +205,12 @@ void updUploadCb() {
       Serial.printf("[WEB] OTA end failed: %s\n", Update.errorString());
       s_updating = false;
     }
+  } else if (up.status == UPLOAD_FILE_ABORTED && s_updating) {
+    // v1.8.2: client vanished mid-upload — close the Update session so the
+    // next attempt isn't rejected with "running" and s_updating doesn't stick.
+    Serial.println("[WEB] OTA upload aborted by client");
+    Update.abort();
+    s_updating = false;
   }
 }
 

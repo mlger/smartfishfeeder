@@ -30,7 +30,11 @@ uint32_t s_accepted = 0;
 uint32_t s_rejected = 0;
 
 constexpr size_t SEQ_RING = 8;
-uint16_t s_seen[SEQ_RING] = {0};
+// Pre-filled with 0xFFFF (v1.8.2): a {0}-initialized ring permanently
+// rejected the very first seq==0 broadcast of any node (a zero slot
+// always 'matched' and was never replaced).
+uint16_t s_seen[SEQ_RING] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+                             0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 uint8_t s_seen_idx = 0;
 
 bool seqSeen(uint16_t seq) {
@@ -102,6 +106,10 @@ bool begin() {
   if (ok) {
     s_radio.setDataRate(RF24_1MBPS);
     s_radio.setChannel(CATFISH_RF24_CHANNEL);
+    // v1.8.2: static 12-byte payload. Without this the radio uses the 32-byte
+    // default, and reading 12 bytes per packet left FIFO residue that
+    // desynchronized every subsequent read.
+    s_radio.setPayloadSize(CATFISH_RFNODE_PKT_LEN);
     s_radio.openReadingPipe(1, NODE_ADDR);
     s_radio.startListening();
   }

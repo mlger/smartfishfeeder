@@ -37,13 +37,32 @@ char s_topic_pulse_set[96] = {0};
 // beyond the configured count are ignored at routing time.
 char s_topic_tank_cmd[CATFISH_MAX_TANKS][96] = {{0}, {0}, {0}, {0}};
 
+// Connection config copied into stable storage (v1.8.2): espMqttClient's
+// setters store RAW `const char*` pointers (verified MqttClientSetup.h) and
+// dereference them from its own task on every connect. Passing local String
+// .c_str() here used to leave the client reading freed/stack memory
+// (endless reconnects or crashes). These buffers are only rewritten by
+// applyConfig() while the client is disconnected.
+char s_cfg_host[CATFISH_MQTT_HOST_LEN] = {0};
+char s_cfg_user[CATFISH_MQTT_USER_LEN] = {0};
+char s_cfg_pass[CATFISH_MQTT_PASS_LEN] = {0};
+char s_cfg_will_topic[96] = {0};
+
 // ---------------------------------------------------------------- callbacks
 void onConnectCb(bool /*sessionPresent*/) {
   // AsyncTCP task: queueing is thread-safe; subscribing queues packets.
+  // Hygiene (v1.8.2): clear any retained payload on our COMMAND topics first —
+  // a stray retained "ON" would otherwise replay a feed on every reconnect.
+  // State topics (availability/tank online/last feed/pulse) stay retained.
+  s_client.publish(s_topic_feed_cmd, 1, true, "");
+  s_client.publish(s_topic_pulse_set, 1, true, "");
   s_client.subscribe(s_topic_feed_cmd, 1);
   s_client.subscribe(s_topic_pulse_set, 1);
   for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
-    if (s_topic_tank_cmd[i][0]) s_client.subscribe(s_topic_tank_cmd[i], 1);
+    if (s_topic_tank_cmd[i][0]) {
+      s_client.publish(s_topic_tank_cmd[i], 1, true, "");
+      s_client.subscribe(s_topic_tank_cmd[i], 1);
+    }
   }
   Serial.printf("[MQTT] connected as '%s'\n", CATFISH_DISPLAY_HOSTNAME);
   if (s_evtq) {
@@ -168,13 +187,19 @@ void applyConfig() {
             sizeof(s_topic_tank_cmd[i]));
   }
 
-  s_client.setServer(host.c_str(), port);
-  if (user.length()) {
-    s_client.setCredentials(user.c_str(), pass.c_str());
-  }
+  strlcpy(s_cfg_host, host.c_str(), sizeof(s_cfg_host));
+  strlcpy(s_cfg_user, user.c_str(), sizeof(s_cfg_user));
+  strlcpy(s_cfg_pass, pass.c_str(), sizeof(s_cfg_pass));
+  strlcpy(s_cfg_will_topic,
+          mqtt_payloads::availabilityTopic(prefix).c_str(), sizeof(s_cfg_will_topic));
+
+  s_client.setServer(s_cfg_host, port);
+  // Always call setCredentials: the lib has no "clear credentials" path, so
+  // skipping the call (the old behavior) silently kept the previous user/pass
+  // forever and made disabling auth impossible.
+  s_client.setCredentials(s_cfg_user, s_cfg_pass);
   // Retained LWT: brokers publish "offline" for us when the connection drops.
-  s_client.setWill(mqtt_payloads::availabilityTopic(prefix).c_str(), 1, true,
-                   "offline");
+  s_client.setWill(s_cfg_will_topic, 1, true, "offline");
 
   s_wanted = true;
   s_backoff_ms = 5000;            // config change resets the retry backoff
@@ -205,9 +230,14 @@ bool receive(bool &connected) {
     s_status = mqtt_mgr::Status::Connected;
     s_backoff_ms = 5000;
   } else {
-    s_status = mqtt_mgr::Status::Offline;
-    s_next_attempt = millis() + s_backoff_ms;
-    s_backoff_ms = (s_backoff_ms < 30000UL) ? s_backoff_ms * 2 : 60000UL;
+    // MQTT disabled mid-flight: the async disconnect event lands after
+    // applyConfig() already set Disabled — don't downgrade it to "offline -
+    // retrying" (v1.8.2).
+    s_status = s_wanted ? mqtt_mgr::Status::Offline : mqtt_mgr::Status::Disabled;
+    if (s_status == mqtt_mgr::Status::Offline) {
+      s_next_attempt = millis() + s_backoff_ms;
+      s_backoff_ms = (s_backoff_ms < 30000UL) ? s_backoff_ms * 2 : 60000UL;
+    }
   }
   return true;
 }

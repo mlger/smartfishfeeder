@@ -193,6 +193,28 @@ void test_remove_by_identity(void) {
   TEST_ASSERT_FALSE(feed_scheduler::removeByIdentity(9, 9, 9));
 }
 
+// v1.8.2 regression: the UI queues enable toggles by identity (the list can
+// change while the event sits in the queue). After a dashboard replaceAll
+// that SHIFTS indices, an identity-based toggle must still hit the right
+// entry — the index-based version flipped the wrong one.
+void test_set_enabled_by_identity_survives_index_shift(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"s":3},{"h":8,"m":0,"e":true,"s":4},{"h":17,"m":30,"e":true,"s":5}])");
+
+  // toggle the 08:00 entry by identity, then simulate the queued event
+  // landing AFTER a dashboard replace removed the 07:30 entry (index 1 -> 0)
+  TEST_ASSERT_TRUE(feed_scheduler::removeByIdentity(7, 30, 3));
+  TEST_ASSERT_TRUE(feed_scheduler::setEnabledByIdentity(8, 0, 4, false));
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(8, out.hour);
+  TEST_ASSERT_FALSE(out.enabled);            // the TARGET entry was toggled
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(1, out));
+  TEST_ASSERT_EQUAL_UINT8(17, out.hour);
+  TEST_ASSERT_TRUE(out.enabled);             // neighbors untouched
+
+  TEST_ASSERT_FALSE(feed_scheduler::setEnabledByIdentity(9, 9, 9, true));
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: dirty flag + JSON round-trip
 // ---------------------------------------------------------------------------
@@ -374,6 +396,7 @@ int main(void) {
   RUN_TEST(test_next_occurrence_tomorrow_after_last);
   RUN_TEST(test_next_occurrence_during_firing_minute_shows_tomorrow);
   RUN_TEST(test_remove_by_identity);
+  RUN_TEST(test_set_enabled_by_identity_survives_index_shift);
   RUN_TEST(test_persistence_flush_and_roundtrip);
   RUN_TEST(test_toggle_marks_dirty_and_stops_firing);
   RUN_TEST(test_replace_all_swaps_everything);

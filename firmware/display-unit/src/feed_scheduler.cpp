@@ -47,8 +47,14 @@ bool persistNow() {
   }
   String out;
   serializeJson(doc, out);
-  s_dirty = false;
-  return prefs::setScheduleJson(out);
+  // v1.8.2: only clear the dirty flag when NVS actually took the write —
+  // otherwise a failed persist silently loses the schedule until the next
+  // mutation re-dirties it.
+  if (prefs::setScheduleJson(out)) {
+    s_dirty = false;
+    return true;
+  }
+  return false;
 }
 
 void seedDefaults() {
@@ -154,6 +160,17 @@ bool setEnabled(int index, bool enabled) {
   s_entries[index].enabled = enabled;
   s_dirty = true;
   return true;
+}
+
+bool setEnabledByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds,
+                          bool enabled) {
+  for (int i = 0; i < s_count; i++) {
+    if (s_entries[i].hour == hour && s_entries[i].minute == minute &&
+        s_entries[i].seconds == seconds) {
+      return setEnabled(i, enabled);
+    }
+  }
+  return false;
 }
 
 bool toggle(int index) {

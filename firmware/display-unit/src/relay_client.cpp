@@ -23,10 +23,23 @@
 
 namespace {
 
-// Per-tank cached IP + transport-failure streak (worker-task owned; the loop
-// only reads ip()/writes setTankIp() with String copies, never concurrently
-// with an in-flight request because net_worker serializes everything).
-String s_ip[relay_client::MAX_TANKS];
+// Per-tank cached IP + transport-failure streak. v1.8.2: bounded char storage
+// instead of Arduino Strings — setTankIp() can run on the worker task while
+// loop() reads ip()/hasIp(), and a torn String copy could dereference freed
+// heap. char[16] writes are bounded (strlcpy always terminates), so any tear
+// is a transient garbled IP string at worst, never a memory error. The
+// loop-facing getters additionally copy under a short critical section.
+char s_ip[relay_client::MAX_TANKS][16];
+portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
+
+String ipCopyLocked(int i) {
+  char buf[16] = {0};
+  if (i < 0) return String();
+  portENTER_CRITICAL(&s_ip_mux);
+  strlcpy(buf, s_ip[i], sizeof(buf));
+  portEXIT_CRITICAL(&s_ip_mux);
+  return String(buf);
+}
 
 // Consecutive transport-level failures against a CACHED IP. Any HTTP status
 // code (even 4xx/5xx) means the relay is ALIVE and resets the streak; only
@@ -54,10 +67,10 @@ int tIdx(uint8_t tank1) {
 
 void noteTransportFailure(uint8_t tank1) {
   const int i = tIdx(tank1);
-  if (i < 0 || !s_ip[i].length()) return;
+  if (i < 0 || !s_ip[i][0]) return;
   s_transport_fail_streak[i]++;
   Serial.printf("[NET] tank %u transport failure #%u at %s\n", (unsigned)tank1,
-                (unsigned)s_transport_fail_streak[i], s_ip[i].c_str());
+                (unsigned)s_transport_fail_streak[i], s_ip[i]);
   if (s_transport_fail_streak[i] >= TRANSPORT_FAIL_LIMIT) {
     Serial.printf("[NET] tank %u unreachable - clearing cached IP for re-discovery\n",
                   (unsigned)tank1);
@@ -211,11 +224,14 @@ namespace relay_client {
 void init() {
   for (uint8_t t = 1; t <= MAX_TANKS; t++) {
     const int i = tIdx(t);
-    s_ip[i] = prefs::getTankIp(t);
+    const String saved = prefs::getTankIp(t);
+    portENTER_CRITICAL(&s_ip_mux);
+    strlcpy(s_ip[i], saved.c_str(), sizeof(s_ip[i]));
+    portEXIT_CRITICAL(&s_ip_mux);
     s_transport_fail_streak[i] = 0;
-    if (s_ip[i].length()) {
+    if (s_ip[i][0]) {
       Serial.printf("[NET] tank %u: saved IP %s (will validate on first use)\n",
-                    (unsigned)t, s_ip[i].c_str());
+                    (unsigned)t, s_ip[i]);
     }
   }
   applyTankTokens();
@@ -232,18 +248,24 @@ void applyTankTokens() {
 
 bool hasIp(uint8_t tank1) {
   const int i = tIdx(tank1);
-  return i >= 0 && s_ip[i].length() > 0;
+  if (i < 0) return false;
+  portENTER_CRITICAL(&s_ip_mux);
+  const bool has = s_ip[i][0] != '\0';
+  portEXIT_CRITICAL(&s_ip_mux);
+  return has;
 }
 
 String ip(uint8_t tank1) {
   const int i = tIdx(tank1);
-  return (i >= 0) ? s_ip[i] : String("");
+  return ipCopyLocked(i);
 }
 
 void setTankIp(uint8_t tank1, const String &ipNew) {
   const int i = tIdx(tank1);
   if (i < 0) return;
-  s_ip[i] = ipNew;
+  portENTER_CRITICAL(&s_ip_mux);
+  strlcpy(s_ip[i], ipNew.c_str(), sizeof(s_ip[i]));
+  portEXIT_CRITICAL(&s_ip_mux);
   prefs::setTankIp(tank1, ipNew); // NVS write; called from loop or worker
   if (ipNew.length()) noteTransportSuccess(tank1);
 }
@@ -251,7 +273,9 @@ void setTankIp(uint8_t tank1, const String &ipNew) {
 void clearTankIp(uint8_t tank1) {
   const int i = tIdx(tank1);
   if (i < 0) return;
-  s_ip[i] = "";
+  portENTER_CRITICAL(&s_ip_mux);
+  s_ip[i][0] = '\0';
+  portEXIT_CRITICAL(&s_ip_mux);
   s_transport_fail_streak[i] = 0;
   prefs::setTankIp(tank1, "");
 }
@@ -270,17 +294,18 @@ Result discoverTank(uint8_t tank1) {
   }
 
   // (1) Saved IP validated by GET /health (2 s timeout)
-  if (s_ip[i].length()) {
-    if (healthCheck(s_ip[i], 2000)) {
+  if (s_ip[i][0]) {
+    const String ipStr(s_ip[i]);
+    if (healthCheck(ipStr, 2000)) {
       noteTransportSuccess(tank1);
       r.ok = true;
-      r.ip = s_ip[i];
+      r.ip = ipStr;
       Serial.printf("[NET] tank %u relay healthy at saved IP %s\n",
-                    (unsigned)tank1, s_ip[i].c_str());
+                    (unsigned)tank1, s_ip[i]);
       return r;
     }
     Serial.printf("[NET] tank %u saved relay IP %s not responding\n",
-                  (unsigned)tank1, s_ip[i].c_str());
+                  (unsigned)tank1, s_ip[i]);
   }
 
   // (2) One broadcast round, collect ALL responders, then bind the first one
@@ -332,7 +357,7 @@ Result feedTank(uint8_t tank1, uint8_t seconds) {
     return r;
   }
 
-  if (!s_ip[i].length()) {
+  if (!s_ip[i][0]) {
     Result d = discoverTank(tank1);
     if (!d.ok) {
       r.error = "No relay (" + d.error + ")";
@@ -346,7 +371,7 @@ Result feedTank(uint8_t tank1, uint8_t seconds) {
   String body;
   serializeJson(doc, body);
 
-  const String url0 = "http://" + s_ip[i] + CATFISH_EP_FEED;
+  const String url0 = "http://" + String(s_ip[i]) + CATFISH_EP_FEED;
   Serial.printf("[FEED] tank %u POST %s (%u bytes)\n", (unsigned)tank1,
                 url0.c_str(), (unsigned)body.length());
 
@@ -357,8 +382,11 @@ Result feedTank(uint8_t tank1, uint8_t seconds) {
   if (code <= 0) {
     // Transport failure: the cached IP may be stale (DHCP moved the relay).
     // Self-heal: drop the cache, re-discover, retry ONCE against a new IP.
+    // v1.8.2: capture the cached IP BEFORE noteTransportFailure() — on the
+    // 3rd consecutive miss that call clears the cache, and reading afterwards
+    // saw an empty IP, skipping the documented re-discover-and-retry pass.
+    const String stale(s_ip[i]);
     noteTransportFailure(tank1);
-    const String stale = s_ip[i];
     if (stale.length()) {
       Serial.printf("[FEED] no response from tank %u at %s - re-discovering\n",
                     (unsigned)tank1, stale.c_str());
@@ -372,8 +400,8 @@ Result feedTank(uint8_t tank1, uint8_t seconds) {
         doc["token"] = tankToken(tank1); // token unchanged, rebuild anyway
         body.clear();
         serializeJson(doc, body);
-        code = httpReq("http://" + s_ip[i] + CATFISH_EP_FEED, true, body, 6000,
-                       resp);
+        code = httpReq("http://" + String(s_ip[i]) + CATFISH_EP_FEED, true, body,
+                       6000, resp);
         if (code > 0) noteTransportSuccess(tank1);
         if (code <= 0) {
           noteTransportFailure(tank1);
@@ -405,7 +433,7 @@ Result feedTank(uint8_t tank1, uint8_t seconds) {
   }
 
   r.ok = true;
-  r.ip = s_ip[i];
+  r.ip = String(s_ip[i]);
   // What the relay actually applied (it clamps to maxPulseS and reports a note)
   r.seconds_applied = (uint8_t)(rd["seconds"] | (int)seconds);
   r.clamped = rd["note"].is<const char *>();
@@ -425,14 +453,15 @@ Status fetchStatusTank(uint8_t tank1) {
     st.error = "WiFi down";
     return st;
   }
-  if (!s_ip[i].length()) {
+  if (!s_ip[i][0]) {
     st.error = "No relay IP";
     return st;
   }
 
   String resp;
   const int code =
-      httpReq("http://" + s_ip[i] + CATFISH_EP_STATUS, false, "", 3000, resp);
+      httpReq("http://" + String(s_ip[i]) + CATFISH_EP_STATUS, false, "", 3000,
+              resp);
   if (code <= 0) {
     noteTransportFailure(tank1);
     st.error = describeError(code, resp);
@@ -489,7 +518,7 @@ Result configureMechTank(uint8_t tank1, uint8_t mech, uint8_t restDeg,
     r.error = "Bad mechanism";
     return r;
   }
-  if (!s_ip[i].length()) {
+  if (!s_ip[i][0]) {
     Result d = discoverTank(tank1);
     if (!d.ok) {
       r.error = "No relay (" + d.error + ")";
@@ -510,7 +539,8 @@ Result configureMechTank(uint8_t tank1, uint8_t mech, uint8_t restDeg,
 
   String resp;
   const int code =
-      httpReq("http://" + s_ip[i] + CATFISH_EP_CONFIG, true, body, 4000, resp);
+      httpReq("http://" + String(s_ip[i]) + CATFISH_EP_CONFIG, true, body, 4000,
+              resp);
   if (code > 0) noteTransportSuccess(tank1);
   if (code <= 0) {
     noteTransportFailure(tank1);
@@ -530,7 +560,7 @@ Result configureMechTank(uint8_t tank1, uint8_t mech, uint8_t restDeg,
   }
 
   r.ok = true;
-  r.ip = s_ip[i];
+  r.ip = String(s_ip[i]);
   return r;
 }
 
@@ -550,7 +580,7 @@ Result rotateTokenTank(uint8_t tank1, const String &newToken) {
     r.error = "Bad token length";
     return r;
   }
-  if (!s_ip[i].length()) {
+  if (!s_ip[i][0]) {
     Result d = discoverTank(tank1);
     if (!d.ok) {
       r.error = "No relay (" + d.error + ")";
@@ -566,7 +596,8 @@ Result rotateTokenTank(uint8_t tank1, const String &newToken) {
 
   String resp;
   const int code =
-      httpReq("http://" + s_ip[i] + CATFISH_EP_CONFIG, true, body, 4000, resp);
+      httpReq("http://" + String(s_ip[i]) + CATFISH_EP_CONFIG, true, body, 4000,
+              resp);
   if (code > 0) noteTransportSuccess(tank1);
   if (code <= 0) {
     noteTransportFailure(tank1);
@@ -586,7 +617,7 @@ Result rotateTokenTank(uint8_t tank1, const String &newToken) {
   }
 
   r.ok = true;
-  r.ip = s_ip[i];
+  r.ip = String(s_ip[i]);
   return r;
 }
 

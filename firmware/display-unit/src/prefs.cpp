@@ -41,6 +41,22 @@ char s_mq_prefix[CATFISH_MQTT_PREFIX_LEN] = CATFISH_MQTT_PREFIX;
 
 // Guards s_token: written by loop(), read by the net worker task.
 portMUX_TYPE s_token_mux = portMUX_INITIALIZER_UNLOCKED;
+// v1.8.2: guards the shared char-blob buffers (schedule JSON, tank names /
+// tokens / IPs, MQTT config). Getters run on the LVGL task (overlay prefills)
+// and the web task (/api/schedule), setters run on loop() — and setTankIp()
+// is also called from the net worker (self-heal). Without the guard a reader
+// could copy a buffer mid-strlcpy (transiently unterminated). Copy under the
+// short critical section, build the String / do NVS work outside it.
+portMUX_TYPE s_blob_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static String blobCopy(const char *src, size_t cap) {
+  char buf[1024];
+  const size_t n = (cap < sizeof(buf)) ? cap : sizeof(buf);
+  portENTER_CRITICAL(&s_blob_mux);
+  strlcpy(buf, src, n);
+  portEXIT_CRITICAL(&s_blob_mux);
+  return String(buf);
+}
 
 void nvsLogFail(const char *key) {
   Serial.printf("[SYS] WARN: NVS write failed for key '%s'\n", key);
@@ -118,7 +134,7 @@ bool begin() {
 
 bool isLoaded() { return s_loaded; }
 
-String getScheduleJson() { return String(s_sched); }
+String getScheduleJson() { return blobCopy(s_sched, sizeof(s_sched)); }
 
 bool setScheduleJson(const String &json) {
   // Never truncate silently: an oversized blob would corrupt the schedule.
@@ -127,7 +143,9 @@ bool setScheduleJson(const String &json) {
                   (unsigned)json.length(), (unsigned)sizeof(s_sched));
     return false;
   }
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_sched, json.c_str(), sizeof(s_sched));
+  portEXIT_CRITICAL(&s_blob_mux);
   if (s_loaded && s_nvs.putString("sched", json) == 0) nvsLogFail("sched");
   return true;
 }
@@ -171,15 +189,17 @@ static int tankIdx(uint8_t tank1) {
 String getTankName(uint8_t tank1) {
   const int i = tankIdx(tank1);
   if (i < 0) return String("");
-  return String(s_tank_name[i]);
+  return blobCopy(s_tank_name[i], sizeof(s_tank_name[i]));
 }
 
 void setTankName(uint8_t tank1, const String &name) {
   const int i = tankIdx(tank1);
   if (i < 0) return;
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_tank_name[i], name.c_str(), sizeof(s_tank_name[i]));
   if (!s_tank_name[i][0])
     snprintf(s_tank_name[i], sizeof(s_tank_name[i]), "Tank %u", (unsigned)tank1);
+  portEXIT_CRITICAL(&s_blob_mux);
   char key[8];
   snprintf(key, sizeof(key), "tName%d", i + 1);
   if (s_loaded && s_nvs.putString(key, s_tank_name[i]) == 0) nvsLogFail(key);
@@ -188,13 +208,15 @@ void setTankName(uint8_t tank1, const String &name) {
 String getTankToken(uint8_t tank1) {
   const int i = tankIdx(tank1);
   if (i < 0) return String("");
-  return String(s_tank_tok[i]);
+  return blobCopy(s_tank_tok[i], sizeof(s_tank_tok[i]));
 }
 
 void setTankToken(uint8_t tank1, const String &token) {
   const int i = tankIdx(tank1);
   if (i < 0) return;
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_tank_tok[i], token.c_str(), sizeof(s_tank_tok[i]));
+  portEXIT_CRITICAL(&s_blob_mux);
   char key[8];
   snprintf(key, sizeof(key), "tTok%d", i + 1);
   if (s_loaded && s_nvs.putString(key, s_tank_tok[i]) == 0) nvsLogFail(key);
@@ -203,13 +225,15 @@ void setTankToken(uint8_t tank1, const String &token) {
 String getTankIp(uint8_t tank1) {
   const int i = tankIdx(tank1);
   if (i < 0) return String("");
-  return String(s_tank_ip[i]);
+  return blobCopy(s_tank_ip[i], sizeof(s_tank_ip[i]));
 }
 
 void setTankIp(uint8_t tank1, const String &ip) {
   const int i = tankIdx(tank1);
   if (i < 0) return;
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_tank_ip[i], ip.c_str(), sizeof(s_tank_ip[i]));
+  portEXIT_CRITICAL(&s_blob_mux);
   char key[8];
   snprintf(key, sizeof(key), "tIp%d", i + 1);
   if (s_loaded && s_nvs.putString(key, s_tank_ip[i]) == 0) nvsLogFail(key);
@@ -264,10 +288,12 @@ void setMqttEnabled(bool on) {
   if (s_loaded && !s_nvs.putBool("mqEn", on)) nvsLogFail("mqEn");
 }
 
-String getMqttHost() { return String(s_mq_host); }
+String getMqttHost() { return blobCopy(s_mq_host, sizeof(s_mq_host)); }
 
 void setMqttHost(const String &host) {
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_mq_host, host.c_str(), sizeof(s_mq_host));
+  portEXIT_CRITICAL(&s_blob_mux);
   if (s_loaded && s_nvs.putString("mqHost", host) == 0) nvsLogFail("mqHost");
 }
 
@@ -279,25 +305,31 @@ void setMqttPort(uint16_t port) {
   if (s_loaded && s_nvs.putUShort("mqPort", port) == 0) nvsLogFail("mqPort");
 }
 
-String getMqttUser() { return String(s_mq_user); }
+String getMqttUser() { return blobCopy(s_mq_user, sizeof(s_mq_user)); }
 
 void setMqttUser(const String &user) {
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_mq_user, user.c_str(), sizeof(s_mq_user));
+  portEXIT_CRITICAL(&s_blob_mux);
   if (s_loaded && s_nvs.putString("mqUser", user) == 0) nvsLogFail("mqUser");
 }
 
-String getMqttPass() { return String(s_mq_pass); }
+String getMqttPass() { return blobCopy(s_mq_pass, sizeof(s_mq_pass)); }
 
 void setMqttPass(const String &pass) {
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_mq_pass, pass.c_str(), sizeof(s_mq_pass));
+  portEXIT_CRITICAL(&s_blob_mux);
   if (s_loaded && s_nvs.putString("mqPass", pass) == 0) nvsLogFail("mqPass");
 }
 
-String getMqttPrefix() { return String(s_mq_prefix); }
+String getMqttPrefix() { return blobCopy(s_mq_prefix, sizeof(s_mq_prefix)); }
 
 void setMqttPrefix(const String &prefix) {
+  portENTER_CRITICAL(&s_blob_mux);
   strlcpy(s_mq_prefix, prefix.c_str(), sizeof(s_mq_prefix));
   if (!s_mq_prefix[0]) strlcpy(s_mq_prefix, CATFISH_MQTT_PREFIX, sizeof(s_mq_prefix));
+  portEXIT_CRITICAL(&s_blob_mux);
   if (s_loaded && s_nvs.putString("mqPre", s_mq_prefix) == 0) nvsLogFail("mqPre");
 }
 

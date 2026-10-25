@@ -492,18 +492,27 @@ void feedBtnCb(lv_event_t *e) {
 }
 
 void enableSwitchCb(lv_event_t *e) {
-  const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  // v1.8.2: pack the entry IDENTITY (h<<12|m<<6|s), not the list index —
+  // the index can go stale while the event sits in the queue (a dashboard
+  // replaceAll or a trash tap processed in the same drain window shifts
+  // entries). Identity stays valid; matches trashCb / removeByIdentity.
+  const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+  const uint8_t h = (uint8_t)((id >> 12) & 0x1F);
+  const uint8_t m = (uint8_t)((id >> 6) & 0x3F);
+  const uint8_t s = (uint8_t)(id & 0x3F);
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   const bool en = lv_obj_has_state(sw, LV_STATE_CHECKED);
   // H3: the scheduler is single-writer (loop() context only) — the LVGL task
-  // just reports index + target state; loop() applies it and flushes NVS.
+  // just reports identity + target state; loop() applies it and flushes NVS.
   UiEvent ev;
   ev.type = UI_EVT_SCHED_PERSIST;
-  ev.a = (uint8_t)idx;
+  ev.a = h;
+  ev.b = m;
+  ev.c = s;
   ev.flag = en;
   uiEventSend(ev);
-  Serial.printf("[UI] schedule entry %d -> %s (queued)\n", idx,
-                en ? "enabled" : "disabled");
+  Serial.printf("[UI] schedule entry %02u:%02u (%us) -> %s (queued)\n",
+                (unsigned)h, (unsigned)m, (unsigned)s, en ? "enabled" : "disabled");
 }
 
 void trashCb(lv_event_t *e) {
@@ -804,7 +813,8 @@ void rebuildScheduleList() {
     lv_obj_set_size(sw, 72, 36);
     if (en.enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, enableSwitchCb, LV_EVENT_VALUE_CHANGED,
-                        (void *)(intptr_t)i);
+                        (void *)(uintptr_t)((en.hour << 12) | (en.minute << 6) |
+                                            en.seconds));
 
     lv_obj_t *trash = lv_btn_create(card);
     lv_obj_set_size(trash, 64, 64);
@@ -2079,7 +2089,7 @@ void rebuildTankRows() {
     s_tank_row_name[i] = name;
 
     lv_obj_t *ipLbl = lv_label_create(row);
-    lv_label_set_text(ipLbl, "—");
+    lv_label_set_text(ipLbl, "--"); // "—" renders as tofu in Montserrat built-ins
     lv_obj_set_style_text_font(ipLbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ipLbl, lv_color_hex(C_MUTED), 0);
     lv_obj_set_flex_grow(ipLbl, 1);
@@ -2274,6 +2284,10 @@ void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on) {
     else
       lv_obj_clear_state(s_sw_bl, LV_STATE_CHECKED);
   }
+  // v1.8.2: actually apply the persisted preference. The board turns the
+  // backlight ON during bring-up; without this, a saved "backlight OFF"
+  // only took effect after the user toggled the switch in this boot.
+  applyBacklight();
 }
 
 void ui_request_feed(uint8_t seconds) {
@@ -2435,7 +2449,7 @@ void ui_set_mech(const String &mechName, int restDeg, int feedDeg, int stepHz) {
   char buf[48];
   switch (s_mech_id) {
     case CATFISH_MECH_SERVO:
-      snprintf(buf, sizeof(buf), "Mechanism: Servo (%d\xC2\xB0 \xE2\x86\x92 %d\xC2\xB0)",
+      snprintf(buf, sizeof(buf), "Mechanism: Servo (%d\xC2\xB0 -> %d\xC2\xB0)", // "→" = tofu in Montserrat
                (s_mech_rest >= 0) ? s_mech_rest : 0, (s_mech_feed >= 0) ? s_mech_feed : 0);
       break;
     case CATFISH_MECH_STEPPER:
