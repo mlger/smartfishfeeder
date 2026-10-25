@@ -31,27 +31,29 @@
 // The queue is also written from the MQTT manager's async task (incoming
 // Home Assistant commands), which is why ui_event_send() is public.
 enum UiEventType : uint8_t {
-  UI_EVT_FEED = 0,      // FEED NOW pressed      (a=seconds, flag=manual, tankMask targets)
+  UI_EVT_FEED = 0,      // FEED NOW pressed      (grams=portion, flag=manual, tankMask targets)
   UI_EVT_RELAY_TEST,    // "Test connection" pressed
   UI_EVT_REBOOT,        // "Reboot" pressed
-  UI_EVT_SET_PULSE,     // default pulse changed (a=seconds)
+  UI_EVT_SET_PORTION,   // v1.10.0: default portion changed (grams, in g)
   UI_EVT_SET_TOKEN,     // pairing token saved   (token=new, flag=also rotate relay)
   UI_EVT_SET_BL,        // backlight switch flipped (flag=on; loop persists)
   UI_EVT_SET_FMT12,     // v1.6.0: 12/24-hour clock switch (flag=true = 12-hour)
-  UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, c=s, tankMask=target tanks)
-  UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m, c=s — identity)
-  UI_EVT_SCHED_PERSIST, // enable switch flipped (a=index, flag=enabled — loop applies + flushes)
+  UI_EVT_SCHED_ADD,     // editor Save           (a=h, b=m, grams=portion, tankMask + gramTank)
+  UI_EVT_SCHED_REMOVE,  // trash pressed         (a=h, b=m — HH:MM identity)
+  UI_EVT_SCHED_PERSIST, // enable switch flipped (a=h, b=m, flag=enabled — loop applies + flushes)
   UI_EVT_MQTT_CFG,      // MQTT settings saved   (mqtt* fields valid — loop persists + applies)
   UI_EVT_MECH_CFG,      // P4: mechanism saved   (mech* fields valid — loop POSTs /config)
   UI_EVT_SELECT_TANK,   // P5: tank chip tapped  (a=tank index 0..3, 0xFE = All)
   UI_EVT_TANK_COUNT,    // P5: tank count changed (a=new count 1..4)
   UI_EVT_TANK_CFG,      // P5: tank saved (a=tank id 1-based, tankName/tankToken valid)
   UI_EVT_SCAN_TANKS,    // P5: "Scan for relays" pressed
-  UI_EVT_RF_FEED,       // v1.8.0: wireless node feed (a=seconds, 0 = default pulse; tankMask; from net_espnow/net_rf24 tasks)
+  UI_EVT_RF_FEED,       // v1.8.0: wireless node feed (grams=portion; tankMask; from net_espnow/net_rf24 tasks)
   UI_EVT_VACATION,      // v1.9.0 (A5): vacation switch flipped (flag=on)
   UI_EVT_SKIP_NEXT,     // v1.9.0 (E4): skip one occurrence (a=h, b=m)
   UI_EVT_REFILL,        // v1.9.0 (D1): hopper refill (a=tank 1..4, 0xFF = all)
   UI_EVT_GUARD_CFG,     // v1.9.0 (F3): policy saved (a=gap min, b=max/day, c=catchup min, d=low %)
+  UI_EVT_WIFI_SCAN,     // v1.10.0: WiFi manager scan requested
+  UI_EVT_WIFI_CONNECT,  // v1.10.0: connect to wifiSsid with wifiPass
 };
 
 struct UiEvent {
@@ -62,11 +64,16 @@ struct UiEvent {
   uint8_t d = 0;        // v1.9.0: 4th generic byte (GUARD_CFG low-food %)
   bool flag = false;
   uint8_t feedSrc = 0;  // v1.9.0 (F3): FEED source: 0 touch/node, 1 web, 2 MQTT
+  uint16_t grams = 0;   // v1.10.0: FEED/SCHED_ADD/SET_PORTION portion (g)
   char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
   uint8_t tankMask = 0; // FEED/SCHED_ADD: target tanks (bit i = tank i+1); 0 = tank 1
   // v1.9.0 (A1/A2): SCHED_ADD weekday mask (bit0=Mon..bit6=Sun; 0 = daily)
   uint8_t days = 0;
-  uint8_t secTank[4] = {0, 0, 0, 0}; // per-tank pulse override (0 = shared)
+  // v1.10.0: per-tank portion override in grams (0 = shared) — was secTank
+  uint16_t gramTank[4] = {0, 0, 0, 0};
+  // v1.10.0: WiFi manager (UI_EVT_WIFI_CONNECT)
+  char wifiSsid[33] = {0};
+  char wifiPass[65] = {0};
   // MQTT settings (UI_EVT_MQTT_CFG); sizes == prefs/catfish_protocol caps
   bool mqttEnable = false;
   uint16_t mqttPort = 0;
@@ -82,8 +89,8 @@ struct UiEvent {
   uint8_t mechDir = 0;  // stepper DIR level during feed
   // Tank editor (UI_EVT_TANK_CFG, P5 + v1.9.0 A3/D1)
   char tankName[CATFISH_TANK_NAME_LEN] = {0};   // == 16 (15 chars + NUL)
-  uint16_t tankGps = 0;   // food rate g/second (0 = off)
-  uint16_t tankHcap = 0;  // hopper capacity in pulse-seconds (0 = unknown)
+  uint16_t tankGps = 0;   // food rate g/second (0 = nominal)
+  uint16_t tankHcap = 0;  // v1.10.0: hopper capacity in GRAMS (0 = unknown)
 };
 
 namespace ui {
@@ -109,8 +116,8 @@ void ui_set_mqtt_status(const String &text, uint8_t state);
 /** Settings > MQTT card broker summary, e.g. "Broker: 192.168.1.10:1883". */
 void ui_set_mqtt_broker(const String &text);
 
-/** Reflect externally changed default pulse (Home Assistant) in the spinbox. */
-void ui_set_pulse(uint8_t seconds);
+/** Reflect externally changed default portion in grams (Home Assistant). */
+void ui_set_portion(uint16_t grams);
 
 /**
  * P4: Settings > Relay card "Mechanism" line + overlay prefill cache.
@@ -144,6 +151,15 @@ void ui_set_scan_busy(bool busy);
 
 /** WiFi state for the status-bar symbol and Settings > Network card. */
 void ui_set_wifi(bool connected, const String &ssid, const String &ip, int rssi);
+
+// ---- v1.10.0: on-display WiFi manager --------------------------------------
+/** Disable/re-enable the Settings > WiFi "Scan" button while scanning. */
+void ui_wifi_scan_busy(bool busy);
+/**
+ * Replace the Settings > WiFi AP list. @p items are preformatted rows
+ * ("ssid   (-58)"); empty list clears it. Caller holds the lock.
+ */
+void ui_wifi_scan_list(uint8_t n, const String items[]);
 
 /** Relay unit state for Home card and Settings card (feeding shows on Home). */
 void ui_set_relay(bool online, const String &ip, bool feeding = false);
@@ -205,7 +221,7 @@ void ui_set_food(uint8_t count, const uint8_t pct[CATFISH_MAX_TANKS],
 void ui_set_history(const String &json);
 
 /** Request a manual feed (safe to call from LVGL callbacks). */
-void ui_request_feed(uint8_t seconds);
+void ui_request_feed(uint16_t grams);
 
 /** Disable/re-enable FEED NOW while a feed request is in flight. */
 void ui_set_feed_busy(bool busy);

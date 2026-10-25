@@ -36,3 +36,6 @@ GH_TOKEN
 Thumbs.db
 *.swp
 *~
+
+# Local Espressif QEMU install (scripts/qemu_run.sh)
+tools/

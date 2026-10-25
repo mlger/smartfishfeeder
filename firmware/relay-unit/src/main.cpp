@@ -385,10 +385,19 @@ static void discoveryPump() {
   const int size = g_discoveryUdp.parsePacket();
   if (size <= 0) return;
   char pkt[64];
-  const int n = g_discoveryUdp.read(pkt, sizeof(pkt) - 1);
-  if (n <= 0) return;
+  const int nRaw = g_discoveryUdp.read(pkt, sizeof(pkt) - 1);
+  if (nRaw <= 0) return;
+  int n = nRaw;
   pkt[n] = '\0';
-  if (strcmp(pkt, DISCOVERY_REQ) != 0) return;  // exact match, per protocol
+  // v1.10.0 FIX: tolerate trailing whitespace/newline. The display unit
+  // broadcasts "CATFISH_DISCOVER\n"; the old exact strcmp never matched, so
+  // UDP discovery (and multi-tank auto-binding) was dead between shipped
+  // firmwares. Trim, then compare.
+  while (n > 0 && (pkt[n - 1] == '\n' || pkt[n - 1] == '\r' ||
+                   pkt[n - 1] == ' ' || pkt[n - 1] == '\t')) {
+    pkt[--n] = '\0';
+  }
+  if (strcmp(pkt, DISCOVERY_REQ) != 0) return; // exact match, per protocol
 
   const IPAddress rip = g_discoveryUdp.remoteIP();
   const uint16_t rport = g_discoveryUdp.remotePort();

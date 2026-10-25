@@ -25,6 +25,22 @@ char s_ssid[33] = {0};
 volatile int s_rssi = 0;
 bool s_mdns_started = false;
 
+// ---- v1.10.0: on-display WiFi manager (UI = single writer, wifi-task consumes)
+constexpr uint8_t WIFI_MGR_MAX_APS = 12;
+struct ApSnap {
+  char ssid[33] = {0};
+  int8_t rssi = 0;
+  bool secure = false;
+};
+ApSnap s_aps[WIFI_MGR_MAX_APS];
+volatile uint8_t s_ap_n = 0;
+volatile uint8_t s_scan_req = 0;   // 1 = scan requested by the UI
+volatile int s_scan_state = 0;     // WIFI_SCAN_*
+volatile uint8_t s_conn_req = 0;   // 1 = connect requested by the UI
+volatile int s_conn_state = 0;     // WIFI_CONN_*
+char s_conn_ssid[33] = {0};
+char s_conn_pass[65] = {0};
+
 void publish() {
   strlcpy(s_ip, WiFi.localIP().toString().c_str(), sizeof(s_ip));
   strlcpy(s_ssid, WiFi.SSID().c_str(), sizeof(s_ssid));
@@ -77,6 +93,69 @@ void wifiTask(void * /*param*/) {
   uint32_t down_since = 0;
 
   for (;;) {
+    // ---- v1.10.0: on-display WiFi manager commands (run here, not in UI) ----
+    if (s_conn_req) {
+      s_conn_req = 0;
+      s_conn_state = net_wifi::CONN_BUSY;
+      Serial.printf("[NET] UI connect request: '%s'\n", s_conn_ssid);
+      WiFi.disconnect(false, false);
+      vTaskDelay(pdMS_TO_TICKS(150));
+      WiFi.begin(s_conn_ssid, s_conn_pass[0] ? s_conn_pass : nullptr);
+      const uint32_t t0 = millis();
+      bool ok = false;
+      while ((int32_t)(millis() - t0) < 25000) {
+        if (WiFi.status() == WL_CONNECTED) {
+          ok = true;
+          break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+      }
+      if (ok) {
+        applyConnectedState();
+        publish();
+        s_connected = true;
+        down_since = 0;
+        Serial.printf("[NET] UI connect OK SSID='%s' IP=%s\n", s_ssid, s_ip);
+      } else {
+        // let the normal reconnect/portal machinery take back over
+        down_since = millis();
+        Serial.println("[NET] UI connect FAILED");
+      }
+      s_conn_state = ok ? net_wifi::CONN_OK : net_wifi::CONN_FAILED;
+    }
+
+    if (s_scan_req) {
+      s_scan_req = 0;
+      s_scan_state = net_wifi::SCAN_BUSY;
+      Serial.println("[NET] UI scan request");
+      WiFi.scanNetworks(true /* async */);
+      const uint32_t t0 = millis();
+      int done = WIFI_SCAN_RUNNING;
+      while ((int32_t)(millis() - t0) < 12000) {
+        done = WiFi.scanComplete();
+        if (done != WIFI_SCAN_RUNNING) break;
+        vTaskDelay(pdMS_TO_TICKS(250));
+      }
+      if (done >= 0) {
+        uint8_t n = 0;
+        for (int i = 0; i < done && n < WIFI_MGR_MAX_APS; i++) {
+          String ssid = WiFi.SSID(i);
+          if (!ssid.length()) continue; // skip hidden/blank entries
+          strlcpy(s_aps[n].ssid, ssid.c_str(), sizeof(s_aps[n].ssid));
+          s_aps[n].rssi = (int8_t)WiFi.RSSI(i);
+          s_aps[n].secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+          n++;
+        }
+        s_ap_n = n;
+        WiFi.scanDelete();
+        s_scan_state = net_wifi::SCAN_DONE;
+        Serial.printf("[NET] UI scan done: %u AP(s)\n", (unsigned)n);
+      } else {
+        s_scan_state = net_wifi::SCAN_FAILED;
+        Serial.println("[NET] UI scan FAILED/timeout");
+      }
+    }
+
     if (WiFi.status() == WL_CONNECTED) {
       if (!s_connected) {
         applyConnectedState();
@@ -133,5 +212,36 @@ String wifi_ip() { return String(s_ip); }
 String wifi_ssid() { return String(s_ssid); }
 
 int wifi_rssi() { return s_rssi; }
+
+// -------------------------------------------------- v1.10.0: WiFi manager
+void requestScan() {
+  if (s_scan_req || s_scan_state == net_wifi::SCAN_BUSY) return;
+  s_scan_state = net_wifi::SCAN_BUSY; // immediate feedback; task confirms
+  s_scan_req = 1;
+}
+
+void requestConnect(const String &ssid, const String &pass) {
+  if (!ssid.length()) return;
+  strlcpy(s_conn_ssid, ssid.c_str(), sizeof(s_conn_ssid));
+  strlcpy(s_conn_pass, pass.c_str(), sizeof(s_conn_pass));
+  s_conn_state = net_wifi::CONN_BUSY;
+  s_conn_req = 1;
+}
+
+int scanState() { return s_scan_state; }
+
+uint8_t scanCount() { return s_ap_n; }
+
+bool scanItem(uint8_t i, String &ssid, int &rssi, bool &secure) {
+  if (i >= WIFI_MGR_MAX_APS || i >= s_ap_n) return false;
+  ssid = String(s_aps[i].ssid);
+  rssi = s_aps[i].rssi;
+  secure = s_aps[i].secure;
+  return true;
+}
+
+int connectState() { return s_conn_state; }
+
+String connectSsid() { return String(s_conn_ssid); }
 
 } // namespace net_wifi

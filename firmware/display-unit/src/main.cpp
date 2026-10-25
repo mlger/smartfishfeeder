@@ -304,6 +304,60 @@ static void rfNodeTokenChanged() {
   net_rf24::onTokenChanged();
 }
 
+// --------------------------------------------------------------- v1.10.0
+// On-display WiFi manager: mirror the wifi-task's scan/connect lifecycle into
+// the Settings WIFI card. All reads are small volatiles + char snapshots.
+static constexpr uint8_t WIFI_UI_MAX_APS = 10;
+static int s_wifi_scan_ui = 0;   // last scan state painted
+static int s_wifi_conn_ui = 0;   // last connect state painted
+
+static void wifiMgrUiSync() {
+  const int sc = net_wifi::scanState();
+  if (sc != s_wifi_scan_ui) {
+    s_wifi_scan_ui = sc;
+    if (sc == 1) {
+      lvgl_port_lock(-1);
+      ui_wifi_scan_busy(true);
+      lvgl_port_unlock();
+    } else if (sc == 2) {
+      uint8_t n = net_wifi::scanCount();
+      if (n > WIFI_UI_MAX_APS) n = WIFI_UI_MAX_APS;
+      String items[WIFI_UI_MAX_APS];
+      for (uint8_t i = 0; i < n; i++) {
+        String ssid;
+        int rssi = 0;
+        bool secure = false;
+        if (!net_wifi::scanItem(i, ssid, rssi, secure)) break;
+        items[i] = (secure ? String(LV_SYMBOL_SETTINGS) : String("")) + ssid +
+                   "   (" + rssi + ")";
+      }
+      lvgl_port_lock(-1);
+      ui_wifi_scan_busy(false);
+      ui_wifi_scan_list(n, items);
+      lvgl_port_unlock();
+    } else if (sc == 3) {
+      lvgl_port_lock(-1);
+      ui_wifi_scan_busy(false);
+      lvgl_port_unlock();
+      uiToast("WiFi scan failed");
+    }
+  }
+
+  const int cc = net_wifi::connectState();
+  if (cc != s_wifi_conn_ui) {
+    s_wifi_conn_ui = cc;
+    if (cc == 2) {
+      uiToast(String("WiFi connected: ") + net_wifi::wifi_ssid());
+      lvgl_port_lock(-1);
+      ui_set_wifi(true, net_wifi::wifi_ssid(), net_wifi::wifi_ip(),
+                  net_wifi::wifi_rssi());
+      lvgl_port_unlock();
+    } else if (cc == 3) {
+      uiToast("WiFi connect failed (check password)");
+    }
+  }
+}
+
 /** "HH:MM" of the next enabled feeding ("none"/"" per scheduler state). */
 static String nextFeedHhmm() {
   if (!feed_scheduler::timeValid()) return String("");
@@ -351,6 +405,7 @@ static void webPublishSnapshot() {
   strlcpy(s.nextFeed, nf.c_str(), sizeof(s.nextFeed));
   s.lastFedEpoch = prefs::getLastFedEpoch();
   s.pulse = prefs::getDefaultPulse();
+  s.defGrams = prefs::getDefaultGrams(); // v1.10.0: default portion (g)
   s.schedCount = (uint16_t)feed_scheduler::getCount();
   s.clockValid = feed_scheduler::timeValid();
   s.hour12 = prefs::getHour12();
@@ -506,14 +561,15 @@ static void beginOtaOnce() {
 
 /**
  * Route a feed request to the worker. Manual feeds get immediate feedback.
- * v1.9.0: @p src drives the F3/A5 policy gate (vacation / min-gap / daily cap
- * — on-device touch always passes); scheduled + catch-up feeds pass per-tank
- * seconds; a scheduled fire marks the fired-map and arms the persistent retry
- * journal on failure.
+ * v1.10.0: @p grams is the requested portion; per-tank wire pulses (seconds)
+ * are derived here from the tank's calibrated g/s rate (per-tank gram
+ * overrides win). v1.9.0: @p src drives the F3/A5 policy gate (vacation /
+ * min-gap / daily cap — on-device touch always passes); scheduled + catch-up
+ * feeds mark the fired-map and arm the persistent retry journal on failure.
  */
-static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
+static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
                         uint8_t minute, bool retry, uint8_t tankMask,
-                        const uint8_t *secTank, feed_state::FeedSource src) {
+                        const uint16_t *gramTank, feed_state::FeedSource src) {
   const uint32_t nowEpoch = (uint32_t)time(nullptr);
 
   // F3/A5 policy gate — retries re-check too (vacation may have flipped on
@@ -522,11 +578,20 @@ static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
   if (!g.allowed) {
     if (retry) feed_state::journalClearFor(hour, minute);
     uiToast(String("Feed blocked (") + g.reason + ")");
-    feed_state::recordHistory(tankMask ? tankMask : 0x01, seconds, false,
+    feed_state::recordHistory(tankMask ? tankMask : 0x01, 0, grams, false,
                               feed_state::HIST_BLOCKED);
     Serial.printf("[FEED] blocked by policy (%s, src %u)\n", g.reason,
                   (unsigned)src);
     return;
+  }
+
+  // v1.10.0: per-tank wire pulse = grams / tank gps (ceil, clamped).
+  uint8_t secPerTank[4] = {0, 0, 0, 0};
+  for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
+    if (tankMask && !(tankMask & (1u << (t - 1)))) continue;
+    const uint16_t gt =
+        (gramTank && gramTank[t - 1]) ? gramTank[t - 1] : grams;
+    secPerTank[t - 1] = catfishGramsToSeconds(gt, prefs::getTankGps(t));
   }
 
   if (!net_wifi::wifi_is_connected()) {
@@ -536,7 +601,7 @@ static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
       // H2: a scheduled feed must survive a WiFi blip at fire time - arm a
       // delayed attempt in the PERSISTENT journal (v1.9.0) instead of
       // silently dropping it.
-      if (feed_state::journalArm(hour, minute, seconds, tankMask)) {
+      if (feed_state::journalArm(hour, minute, grams, tankMask)) {
         uiToast("No WiFi - feed will retry");
       } else {
         uiToast(String("Feed FAILED: no WiFi"));
@@ -553,17 +618,17 @@ static void requestFeed(uint8_t seconds, bool manual, uint8_t hour,
 #endif
     return;
   }
-  if (!net_worker::enqueueFeed(seconds, manual, hour, minute, retry, tankMask,
-                               secTank, src == feed_state::SRC_CATCHUP)) {
+  if (!net_worker::enqueueFeed(grams, secPerTank, manual, hour, minute, retry,
+                               tankMask, src == feed_state::SRC_CATCHUP)) {
     // v1.8.2: a scheduled feed dropped because the worker queue was full gets
     // a journal slot instead of being lost with a misleading "try again" toast.
     if (!manual && !retry) {
-      feed_state::journalArm(hour, minute, seconds, tankMask);
+      feed_state::journalArm(hour, minute, grams, tankMask);
       uiToast("Feeder busy - feed will retry");
       Serial.println("[FEED] worker queue full, scheduled feed retry armed");
     } else if (!manual && retry) {
       // defer the in-flight retry by re-arming it (attempt count preserved)
-      feed_state::journalArm(hour, minute, seconds, tankMask);
+      feed_state::journalArm(hour, minute, grams, tankMask);
       uiToast("Feeder busy - retry deferred");
     } else {
       uiToast("Too busy, try again");
@@ -598,9 +663,9 @@ static void refreshFoodUi() {
   uint16_t cap[relay_client::MAX_TANKS];
   for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
     pct[t - 1] = feed_state::hopperLevelPct(t);
-    used[t - 1] = feed_state::hopperUsedSec(t);
+    used[t - 1] = feed_state::hopperUsedG(t); // v1.10.0: grams
     gps[t - 1] = prefs::getTankGps(t);
-    cap[t - 1] = prefs::getTankHopperCap(t);
+    cap[t - 1] = prefs::getTankHopperCap(t); // v1.10.0: grams
   }
   lvgl_port_lock(-1);
   ui_set_food(tankCountClamped(), pct, used, gps, cap, prefs::getHopperLowPct());
@@ -631,28 +696,28 @@ static void runCatchupScan() {
         break;
       }
     }
-    uint8_t st[4] = {0, 0, 0, 0};
+    uint16_t gt[4] = {0, 0, 0, 0};
     uint8_t mask = due[i].tankMask;
     if (e) {
       mask = effectiveTankMask(*e, tankCountClamped());
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++)
-        st[t - 1] = entrySecondsForTank(*e, t);
+        gt[t - 1] = entryGramsForTank(*e, t); // v1.10.0: per-tank grams
     }
     // Guards re-checked: vacation may have been enabled while away.
     const feed_state::GuardResult g = feed_state::checkFeed(
         feed_state::SRC_CATCHUP, (uint32_t)time(nullptr));
     if (!g.allowed) {
-      feed_state::recordHistory(mask, due[i].seconds, false,
+      feed_state::recordHistory(mask, 0, due[i].grams, false,
                                 feed_state::HIST_BLOCKED);
       uiToast(String("Catch-up blocked (") + g.reason + ")");
       continue;
     }
     uiToast(String("Catch-up feed ") + fmtHhmm(due[i].hour, due[i].minute));
-    Serial.printf("[FEED] catch-up firing %02u:%02u (%u s, tanks 0x%X)\n",
+    Serial.printf("[FEED] catch-up firing %02u:%02u (%u g, tanks 0x%X)\n",
                   (unsigned)due[i].hour, (unsigned)due[i].minute,
-                  (unsigned)due[i].seconds, (unsigned)mask);
-    requestFeed(due[i].seconds, false, due[i].hour, due[i].minute, false, mask,
-                st, feed_state::SRC_CATCHUP);
+                  (unsigned)due[i].grams, (unsigned)mask);
+    requestFeed(due[i].grams, false, due[i].hour, due[i].minute, false, mask,
+                gt, feed_state::SRC_CATCHUP);
   }
 }
 
@@ -662,18 +727,21 @@ static void runCatchupScan() {
 static void handleUiEvent(const UiEvent &ev) {
   switch (ev.type) {
     case UI_EVT_FEED: {
-      Serial.printf("[FEED] manual feed %u s (mask 0x%X, src %u)\n", (unsigned)ev.a,
-                    (unsigned)ev.tankMask, (unsigned)ev.feedSrc);
+      Serial.printf("[FEED] manual feed %u g (mask 0x%X, src %u)\n",
+                    (unsigned)ev.grams, (unsigned)ev.tankMask,
+                    (unsigned)ev.feedSrc);
       // explicit mask (MQTT tank button / dashboard) or the Home selection
       const uint8_t mask = ev.tankMask ? ev.tankMask
                                        : (s_selected_tank == 0xFE
                                               ? configuredTankMask()
                                               : (uint8_t)(1u << s_selected_tank));
-      // v1.9.0: web/MQTT feeds are REMOTE for the policy gate; touch and the
-      // wireless node buttons are TOUCH (a human is physically present).
+      // v1.9.0 (mapping FIXED in v1.10.0): web AND MQTT feeds are REMOTE for
+      // the policy gate; touch and the wireless node buttons are TOUCH (a
+      // human is physically present). The old `== 1` check let MQTT feeds
+      // (feedSrc 2) bypass vacation / min-gap / the daily cap.
       const feed_state::FeedSource src =
-          (ev.feedSrc == 1) ? feed_state::SRC_REMOTE : feed_state::SRC_TOUCH;
-      requestFeed(ev.a, true, 0, 0, false, mask, nullptr, src);
+          (ev.feedSrc != 0) ? feed_state::SRC_REMOTE : feed_state::SRC_TOUCH;
+      requestFeed(ev.grams, true, 0, 0, false, mask, ev.gramTank, src);
       break;
     }
 
@@ -740,15 +808,15 @@ static void handleUiEvent(const UiEvent &ev) {
       ESP.restart();
       break;
 
-    case UI_EVT_SET_PULSE:
-      if (ev.a == prefs::getDefaultPulse())
-        break; // no-op replay guard (v1.8.3): skip NVS write + MQTT republish
-      prefs::setDefaultPulse(ev.a);
+    case UI_EVT_SET_PORTION:
+      // v1.10.0: the Home portion spinbox is GRAMS (persisted as defG).
+      if (ev.grams == prefs::getDefaultGrams())
+        break; // no-op replay guard (v1.8.3): skip NVS write + repaint
+      prefs::setDefaultGrams(ev.grams);
       lvgl_port_lock(-1);
-      ui_set_pulse(ev.a); // also corrects the spinbox when set via Home Assistant
+      ui_set_portion(ev.grams); // also corrects the spinbox when set remotely
       lvgl_port_unlock();
-      mqtt_mgr::publishPulse(ev.a); // retained; no-op when disconnected
-      Serial.printf("[FEED] default pulse set to %u s\n", (unsigned)ev.a);
+      Serial.printf("[FEED] default portion set to %u g\n", (unsigned)ev.grams);
       break;
 
     case UI_EVT_SET_TOKEN:
@@ -796,10 +864,10 @@ static void handleUiEvent(const UiEvent &ev) {
       t.hour = ev.a;
       t.minute = ev.b;
       t.enabled = true;
-      t.seconds = ev.c;
+      t.grams = ev.grams; // v1.10.0: portion in grams
       t.tanks = ev.tankMask;
       t.days = ev.days; // v1.9.0 (A1): weekday mask (0 = clamp to daily)
-      for (int k = 0; k < 4; k++) t.secTank[k] = ev.secTank[k]; // A2
+      for (int k = 0; k < 4; k++) t.gramTank[k] = ev.gramTank[k]; // A2 (grams)
       if (feed_scheduler::add(t)) {
         afterScheduleChange(false);
       } else {
@@ -810,7 +878,9 @@ static void handleUiEvent(const UiEvent &ev) {
     }
 
     case UI_EVT_SCHED_REMOVE:
-      if (feed_scheduler::removeByIdentity(ev.a, ev.b, ev.c)) {
+      // v1.10.0: identity is HH:MM (ev.a = h, ev.b = m) — duplicates are
+      // rejected on add, so the pair is unique.
+      if (feed_scheduler::removeByIdentity(ev.a, ev.b)) {
         feed_state::pruneFired(feed_scheduler::getAll(),
                                feed_scheduler::getCount());
         afterScheduleChange(true);
@@ -820,9 +890,9 @@ static void handleUiEvent(const UiEvent &ev) {
       break;
 
     case UI_EVT_SCHED_PERSIST:
-      // v1.8.2: identity-packed (h/m/s in a/b/c) so a queued toggle survives
+      // v1.10.0: identity-packed (h in a, m in b) so a queued toggle survives
       // index shifts from a dashboard replaceAll or a same-batch trash tap.
-      feed_scheduler::setEnabledByIdentity(ev.a, ev.b, ev.c, ev.flag);
+      feed_scheduler::setEnabledByIdentity(ev.a, ev.b, ev.flag);
       feed_scheduler::flushIfDirty();
       refreshNextFeedUi(); // enable/disable changes the next occurrence
       break;
@@ -926,13 +996,28 @@ static void handleUiEvent(const UiEvent &ev) {
                       : (s_selected_tank == 0xFE
                              ? configuredTankMask()
                              : (uint8_t)(1u << s_selected_tank));
-      const uint8_t seconds = ev.a ? ev.a : prefs::getDefaultPulse();
-      Serial.printf("[RF] node feed %u s (mask 0x%X)\n", (unsigned)seconds,
+      // v1.10.0: producers convert the datagram's seconds to grams already;
+      // fall back to the default portion for anything older.
+      const uint16_t grams =
+          ev.grams ? ev.grams
+                   : catfishSecondsToGrams(ev.a, prefs::getTankGps(1));
+      Serial.printf("[RF] node feed %u g (mask 0x%X)\n", (unsigned)grams,
                     (unsigned)mask);
-      requestFeed(seconds, true, 0, 0, false, mask, nullptr,
+      requestFeed(grams, true, 0, 0, false, mask, nullptr,
                   feed_state::SRC_TOUCH);
       break;
     }
+
+    case UI_EVT_WIFI_SCAN:
+      // v1.10.0: on-display WiFi manager — async scan handled by wifi-task.
+      net_wifi::requestScan();
+      break;
+
+    case UI_EVT_WIFI_CONNECT:
+      // v1.10.0: connect to a user-picked AP (runs on wifi-task, not here).
+      net_wifi::requestConnect(String(ev.wifiSsid), String(ev.wifiPass));
+      uiToast(String("Connecting to ") + ev.wifiSsid + "...");
+      break;
 
     default:
       break;
@@ -987,7 +1072,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
                         r.seconds, false);
       }
       feed_state::recordHistory((uint8_t)(r.tanksFail ? r.tanksFail : 0x01),
-                                r.seconds, false, hflag);
+                                r.seconds, r.grams, false, hflag);
       feed_state::onFeedResult(false, r.seconds); // C3
     }
     if (r.ok) {
@@ -999,12 +1084,20 @@ static void handleWorkerResult(const net_worker::Result &r) {
         sd_log::logFeed(nowEpoch, (uint8_t)(r.tanksOk ? r.tanksOk : 0x01),
                         r.seconds, true);
         feed_state::recordHistory((uint8_t)(r.tanksOk ? r.tanksOk : 0x01),
-                                  r.seconds, true, hflag);
+                                  r.seconds, r.grams, true, hflag);
         when = r.manual ? formatLastFed(nowEpoch)
                         : (String("Today ") + fmtHhmm(r.hour, r.minute));
       }
       feed_state::onFeedResult(true, r.seconds); // C3 counters
-      feed_state::hopperAddUsage(r.tanksOk, r.secOk); // D1 estimator
+      // v1.10.0 (D1): hopper usage in grams — derived from the applied wire
+      // pulses and each tank's calibrated g/s rate.
+      uint16_t usedG[4] = {0, 0, 0, 0};
+      for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
+        if (r.tanksOk & (1u << (t - 1)))
+          usedG[t - 1] = catfishSecondsToGrams(r.secOk[t - 1],
+                                               prefs::getTankGps(t));
+      }
+      feed_state::hopperAddUsage(r.tanksOk, usedG);
 
       // Optimistic feeding state per successfully fed tank.
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
@@ -1027,7 +1120,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
       ui_set_feed_busy(false);
       if (clock_ok) ui_set_last_feed(when);
       if (r.manual) {
-        String t = String("Fed OK (") + r.seconds + " s";
+        String t = String("Fed OK (") + r.grams + " g";
         if (r.tanksOk & (r.tanksOk - 1)) t += ", multiple tanks";
         if (r.clamped) t += " - clamped"; // M3: relay clamp surfaced
         t += ")";
@@ -1062,7 +1155,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
         // the persistent journal — the success of tank 1 must not strand
         // tank 2 (P5 intent).
         if (!r.manual && !r.retry) {
-          if (feed_state::journalArm(r.hour, r.minute, r.seconds,
+          if (feed_state::journalArm(r.hour, r.minute, r.grams,
                                      r.tanksFail)) {
             uiToast("Some tanks failed - retrying in 30 s");
             Serial.printf("[FEED] partial scheduled feed, retry armed (mask 0x%X)\n",
@@ -1076,8 +1169,8 @@ static void handleWorkerResult(const net_worker::Result &r) {
       // Retained MQTT mirror: the relay IS pulsing now (M2-consistent).
       recomputeAggregates();
       if (clock_ok) mqtt_mgr::publishLastFeed(prefs::getLastFedEpoch());
-      Serial.printf("[FEED] feed OK via %s (%u s, tanks ok=0x%X)\n", r.ip,
-                    (unsigned)r.seconds, (unsigned)r.tanksOk);
+      Serial.printf("[FEED] feed OK via %s (%u g / %u s, tanks ok=0x%X)\n", r.ip,
+                    (unsigned)r.grams, (unsigned)r.seconds, (unsigned)r.tanksOk);
       refreshNextFeedUi();
       refreshFoodUi();
     } else if (r.manual) {
@@ -1097,7 +1190,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
                      : (String("Feed FAILED: ") + r.error));
         Serial.printf("[FEED] scheduled feed FAILED (%s) - %s\n", r.error,
                       more ? "another retry armed" : "journal gave up");
-      } else if (feed_state::journalArm(r.hour, r.minute, r.seconds,
+      } else if (feed_state::journalArm(r.hour, r.minute, r.grams,
                                         r.tanksFail ? r.tanksFail : 0x01)) {
         uiToast("Feed failed - retrying in 30 s");
         Serial.printf("[FEED] scheduled feed failed (%s), retry armed\n",
@@ -1148,7 +1241,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
       s_verify[i].pending = false;
       if (r.online && !r.feeding && (int32_t)(millis() - s_verify[i].untilMs) < 0) {
         const uint8_t bit = (uint8_t)(1u << i);
-        feed_state::recordHistory(bit, 0, false, feed_state::HIST_VERIFY);
+        feed_state::recordHistory(bit, 0, 0, false, feed_state::HIST_VERIFY);
         uiToast(String("Tank ") + (int)r.tankId + " not pulsing? (check food)"
                 );
         Serial.printf("[FEED] VERIFY FAIL tank %u: relay online but not feeding "
@@ -1213,21 +1306,21 @@ static void qemuSmokePump() {
 
   switch (s_step) {
     case 0: {
-      UiEvent ev{}; // default pulse -> 7 s
-      ev.type = UI_EVT_SET_PULSE;
-      ev.a = 7;
+      UiEvent ev{}; // default portion -> 7 g
+      ev.type = UI_EVT_SET_PORTION;
+      ev.grams = 7;
       qemuSmokeSend(ev);
       s_step = 1;
       break;
     }
     case 1:
-      qemuSmokeLog("SET_PULSE persisted (NVS)", prefs::getDefaultPulse() == 7);
+      qemuSmokeLog("SET_PORTION persisted (NVS)", prefs::getDefaultGrams() == 7);
       {
-        UiEvent ev{}; // add schedule 08:00:00, tank 1
+        UiEvent ev{}; // add schedule 08:00, 15 g, tank 1
         ev.type = UI_EVT_SCHED_ADD;
         ev.a = 8;
         ev.b = 0;
-        ev.c = 0;
+        ev.grams = 15;
         ev.tankMask = 1;
         qemuSmokeSend(ev);
       }
@@ -1546,35 +1639,31 @@ void loop() {
       // v1.9.0 (E4): one-shot skip of this occurrence
       if (feed_state::consumeSkip(due.hour, due.minute)) {
         feed_state::markFired(due.hour, due.minute, (uint32_t)time(nullptr));
-        feed_state::recordHistory(mask, due.seconds, false,
+        feed_state::recordHistory(mask, 0, due.grams, false,
                                   feed_state::HIST_SKIPPED);
         uiToast(String("Skipped ") + fmtHhmm(due.hour, due.minute));
         Serial.printf("[FEED] skipped scheduled feed %02u:%02u (skip-next)\n",
                       (unsigned)due.hour, (unsigned)due.minute);
       } else {
-        // v1.9.0 (A2): per-tank pulse overrides for this entry
-        uint8_t st[4] = {0, 0, 0, 0};
-        for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++)
-          st[t - 1] = entrySecondsForTank(due, t);
         // fired-map marker BEFORE firing (crash-safe: failures are the
         // journal's job; catch-up must not double-fire this slot)
         feed_state::markFired(due.hour, due.minute, (uint32_t)time(nullptr));
-        Serial.printf("[FEED] scheduled feed %02u:%02u (%u s, tanks 0x%X)\n",
+        Serial.printf("[FEED] scheduled feed %02u:%02u (%u g, tanks 0x%X)\n",
                       (unsigned)due.hour, (unsigned)due.minute,
-                      (unsigned)due.seconds, (unsigned)mask);
+                      (unsigned)due.grams, (unsigned)mask);
         uiToast("Feeding time!");
-        requestFeed(due.seconds, false, due.hour, due.minute, false, mask, st,
-                    feed_state::SRC_SCHED);
+        requestFeed(due.grams, false, due.hour, due.minute, false, mask,
+                    due.gramTank, feed_state::SRC_SCHED);
       }
     }
 
     // v1.9.0 (B1): persistent retry journal (survives power cycles)
     feed_state::RetryDue rd;
     if (feed_state::journalDue((uint32_t)time(nullptr), rd)) {
-      Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u s, tanks 0x%X)\n",
+      Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u g, tanks 0x%X)\n",
                     (unsigned)rd.hour, (unsigned)rd.minute,
-                    (unsigned)rd.seconds, (unsigned)rd.tankMask);
-      requestFeed(rd.seconds, false, rd.hour, rd.minute, true, rd.tankMask,
+                    (unsigned)rd.grams, (unsigned)rd.tankMask);
+      requestFeed(rd.grams, false, rd.hour, rd.minute, true, rd.tankMask,
                   nullptr, feed_state::SRC_SCHED);
     }
 
@@ -1610,6 +1699,7 @@ void loop() {
     mqtt_mgr::retryIfDue(now);
     mqttSyncUi();
     radiosUiSync();
+    wifiMgrUiSync(); // v1.10.0: WiFi manager scan/connect lifecycle
 
     // web dashboard state cache (~1 Hz; plain-field reads for the web task)
     webPublishSnapshot();

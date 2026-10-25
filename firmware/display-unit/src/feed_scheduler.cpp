@@ -32,13 +32,13 @@ void resetFireTracking() {
 void clampEntry(FeedTime &t) {
   if (t.hour > 23) t.hour = 23;
   if (t.minute > 59) t.minute = 59;
-  if (t.seconds < 1) t.seconds = 1;
-  if (t.seconds > 30) t.seconds = 30;
+  t.grams = catfishClampGrams(t.grams); // v1.10.0: portion 1..500 g
   t.tanks &= 0x0F;      // P5: only tanks 1..4 exist
   if (t.tanks == 0) t.tanks = 0x01;
   if (t.days == 0) t.days = 0x7F; // v1.9.0: empty mask = every day
   for (int i = 0; i < 4; i++) {
-    if (t.secTank[i] > 30) t.secTank[i] = 30; // 0 = inherit the shared seconds
+    // v1.10.0: per-tank gram override (0 = inherit the shared grams)
+    if (t.gramTank[i] > CATFISH_MAX_GRAMS) t.gramTank[i] = CATFISH_MAX_GRAMS;
   }
 }
 
@@ -51,11 +51,11 @@ bool persistNow() {
     o["h"] = s_entries[i].hour;
     o["m"] = s_entries[i].minute;
     o["e"] = s_entries[i].enabled;
-    o["s"] = s_entries[i].seconds;
+    o["g"] = s_entries[i].grams; // v1.10.0: portion in grams
     o["t"] = s_entries[i].tanks; // P5: target-tank bitmask
     o["d"] = s_entries[i].days;  // v1.9.0: weekday mask (0x7F = daily)
-    JsonArray st = o["st"].to<JsonArray>(); // v1.9.0: per-tank seconds (0 = shared)
-    for (int k = 0; k < 4; k++) st.add(s_entries[i].secTank[k]);
+    JsonArray gt = o["gt"].to<JsonArray>(); // v1.10.0: per-tank grams (0 = shared)
+    for (int k = 0; k < 4; k++) gt.add(s_entries[i].gramTank[k]);
   }
   String out;
   serializeJson(doc, out);
@@ -71,27 +71,45 @@ bool persistNow() {
 
 void seedDefaults() {
   s_count = 2;
-  s_entries[0] = FeedTime{7, 30, true, 3, 0x01};   // 07:30, 3 s, tank 1
-  s_entries[1] = FeedTime{17, 30, true, 3, 0x01};  // 17:30, 3 s, tank 1
+  s_entries[0] = FeedTime{};   // zero the C-struct parts (tanks, days init below)
+  s_entries[0].hour = 7;
+  s_entries[0].minute = 30;
+  s_entries[0].enabled = true;
+  s_entries[0].tanks = 0x01;
+  s_entries[0].grams = CATFISH_DEFAULT_GRAMS; // 15 g (== legacy 3 s @ 5 g/s)
+  s_entries[1] = FeedTime{};
+  s_entries[1].hour = 17;
+  s_entries[1].minute = 30;
+  s_entries[1].enabled = true;
+  s_entries[1].tanks = 0x01;
+  s_entries[1].grams = CATFISH_DEFAULT_GRAMS;
   resetFireTracking();
   s_dirty = true;
-  Serial.println("[FEED] first boot: seeded default schedule 07:30 + 17:30 (3 s)");
+  Serial.printf("[FEED] first boot: seeded default schedule 07:30 + 17:30 (%u g)\n",
+                (unsigned)CATFISH_DEFAULT_GRAMS);
 }
 
-/** Parse one schedule entry from JSON with v1.9.0 defaults (legacy-safe). */
+/** Parse one schedule entry from JSON (legacy-safe through v1.9.0 blobs). */
 void parseEntry(JsonVariant v, FeedTime &t) {
   t.hour = (uint8_t)(v["h"] | 0);
   t.minute = (uint8_t)(v["m"] | 0);
   t.enabled = (bool)(v["e"] | true);
-  t.seconds = (uint8_t)(v["s"] | 3);
   t.tanks = (uint8_t)(v["t"] | 1); // P5: missing key = legacy blob = tank 1
   t.days = (uint8_t)(v["d"] | 0x7F); // v1.9.0: absent = every day
-  for (int k = 0; k < 4; k++) t.secTank[k] = 0;
-  if (v["st"].is<JsonArray>()) {
+  t.grams = (uint16_t)(v["g"] | 0);
+  if (t.grams == 0) {
+    // v1.10.0 migration: legacy blobs stored SECONDS ("s" key, 1..30).
+    // Interpret them at the nominal auger rate (5 g/s) so prior portions
+    // keep approximately the same physical size (3 s -> 15 g).
+    const uint8_t legacySec = (uint8_t)(v["s"] | 3);
+    t.grams = (uint16_t)legacySec * CATFISH_DEFAULT_GPS;
+  }
+  for (int k = 0; k < 4; k++) t.gramTank[k] = 0;
+  if (v["gt"].is<JsonArray>()) {
     int k = 0;
-    for (JsonVariant s : v["st"].as<JsonArray>()) {
+    for (JsonVariant s : v["gt"].as<JsonArray>()) {
       if (k >= 4) break;
-      t.secTank[k++] = (uint8_t)(s | 0);
+      t.gramTank[k++] = (uint16_t)(s | 0);
     }
   }
   clampEntry(t);
@@ -171,10 +189,9 @@ bool remove(int index) {
   return true;
 }
 
-bool removeByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds) {
+bool removeByIdentity(uint8_t hour, uint8_t minute) {
   for (int i = 0; i < s_count; i++) {
-    if (s_entries[i].hour == hour && s_entries[i].minute == minute &&
-        s_entries[i].seconds == seconds) {
+    if (s_entries[i].hour == hour && s_entries[i].minute == minute) {
       return remove(i);
     }
   }
@@ -188,11 +205,9 @@ bool setEnabled(int index, bool enabled) {
   return true;
 }
 
-bool setEnabledByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds,
-                          bool enabled) {
+bool setEnabledByIdentity(uint8_t hour, uint8_t minute, bool enabled) {
   for (int i = 0; i < s_count; i++) {
-    if (s_entries[i].hour == hour && s_entries[i].minute == minute &&
-        s_entries[i].seconds == seconds) {
+    if (s_entries[i].hour == hour && s_entries[i].minute == minute) {
       return setEnabled(i, enabled);
     }
   }
@@ -264,8 +279,8 @@ FeedTime tick() {
     const uint32_t now_abs_min = (uint32_t)(now / 60);
     if (entry_min == now_min_of_day && s_last_fired[i] != now_abs_min) {
       s_last_fired[i] = now_abs_min;
-      Serial.printf("[FEED] due entry %d: %02u:%02u (%u s, days 0x%02X)\n", i,
-                    (unsigned)e.hour, (unsigned)e.minute, (unsigned)e.seconds,
+      Serial.printf("[FEED] due entry %d: %02u:%02u (%u g, days 0x%02X)\n", i,
+                    (unsigned)e.hour, (unsigned)e.minute, (unsigned)e.grams,
                     (unsigned)e.days);
       return e;
     }
@@ -284,7 +299,7 @@ NextFeed nextOccurrence() {
   out.tomorrow = false;
   out.hour = 0;
   out.minute = 0;
-  out.seconds = 0;
+  out.grams = 0;
   out.daysAhead = 0;
 
   if (!timeValid() || s_count == 0) return out;
@@ -298,7 +313,8 @@ NextFeed nextOccurrence() {
   for (int d = 0; d < 8; d++) {
     const int wday = (lt.tm_wday + d) % 7;
     int best = -1;
-    uint8_t bh = 0, bm = 0, bs = 0;
+    uint8_t bh = 0, bm = 0;
+    uint16_t bg = 0;
     for (int i = 0; i < s_count; i++) {
       const FeedTime &e = s_entries[i];
       if (!e.enabled) continue;
@@ -309,7 +325,7 @@ NextFeed nextOccurrence() {
         best = em;
         bh = e.hour;
         bm = e.minute;
-        bs = e.seconds;
+        bg = e.grams;
       }
     }
     if (best >= 0) {
@@ -318,7 +334,7 @@ NextFeed nextOccurrence() {
       out.daysAhead = (uint8_t)d;
       out.hour = bh;
       out.minute = bm;
-      out.seconds = bs;
+      out.grams = bg;
       return out;
     }
   }

@@ -85,6 +85,7 @@ void handleStatus() {
   doc["lastFedEpoch"] = s_snap.lastFedEpoch;
   doc["lastFeedIso"] = mqtt_payloads::epochToIso8601(s_snap.lastFedEpoch);
   doc["pulse"] = s_snap.pulse;
+  doc["defGrams"] = s_snap.defGrams; // v1.10.0: default portion (g)
   doc["schedCount"] = s_snap.schedCount;
   doc["clockValid"] = s_snap.clockValid;
   doc["clockSrc"] = s_snap.clockSrc;  // v1.9.0 (B2): "none"/"rtc"/"ntp"
@@ -153,17 +154,25 @@ void handleSchedulePut() {
 
 void handleFeed() {
   if (!authOk()) return sendErr(403, "auth");
-  uint8_t secs = 0;   // 0 -> device default pulse
+  uint16_t grams = 0; // v1.10.0: 0 -> device default portion (g)
+  uint8_t legacySecs = 0; // v1.9.0 wire-compat: explicit seconds (converted)
   long tankMask = -1; // -1 -> all configured tanks
   const String body = s_srv.arg("plain");
   if (body.length()) {
     JsonDocument doc;
     if (deserializeJson(doc, body) != DeserializationError::Ok)
       return sendErr(400, "bad_json");
-    if (!doc["seconds"].isNull()) {
+    if (!doc["grams"].isNull()) {
+      const long v = doc["grams"] | -1L;
+      if (v < 1 || v > (long)CATFISH_MAX_GRAMS) return sendErr(400, "bad_grams");
+      grams = (uint16_t)v;
+    } else if (!doc["seconds"].isNull()) {
+      // v1.10.0 wire-compat: legacy clients may still send seconds; they are
+      // converted to grams via tank 1's calibrated rate.
       const long v = doc["seconds"] | -1L;
-      if (v < 1 || v > (long)CATFISH_PULSE_S_LIMIT) return sendErr(400, "bad_seconds");
-      secs = (uint8_t)v;
+      if (v < 1 || v > (long)CATFISH_PULSE_S_LIMIT)
+        return sendErr(400, "bad_seconds");
+      legacySecs = (uint8_t)v;
     }
     if (!doc["tanks"].isNull()) {
       tankMask = doc["tanks"] | 0L;
@@ -180,7 +189,10 @@ void handleFeed() {
   UiEvent ev;
   ev.type = UI_EVT_FEED;
   ev.flag = true; // manual (shows the on-device "Feeding fish..." toast too)
-  ev.a = secs ? secs : prefs::getDefaultPulse();
+  ev.grams = grams ? grams
+                   : catfishSecondsToGrams(legacySecs ? legacySecs
+                                                      : prefs::getDefaultPulse(),
+                                           prefs::getTankGps(1));
   ev.tankMask = mask;
   ev.feedSrc = 1; // v1.9.0: REMOTE for the policy gate (F3: vacation/gap/cap)
   if (!ui::ui_event_send(ev)) return sendErr(503, "busy");

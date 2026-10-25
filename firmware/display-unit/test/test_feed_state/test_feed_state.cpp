@@ -33,7 +33,8 @@ static uint32_t g_skipMin = 0xFFFF;
 static bool g_vacation = false;
 static uint8_t g_minGap = 0, g_maxFeeds = 0, g_catchupWin = 10, g_lowPct = 20;
 static uint32_t g_lastFed = 0;
-static uint16_t g_cap[5] = {0, 0, 0, 0, 0}; // hopper caps, index 1..4
+static uint16_t g_cap[5] = {0, 0, 0, 0, 0}; // hopper caps (g), index 1..4
+static uint16_t g_gps[5] = {0, 0, 0, 0, 0}; // per-tank g/s rate, index 1..4
 
 static void resetMock() {
   g_retry.clear();
@@ -47,7 +48,10 @@ static void resetMock() {
   g_catchupWin = 10;
   g_lowPct = 20;
   g_lastFed = 0;
-  for (int i = 0; i < 5; i++) g_cap[i] = 0;
+  for (int i = 0; i < 5; i++) {
+    g_cap[i] = 0;
+    g_gps[i] = 0;
+  }
 }
 
 String getRetryJson() { return g_retry; }
@@ -81,6 +85,9 @@ void setMaxFeedsDay(uint8_t m) { g_maxFeeds = m; }
 uint8_t getCatchupWin() { return g_catchupWin; } // getter-only (feed_state takes the window as a parameter)
 uint8_t getHopperLowPct() { return g_lowPct; }
 uint32_t getLastFedEpoch() { return g_lastFed; }
+uint16_t getTankGps(uint8_t tank1) { // v1.10.0: legacy "s" journal migration
+  return (tank1 >= 1 && tank1 <= 4) ? g_gps[tank1] : 0;
+}
 uint16_t getTankHopperCap(uint8_t tank1) {
   return (tank1 >= 1 && tank1 <= 4) ? g_cap[tank1] : 0;
 }
@@ -142,7 +149,7 @@ void test_journal_due_gates_on_first_backoff(void) {
   TEST_ASSERT_TRUE(feed_state::journalDue(anchorEpoch() + 30, out));
   TEST_ASSERT_EQUAL_UINT8(7, out.hour);
   TEST_ASSERT_EQUAL_UINT8(30, out.minute);
-  TEST_ASSERT_EQUAL_UINT8(3, out.seconds);
+  TEST_ASSERT_EQUAL_UINT16(3, out.grams); // v1.10.0: portion (g) carried
   TEST_ASSERT_EQUAL_UINT8(0x01, out.tankMask);
 }
 
@@ -213,7 +220,7 @@ void test_journal_survives_reinit_from_prefs(void) {
   TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 30, out));
   TEST_ASSERT_EQUAL_UINT8(7, out.hour);
   TEST_ASSERT_EQUAL_UINT8(30, out.minute);
-  TEST_ASSERT_EQUAL_UINT8(3, out.seconds);
+  TEST_ASSERT_EQUAL_UINT16(3, out.grams); // v1.10.0: portion (g) carried
   TEST_ASSERT_EQUAL_UINT8(0x01, out.tankMask);
 }
 
@@ -229,6 +236,31 @@ void test_journal_inflight_slot_becomes_due_after_reinit(void) {
   TEST_ASSERT_FALSE(feed_state::journalDue(t0 + 44, out));
   TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 45, out)); // fires right away
   TEST_ASSERT_EQUAL_UINT8(7, out.hour);
+}
+
+// v1.10.0 regression: a pre-1.10 journal blob stores pulse SECONDS ("s" key);
+// init() must migrate it to grams via catfishSecondsToGrams + the tank's g/s.
+void test_journal_legacy_s_blob_migrates_to_grams(void) {
+  const uint32_t t0 = anchorEpoch();
+  char blob[160];
+  snprintf(blob, sizeof(blob),
+           "[{\"h\":7,\"m\":30,\"s\":3,\"t\":1,\"a\":1,\"due\":%lu}]",
+           (unsigned long)(t0 + 30));
+  prefs::g_retry = blob;
+  feed_state::init(); // "power cycle" reload from the legacy blob
+
+  feed_state::RetryDue out;
+  TEST_ASSERT_FALSE(feed_state::journalDue(t0 + 29, out));
+  TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 30, out));
+  TEST_ASSERT_EQUAL_UINT16(15, out.grams); // 3 s at the default 5 g/s
+  TEST_ASSERT_EQUAL_UINT8(0x01, out.tankMask);
+
+  // an explicit tank rate is honoured by the migration: 3 s * 10 g/s = 30 g
+  prefs::g_retry = blob;
+  prefs::g_gps[1] = 10;
+  feed_state::init();
+  TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 30, out));
+  TEST_ASSERT_EQUAL_UINT16(30, out.grams);
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +290,7 @@ void test_scan_catchup_fires_within_window_once(void) {
                                                    10, out, 2));
   TEST_ASSERT_EQUAL_UINT8(7, out[0].hour);
   TEST_ASSERT_EQUAL_UINT8(30, out[0].minute);
-  TEST_ASSERT_EQUAL_UINT8(3, out[0].seconds);
+  TEST_ASSERT_EQUAL_UINT16(3, out[0].grams); // portion carried (was .seconds)
   TEST_ASSERT_EQUAL_UINT8(0x01, out[0].tankMask);
 
   // marked fired BEFORE returning -> second scan (and a reboot) stay quiet
@@ -414,24 +446,24 @@ void test_guards_defaults_allow_everything(void) {
 // D1: hopper estimator
 // ---------------------------------------------------------------------------
 void test_hopper_usage_accumulates_and_refills(void) {
-  const uint8_t secs[4] = {5, 7, 0, 0};
-  feed_state::hopperAddUsage(0x03, secs); // tanks 1+2
-  TEST_ASSERT_EQUAL_UINT16(5, feed_state::hopperUsedSec(1));
-  TEST_ASSERT_EQUAL_UINT16(7, feed_state::hopperUsedSec(2));
-  feed_state::hopperAddUsage(0x01, secs); // tank 1 again
-  TEST_ASSERT_EQUAL_UINT16(10, feed_state::hopperUsedSec(1));
+  const uint16_t grams[4] = {5, 7, 0, 0};
+  feed_state::hopperAddUsage(0x03, grams); // tanks 1+2
+  TEST_ASSERT_EQUAL_UINT16(5, feed_state::hopperUsedG(1));
+  TEST_ASSERT_EQUAL_UINT16(7, feed_state::hopperUsedG(2));
+  feed_state::hopperAddUsage(0x01, grams); // tank 1 again
+  TEST_ASSERT_EQUAL_UINT16(10, feed_state::hopperUsedG(1));
 
   // usage survives a reboot (hopper blob round-trip)
   feed_state::init();
-  TEST_ASSERT_EQUAL_UINT16(10, feed_state::hopperUsedSec(1));
-  TEST_ASSERT_EQUAL_UINT16(7, feed_state::hopperUsedSec(2));
+  TEST_ASSERT_EQUAL_UINT16(10, feed_state::hopperUsedG(1));
+  TEST_ASSERT_EQUAL_UINT16(7, feed_state::hopperUsedG(2));
 
   feed_state::hopperRefill(1); // refill tank 1 only
-  TEST_ASSERT_EQUAL_UINT16(0, feed_state::hopperUsedSec(1));
-  TEST_ASSERT_EQUAL_UINT16(7, feed_state::hopperUsedSec(2));
+  TEST_ASSERT_EQUAL_UINT16(0, feed_state::hopperUsedG(1));
+  TEST_ASSERT_EQUAL_UINT16(7, feed_state::hopperUsedG(2));
 
   feed_state::hopperRefill(0xFF); // refill everything
-  TEST_ASSERT_EQUAL_UINT16(0, feed_state::hopperUsedSec(2));
+  TEST_ASSERT_EQUAL_UINT16(0, feed_state::hopperUsedG(2));
 }
 
 void test_hopper_level_pct_and_low_alert(void) {
@@ -439,12 +471,12 @@ void test_hopper_level_pct_and_low_alert(void) {
   TEST_ASSERT_EQUAL_UINT8(255, feed_state::hopperLevelPct(1));
   TEST_ASSERT_FALSE(feed_state::hopperLowAny(1));
 
-  prefs::g_cap[1] = 600; // tank 1 holds 600 pulse-seconds
+  prefs::g_cap[1] = 600; // tank 1 holds 600 g (v1.9.0 stored pulse-seconds)
   TEST_ASSERT_EQUAL_UINT8(100, feed_state::hopperLevelPct(1)); // unused
 
-  // 255 + 45 = 300 used of 600 -> exactly 50 %
-  const uint8_t first[4] = {255, 0, 0, 0};
-  const uint8_t rest[4] = {45, 0, 0, 0};
+  // 255 g + 45 g = 300 g used of 600 g -> exactly 50 %
+  const uint16_t first[4] = {255, 0, 0, 0};
+  const uint16_t rest[4] = {45, 0, 0, 0};
   feed_state::hopperAddUsage(0x01, first);
   feed_state::hopperAddUsage(0x01, rest);
   TEST_ASSERT_EQUAL_UINT8(50, feed_state::hopperLevelPct(1));
@@ -452,28 +484,28 @@ void test_hopper_level_pct_and_low_alert(void) {
   // default low threshold (20 %): 50 % is still fine
   TEST_ASSERT_FALSE(feed_state::hopperLowAny(1));
 
-  const uint8_t more[4] = {250, 0, 0, 0}; // 300 + 250 = 550/600 -> 9 %
+  const uint16_t more[4] = {250, 0, 0, 0}; // 300 + 250 = 550/600 -> 9 %
   feed_state::hopperAddUsage(0x01, more);
   TEST_ASSERT_EQUAL_UINT8(9, feed_state::hopperLevelPct(1));
   TEST_ASSERT_TRUE(feed_state::hopperLowAny(1));
 
   // over-capacity clamps to 0 %
   feed_state::hopperRefill(1);
-  const uint8_t over[4] = {255, 0, 0, 0};
+  const uint16_t over[4] = {255, 0, 0, 0};
   feed_state::hopperAddUsage(0x01, over);
   feed_state::hopperAddUsage(0x01, over);
-  feed_state::hopperAddUsage(0x01, over); // 765 >= 600
+  feed_state::hopperAddUsage(0x01, over); // 765 g >= 600 g
   TEST_ASSERT_EQUAL_UINT8(0, feed_state::hopperLevelPct(1));
 }
 
 void test_hopper_low_ignores_unconfigured_tanks(void) {
   prefs::g_cap[2] = 600; // only tank 2 has a known capacity
-  // 255 + 255 + 40 = 550 used of 600 -> 9 % (below the 20 % threshold)
-  const uint8_t s255[4] = {0, 255, 0, 0};
-  const uint8_t s40[4] = {0, 40, 0, 0};
-  feed_state::hopperAddUsage(0x02, s255);
-  feed_state::hopperAddUsage(0x02, s255);
-  feed_state::hopperAddUsage(0x02, s40);
+  // 255 g + 255 g + 40 g = 550 g used of 600 g -> 9 % (below 20 %)
+  const uint16_t g255[4] = {0, 255, 0, 0};
+  const uint16_t g40[4] = {0, 40, 0, 0};
+  feed_state::hopperAddUsage(0x02, g255);
+  feed_state::hopperAddUsage(0x02, g255);
+  feed_state::hopperAddUsage(0x02, g40);
   TEST_ASSERT_TRUE(feed_state::hopperLowAny(2));  // tank 2 is in the scan
   TEST_ASSERT_FALSE(feed_state::hopperLowAny(1)); // scan stops at tank 1
 }
@@ -485,7 +517,8 @@ void test_history_ring_caps_at_24_newest_first(void) {
   for (int i = 0; i < 30; i++) {
     g_now = makeLocalTime(2025, 6, 16, 12, 0, i); // distinct epochs
     feed_state::recordHistory((uint8_t)(0x01 << (i % 4)), (uint8_t)(i + 1),
-                              (i % 2) == 1, feed_state::HIST_MANUAL);
+                              (uint16_t)(i + 1), (i % 2) == 1,
+                              feed_state::HIST_MANUAL);
   }
   TEST_ASSERT_EQUAL_INT(24, feed_state::historyCount());
 
@@ -493,32 +526,34 @@ void test_history_ring_caps_at_24_newest_first(void) {
   TEST_ASSERT_EQUAL_UINT32((uint32_t)makeLocalTime(2025, 6, 16, 12, 0, 29),
                            h[0].epoch); // index 0 = newest
   TEST_ASSERT_EQUAL_UINT8(30, h[0].seconds);
+  TEST_ASSERT_EQUAL_UINT16(30, h[0].grams);
   TEST_ASSERT_TRUE(h[0].ok);
   TEST_ASSERT_EQUAL_UINT8(feed_state::HIST_MANUAL, h[0].flag);
   // 6 oldest entries (i = 0..5) fell off; index 23 = event i = 6
   TEST_ASSERT_EQUAL_UINT8(7, h[23].seconds);
+  TEST_ASSERT_EQUAL_UINT16(7, h[23].grams);
   TEST_ASSERT_EQUAL_UINT8(0x04, h[23].tankMask);
   TEST_ASSERT_FALSE(h[23].ok);
 }
 
 void test_history_dirty_flag_lifecycle(void) {
   TEST_ASSERT_FALSE(feed_state::historyDirty());
-  feed_state::recordHistory(0x01, 3, true, feed_state::HIST_MANUAL);
+  feed_state::recordHistory(0x01, 3, 0, true, feed_state::HIST_MANUAL);
   TEST_ASSERT_TRUE(feed_state::historyDirty());
   feed_state::historyClearDirty();
   TEST_ASSERT_FALSE(feed_state::historyDirty());
 
   // serializing does not clear the flag (the consumer does)
-  feed_state::recordHistory(0x01, 3, true, feed_state::HIST_MANUAL);
+  feed_state::recordHistory(0x01, 3, 0, true, feed_state::HIST_MANUAL);
   (void)feed_state::historyJson(1);
   TEST_ASSERT_TRUE(feed_state::historyDirty());
 }
 
 void test_history_json_roundtrip_via_arduinojson(void) {
   g_now = makeLocalTime(2025, 6, 16, 12, 0, 0);
-  feed_state::recordHistory(0x03, 4, true, feed_state::HIST_RETRY);
+  feed_state::recordHistory(0x03, 4, 40, true, feed_state::HIST_RETRY);
   g_now = makeLocalTime(2025, 6, 16, 12, 0, 10);
-  feed_state::recordHistory(0x02, 9, false, feed_state::HIST_BLOCKED);
+  feed_state::recordHistory(0x02, 9, 0, false, feed_state::HIST_BLOCKED);
 
   const String j = feed_state::historyJson(2); // newest-first
   JsonDocument doc;
@@ -533,12 +568,14 @@ void test_history_json_roundtrip_via_arduinojson(void) {
       (uint32_t)(long)(arr[0]["e"] | 0L));
   TEST_ASSERT_EQUAL_UINT8(0x02, (uint8_t)(arr[0]["m"] | 0));
   TEST_ASSERT_EQUAL_UINT8(9, (uint8_t)(arr[0]["s"] | 0));
+  TEST_ASSERT_EQUAL_INT(0, (int)(arr[0]["g"] | -1)); // blocked: no grams known
   TEST_ASSERT_EQUAL_INT(0, (int)(arr[0]["ok"] | -1));
   TEST_ASSERT_EQUAL_UINT8(feed_state::HIST_BLOCKED,
                           (uint8_t)(arr[0]["f"] | 0));
   // [1] = older: tank 1+2, 4 s, ok, retry
   TEST_ASSERT_EQUAL_UINT8(0x03, (uint8_t)(arr[1]["m"] | 0));
   TEST_ASSERT_EQUAL_UINT8(4, (uint8_t)(arr[1]["s"] | 0));
+  TEST_ASSERT_EQUAL_INT(40, (int)(arr[1]["g"] | -1)); // v1.10.0: grams present
   TEST_ASSERT_EQUAL_INT(1, (int)(arr[1]["ok"] | -1));
   TEST_ASSERT_EQUAL_UINT8(feed_state::HIST_RETRY, (uint8_t)(arr[1]["f"] | 0));
 }
@@ -551,6 +588,7 @@ int main(void) {
   RUN_TEST(test_journal_two_slots_and_same_identity_refresh);
   RUN_TEST(test_journal_survives_reinit_from_prefs);
   RUN_TEST(test_journal_inflight_slot_becomes_due_after_reinit);
+  RUN_TEST(test_journal_legacy_s_blob_migrates_to_grams);
   RUN_TEST(test_skip_next_consumed_exactly_once);
   RUN_TEST(test_skip_next_other_identity_does_not_consume);
   RUN_TEST(test_scan_catchup_fires_within_window_once);

@@ -23,25 +23,36 @@
 #include <stdint.h>
 #include <time.h>
 
+#include <catfish_protocol.h>
+
 struct FeedTime {
   uint8_t hour;    // 0..23
   uint8_t minute;  // 0..59
   bool enabled;    // entry participates in scheduling when true
-  uint8_t seconds; // feed pulse duration 1..30 s
+  // v1.10.0: the portion unit is GRAMS. The wire pulse (seconds) is derived
+  // per tank at fire time via catfishGramsToSeconds(grams, tankGps).
+  uint16_t grams = CATFISH_DEFAULT_GRAMS; // portion 1..CATFISH_MAX_GRAMS
   uint8_t tanks;   // P5: target-tank bitmask (bit 0 = tank 1). 0 loads as 1
                    // (legacy blobs) and is clamped back to 1 when stored.
   // v1.9.0: weekday mask, bit0=Mon .. bit5=Sat, bit6=Sun. 0x7F = every day
   // (default; legacy blobs and absent JSON key load as every-day).
   uint8_t days = 0x7F;
-  // v1.9.0: per-tank pulse override in seconds (0 = use the shared `seconds`).
-  uint8_t secTank[4] = {0, 0, 0, 0};
+  // v1.10.0: per-tank portion override in grams (0 = use the shared `grams`).
+  uint16_t gramTank[4] = {0, 0, 0, 0};
 };
 
-/** v1.9.0: seconds actually fed to @p tank1 (1-based) for an entry. */
-inline uint8_t entrySecondsForTank(const FeedTime &e, uint8_t tank1) {
+/** v1.10.0: portion in grams fed to @p tank1 (1-based) for an entry. */
+inline uint16_t entryGramsForTank(const FeedTime &e, uint8_t tank1) {
   const int i = (int)tank1 - 1;
-  if (i < 0 || i >= 4 || e.secTank[i] == 0) return e.seconds;
-  return e.secTank[i];
+  if (i < 0 || i >= 4 || e.gramTank[i] == 0) return e.grams;
+  return e.gramTank[i];
+}
+
+/** v1.9.0 (kept for the wire path): relay pulse seconds for @p tank1,
+ *  derived from the entry's grams and the tank's calibrated g/s rate. */
+inline uint8_t entrySecondsForTank(const FeedTime &e, uint8_t tank1,
+                                   uint16_t tankGps) {
+  return catfishGramsToSeconds(entryGramsForTank(e, tank1), tankGps);
 }
 
 /** v1.9.0: true when the entry is scheduled on the given localtime weekday
@@ -110,18 +121,18 @@ bool add(const FeedTime &ft);
 /** Remove entry at index (shifts the rest). Marks persistence dirty. */
 bool remove(int index);
 
-/** Remove the first entry matching h:m:s (identity-safe vs index shifts).
+/** Remove the first entry matching h:m (HH:MM is the unique identity —
+ *  duplicates are rejected on add). Identity-safe vs index shifts.
  *  @return false when not found. */
-bool removeByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds);
+bool removeByIdentity(uint8_t hour, uint8_t minute);
 
 /** Enable/disable an entry. Marks persistence dirty. */
 bool setEnabled(int index, bool enabled);
 
-/** Enable/disable the first entry matching h:m:s (identity-safe vs index
+/** Enable/disable the first entry matching h:m (identity-safe vs index
  *  shifts — the UI queues toggles, and the list can change meanwhile).
  *  @return false when not found. */
-bool setEnabledByIdentity(uint8_t hour, uint8_t minute, uint8_t seconds,
-                          bool enabled);
+bool setEnabledByIdentity(uint8_t hour, uint8_t minute, bool enabled);
 
 /** Flip an entry's enabled flag. Marks persistence dirty. */
 bool toggle(int index);
@@ -164,7 +175,7 @@ struct NextFeed {
   bool tomorrow;   // next occurrence is NOT today
   uint8_t hour;
   uint8_t minute;
-  uint8_t seconds;
+  uint16_t grams;    // v1.10.0: portion of the next entry
   uint8_t daysAhead; // v1.9.0: 0 = today, 1..7 = days into the future
 };
 

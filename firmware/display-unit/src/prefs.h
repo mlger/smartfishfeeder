@@ -63,9 +63,13 @@ void setTankIp(uint8_t tank1, const String &ip);
 String effectiveTankToken(uint8_t tank1);
 
 // ---- Feeding defaults ----
-/** Default manual-feed pulse in seconds (1..30). */
+/** Default manual-feed pulse in seconds (1..30) — used by the MQTT/HA number
+ *  entity and the wire protocol; the touch UI default portion is GRAMS below. */
 uint8_t getDefaultPulse();
 void setDefaultPulse(uint8_t seconds);
+/** v1.10.0: default manual-feed portion in grams (1..CATFISH_MAX_GRAMS). */
+uint16_t getDefaultGrams();
+void setDefaultGrams(uint16_t grams);
 
 // ---- MQTT / Home Assistant (display unit is the hub) ----
 // All MQTT getters/setters are called ONLY from loop() (single-writer,
@@ -140,12 +144,15 @@ void setCatchupWin(uint8_t minutes);
 /** Low-food alert threshold in percent (5..90, default 20). */
 uint8_t getHopperLowPct();
 void setHopperLowPct(uint8_t pct);
-/** Per-tank food rate in grams/second for portion display (0 = off). */
+/** Per-tank food rate in grams/second for portion display (0 = nominal). */
 uint16_t getTankGps(uint8_t tank1);
 void setTankGps(uint8_t tank1, uint16_t gps);
-/** Per-tank hopper capacity in pulse-seconds (0 = unknown -> no level bar). */
+/**
+ * v1.10.0: per-tank hopper capacity in GRAMS (0 = unknown -> no level bar).
+ * v1.9.0 stored pulse-seconds; begin() migrates old values once (x gps).
+ */
 uint16_t getTankHopperCap(uint8_t tank1);
-void setTankHopperCap(uint8_t tank1, uint16_t capSec);
+void setTankHopperCap(uint8_t tank1, uint16_t capG);
 
 } // namespace prefs
 

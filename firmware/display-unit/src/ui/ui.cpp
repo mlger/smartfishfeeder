@@ -263,7 +263,7 @@ void enableSwitchCb(lv_event_t *e);
 void trashCb(lv_event_t *e);
 void editorSaveCb(lv_event_t *e);
 void editorCancelCb(lv_event_t *e);
-void pulseSpinCb(lv_event_t *e);
+void portionSpinCb(lv_event_t *e); // v1.10.0 (was pulseSpinCb)
 void blSwitchCb(lv_event_t *e);
 void h12SwitchCb(lv_event_t *e);
 void relayTestCb(lv_event_t *e);
@@ -271,7 +271,6 @@ void rebootCb(lv_event_t *e);
 void toastTimerCb(lv_timer_t *t);
 void spinMinusCb(lv_event_t *e);
 void spinPlusCb(lv_event_t *e);
-void rebuildScheduleList();
 void openEditor();
 void closeEditor();
 void addBtnCb(lv_event_t *e);
@@ -312,8 +311,6 @@ void rebuildTankRows();
 // v1.9.0
 void vacationSwitchCb(lv_event_t *e);
 void skipOnceCb(lv_event_t *e);
-void dayChipCb(lv_event_t *e);
-void presetCb(lv_event_t *e);
 void refillCb(lv_event_t *e);
 void policySaveCb(lv_event_t *e);
 void histBtnCb(lv_event_t *e);
@@ -321,6 +318,15 @@ void histCloseCb(lv_event_t *e);
 void rebuildFoodRows();
 void refreshFoodRows();
 const char *fmtDaysMask(uint8_t days, char *buf, size_t cap);
+// v1.10.0: on-display WiFi manager. buildWifiCard is implemented in namespace
+// ui (below, next to its public ui_wifi_* entry points), so the declaration
+// must live in namespace ui too — briefly close this anonymous namespace.
+} // namespace (anonymous — reopened immediately below)
+void buildWifiCard(lv_obj_t *parent);
+namespace {
+// v1.10.0: dayChipCb removed — the weekly day chips now toggle via
+// LV_OBJ_FLAG_CHECKABLE + LV_STATE_CHECKED style selectors (the old callback
+// read a state that never toggled, so weekly scheduling was impossible).
 
 // ---------------------------------------------------------------------------
 // Keyboard helpers (v1.6.1) — shared by the token, MQTT and tank editors
@@ -403,7 +409,12 @@ lv_obj_t *makeSpinbox(lv_obj_t *parent, int32_t mn, int32_t mx, int32_t val,
                       lv_coord_t w, lv_coord_t h) {
   lv_obj_t *sb = lv_spinbox_create(parent);
   lv_spinbox_set_range(sb, mn, mx);
-  lv_spinbox_set_digit_format(sb, 2, 0);
+  // v1.10.0: digit width follows the range (grams spinboxes go up to 500)
+  uint8_t digits = 1;
+  if (mx >= 1000) digits = 4;
+  else if (mx >= 100) digits = 3;
+  else if (mx >= 10) digits = 2;
+  lv_spinbox_set_digit_format(sb, digits, 0);
   spinSetValueQuiet(sb, val);
   lv_obj_set_size(sb, w, h);
   lv_obj_set_style_bg_color(sb, lv_color_hex(C_BG_DARK), 0);
@@ -499,14 +510,19 @@ void addStatusBar(lv_obj_t *parent, int idx) {
   lv_label_set_text(wf, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_font(wf, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(wf, lv_color_hex(C_MUTED), 0);
-  lv_obj_align(wf, LV_ALIGN_RIGHT_MID, -68, 0);
+  // v1.10.0 FIX (overlap): the clock label is LV_SIZE_CONTENT and grows
+  // LEFTWARD from its right anchor (e.g. "10:45 AM" in 12-hour mode), which
+  // used to run into the WiFi symbol parked at -68. The symbol now sits at
+  // the fixed right edge and the clock lives to its LEFT, so the clock can
+  // only ever grow away from the icon.
+  lv_obj_align(wf, LV_ALIGN_RIGHT_MID, -16, 0);
   s_wifi_sym[idx] = wf;
 
   lv_obj_t *ck = lv_label_create(bar);
   lv_label_set_text(ck, "--:--");
   lv_obj_set_style_text_font(ck, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(ck, lv_color_hex(C_TEXT), 0);
-  lv_obj_align(ck, LV_ALIGN_RIGHT_MID, -16, 0);
+  lv_obj_align(ck, LV_ALIGN_RIGHT_MID, -44, 0); // icon (~18 px) + 10 px gap
   s_clock_lbl[idx] = ck;
 }
 
@@ -569,18 +585,17 @@ void navCb(lv_event_t *e) {
 
 void feedBtnCb(lv_event_t *e) {
   (void)e;
-  ui_request_feed(prefs::getDefaultPulse());
+  ui_request_feed(prefs::getDefaultGrams()); // v1.10.0: default portion (g)
 }
 
 void enableSwitchCb(lv_event_t *e) {
-  // v1.8.2: pack the entry IDENTITY (h<<12|m<<6|s), not the list index —
+  // v1.8.2/v1.10.0: pack the entry IDENTITY (h<<8|m), not the list index —
   // the index can go stale while the event sits in the queue (a dashboard
   // replaceAll or a trash tap processed in the same drain window shifts
   // entries). Identity stays valid; matches trashCb / removeByIdentity.
   const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
-  const uint8_t h = (uint8_t)((id >> 12) & 0x1F);
-  const uint8_t m = (uint8_t)((id >> 6) & 0x3F);
-  const uint8_t s = (uint8_t)(id & 0x3F);
+  const uint8_t h = (uint8_t)((id >> 8) & 0xFF);
+  const uint8_t m = (uint8_t)(id & 0xFF);
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   const bool en = lv_obj_has_state(sw, LV_STATE_CHECKED);
   // H3: the scheduler is single-writer (loop() context only) — the LVGL task
@@ -589,23 +604,21 @@ void enableSwitchCb(lv_event_t *e) {
   ev.type = UI_EVT_SCHED_PERSIST;
   ev.a = h;
   ev.b = m;
-  ev.c = s;
   ev.flag = en;
   uiEventSend(ev);
-  Serial.printf("[UI] schedule entry %02u:%02u (%us) -> %s (queued)\n",
-                (unsigned)h, (unsigned)m, (unsigned)s, en ? "enabled" : "disabled");
+  Serial.printf("[UI] schedule entry %02u:%02u -> %s (queued)\n",
+                (unsigned)h, (unsigned)m, en ? "enabled" : "disabled");
 }
 
 void trashCb(lv_event_t *e) {
-  // user_data packs the entry identity (h<<12 | m<<6 | s) so a tap is immune
+  // user_data packs the entry identity (h<<8 | m) so a tap is immune
   // to index shifts caused by other pending removals; loop() does the actual
   // feed_scheduler::removeByIdentity() + list rebuild under the LVGL lock.
   const uintptr_t packed = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
   UiEvent ev;
   ev.type = UI_EVT_SCHED_REMOVE;
-  ev.a = (uint8_t)((packed >> 12) & 0x1F);
-  ev.b = (uint8_t)((packed >> 6) & 0x3F);
-  ev.c = (uint8_t)(packed & 0x3F);
+  ev.a = (uint8_t)((packed >> 8) & 0xFF);
+  ev.b = (uint8_t)(packed & 0xFF);
   uiEventSend(ev);
 }
 
@@ -657,23 +670,15 @@ void skipOnceCb(lv_event_t *e) {
   const uintptr_t packed = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
   UiEvent ev;
   ev.type = UI_EVT_SKIP_NEXT;
-  ev.a = (uint8_t)((packed >> 8) & 0x1F);
-  ev.b = (uint8_t)(packed & 0x3F);
+  ev.a = (uint8_t)((packed >> 8) & 0xFF);
+  ev.b = (uint8_t)(packed & 0xFF);
   uiEventSend(ev);
 }
 
-void dayChipCb(lv_event_t *e) {
-  // visual toggle only; editorSaveCb reads the CHECKED state of every chip
-  lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
-  const bool on = lv_obj_has_state(btn, LV_STATE_CHECKED);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(on ? C_AMBER : C_CARD), 0);
-  lv_obj_set_style_text_color(btn, lv_color_hex(on ? C_INK : C_MUTED), 0);
-}
-
 void presetCb(lv_event_t *e) {
-  // A3: S/M/L portion presets -> shared seconds (per-tank overrides untouched)
-  const uintptr_t secs = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
-  if (s_sb_sec) spinSetValueQuiet(s_sb_sec, (int32_t)secs);
+  // v1.10.0: S/M/L portion presets in GRAMS (per-tank overrides untouched).
+  const uintptr_t g = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  if (s_sb_sec) spinSetValueQuiet(s_sb_sec, (int32_t)g);
 }
 
 void refillCb(lv_event_t *e) {
@@ -712,7 +717,7 @@ void editorSaveCb(lv_event_t *e) {
   ev.type = UI_EVT_SCHED_ADD;
   ev.a = (uint8_t)lv_roller_get_selected(s_r_hour);
   ev.b = (uint8_t)lv_roller_get_selected(s_r_min);
-  ev.c = (uint8_t)lv_spinbox_get_value(s_sb_sec);
+  ev.grams = (uint16_t)lv_spinbox_get_value(s_sb_sec); // v1.10.0: grams
   // P5: pack target tanks from the editor checkboxes (missing checkboxes =
   // single-tank setup = tank 1). Default: every checkbox unchecked row would
   // mean "no tank" -> loop falls back to tank 1 via effectiveTankMask.
@@ -729,9 +734,9 @@ void editorSaveCb(lv_event_t *e) {
       days |= (uint8_t)(1u << i);
   }
   ev.days = days;
-  // v1.9.0 (A2): per-tank pulse overrides (0 = inherit the shared seconds).
+  // v1.10.0 (A2): per-tank portion overrides in grams (0 = inherit shared).
   for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
-    ev.secTank[i] = s_ed_sec_sb[i] ? (uint8_t)lv_spinbox_get_value(s_ed_sec_sb[i]) : 0;
+    ev.gramTank[i] = s_ed_sec_sb[i] ? (uint16_t)lv_spinbox_get_value(s_ed_sec_sb[i]) : 0;
   }
   // loop() performs the add: on success it rebuilds the list, closes the
   // editor and toasts; on failure the editor stays open with the reason.
@@ -743,12 +748,12 @@ void editorCancelCb(lv_event_t *e) {
   closeEditor();
 }
 
-void pulseSpinCb(lv_event_t *e) {
-  if (s_spin_prog) return; // programmatic ui_set_pulse() replay (see guard note)
+void portionSpinCb(lv_event_t *e) {
+  if (s_spin_prog) return; // programmatic ui_set_portion() replay (see guard)
   lv_obj_t *sb = (lv_obj_t *)lv_event_get_target(e);
   UiEvent ev;
-  ev.type = UI_EVT_SET_PULSE;
-  ev.a = (uint8_t)lv_spinbox_get_value(sb);
+  ev.type = UI_EVT_SET_PORTION;
+  ev.grams = (uint16_t)lv_spinbox_get_value(sb); // v1.10.0: grams
   uiEventSend(ev); // loop() persists (keeps flash writes out of the LVGL task)
 }
 
@@ -938,11 +943,97 @@ void spinPlusCb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 // Schedule list + editor
 // ---------------------------------------------------------------------------
-void rebuildScheduleList() {
+// v1.10.0 FIX (tank-count hang): ui_tanks_rebuild() / ui_schedule_refresh()
+// used to lv_obj_clean() the tank chips / tank rows / schedule list FROM THE
+// LOOP TASK (under the LVGL lock) — deleting the very button whose CLICKED
+// event the LVGL task was still dispatching (tankChipCb / trashCb /
+// enableSwitchCb). Resuming the dispatch on freed objects corrupts the heap
+// and hangs the device. All destructive rebuilds now run INSIDE the LVGL task
+// via lv_async_call, from a snapshot filled on the loop task, so the event
+// dispatch always completes first.
+struct SchedSnapEntry {
+  uint8_t hour = 0, minute = 0, enabled = false, tanks = 1, days = 0x7F;
+  uint16_t grams = CATFISH_DEFAULT_GRAMS;
+  uint16_t gramTank[4] = {0, 0, 0, 0};
+};
+
+struct TankRbReq {
+  bool pending = false;
+  uint8_t count = 1;
+  uint8_t selected = 0;
+  char names[CATFISH_MAX_TANKS][CATFISH_TANK_NAME_LEN] = {};
+  SchedSnapEntry sched[8]; // == feed_scheduler::MAX_FEED_TIMES
+  uint8_t schedN = 0;
+};
+static TankRbReq s_rb;
+
+void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n);
+
+static void fillSchedSnap() {
+  s_rb.schedN = 0;
+  const int n = feed_scheduler::getCount();
+  const FeedTime *all = feed_scheduler::getAll();
+  for (int i = 0; i < n && s_rb.schedN < 8; i++) {
+    SchedSnapEntry &d = s_rb.sched[s_rb.schedN++];
+    d.hour = all[i].hour;
+    d.minute = all[i].minute;
+    d.enabled = all[i].enabled;
+    d.tanks = all[i].tanks;
+    d.days = all[i].days;
+    d.grams = all[i].grams;
+    for (int k = 0; k < 4; k++) d.gramTank[k] = all[i].gramTank[k];
+  }
+}
+
+static void tanksRebuildExec(void *) {
+  // LVGL task context: safe to delete widgets — no indev dispatch in flight.
+  s_spin_prog = true; // covers the tank-count spinbox quiet-set
+  // apply the request snapshot to the live statics
+  s_tank_count = s_rb.count;
+  s_sel_tank = s_rb.selected;
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++)
+    strlcpy(s_tank_names[i], s_rb.names[i], sizeof(s_tank_names[i]));
+  if (s_tank_sb_count) spinSetValueQuiet(s_tank_sb_count, s_rb.count);
+  rebuildTankChips();
+  rebuildTankRows();
+  rebuildFoodRows();  // v1.10.0: FOOD card rows follow the tank count too
+  rebuildScheduleList(s_rb.sched, s_rb.schedN);
+  s_spin_prog = false;
+  s_rb.pending = false;
+}
+
+static void scheduleAsyncRebuild() {
+  if (s_rb.pending) return; // an async rebuild is already queued (coalesce)
+  s_rb.pending = true;
+  lv_async_call(tanksRebuildExec, nullptr);
+}
+
+/** Schedule-only refresh (loop context; caller holds the LVGL lock). */
+static void schedRefreshRequest() {
+  fillSchedSnap();
+  scheduleAsyncRebuild();
+}
+
+/** Full tanks+schedule rebuild request (loop context; caller holds the lock). */
+static void tanksRebuildRequest(uint8_t count, const String names[CATFISH_MAX_TANKS],
+                                uint8_t selected) {
+  if (count < 1) count = 1;
+  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
+  s_rb.count = count;
+  s_rb.selected = (selected == 0xFE || selected < count) ? selected : 0;
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    strlcpy(s_rb.names[i], names[i].c_str(), sizeof(s_rb.names[i]));
+    if (!s_rb.names[i][0])
+      snprintf(s_rb.names[i], sizeof(s_rb.names[i]), "Tank %u", (unsigned)(i + 1));
+  }
+  fillSchedSnap();
+  scheduleAsyncRebuild();
+}
+
+void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n) {
   if (!s_sched_list) return;
   lv_obj_clean(s_sched_list);
 
-  const int n = feed_scheduler::getCount();
   if (n == 0) {
     lv_obj_t *empty = lv_label_create(s_sched_list);
     lv_label_set_text(empty, "No feeding times yet. Tap ADD FEEDING TIME below.");
@@ -951,9 +1042,8 @@ void rebuildScheduleList() {
     return;
   }
 
-  const FeedTime *all = feed_scheduler::getAll();
-  for (int i = 0; i < n; i++) {
-    const FeedTime &en = all[i];
+  for (uint8_t i = 0; i < n; i++) {
+    const SchedSnapEntry &en = entries[i];
 
     lv_obj_t *card = lv_obj_create(s_sched_list);
     lv_obj_set_size(card, lv_pct(100), 76);
@@ -973,22 +1063,22 @@ void rebuildScheduleList() {
     char day[24];
     catfishFormatHm(hm, sizeof(hm), en.hour, en.minute, s_hour12);
     fmtDaysMask(en.days, day, sizeof(day));
-    // v1.9.0 (A2): per-tank overrides replace the plain tank tag when set.
+    // v1.10.0 (A2): per-tank GRAM overrides replace the plain tank tag when set.
     bool hasOverrides = false;
-    char secsTag[40] = {0};
+    char gTag[44] = {0};
     int sl = 0;
     for (uint8_t b = 0; b < s_tank_count && b < CATFISH_MAX_TANKS; b++) {
-      if (en.secTank[b]) {
+      if (en.gramTank[b]) {
         hasOverrides = true;
-        sl += snprintf(secsTag + sl, sizeof(secsTag) - sl, "%sT%u:%us",
+        sl += snprintf(gTag + sl, sizeof(gTag) - sl, "%sT%u:%ug",
                        sl ? "+" : "", (unsigned)(b + 1),
-                       (unsigned)en.secTank[b]);
+                       (unsigned)en.gramTank[b]);
       }
     }
     if (s_tank_count > 1) {
       if (hasOverrides) {
-        snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  %s  \xE2\x80\xA2  %s",
-                 hm, (unsigned)en.seconds, secsTag, day);
+        snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u g  \xE2\x80\xA2  %s  \xE2\x80\xA2  %s",
+                 hm, (unsigned)en.grams, gTag, day);
       } else {
         char tag[16] = {0};
         int tl = 0;
@@ -998,12 +1088,12 @@ void rebuildScheduleList() {
                            (unsigned)(b + 1));
           }
         }
-        snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  T%s  \xE2\x80\xA2  %s",
-                 hm, (unsigned)en.seconds, tag[0] ? tag : "1", day);
+        snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u g  \xE2\x80\xA2  T%s  \xE2\x80\xA2  %s",
+                 hm, (unsigned)en.grams, tag[0] ? tag : "1", day);
       }
     } else {
-      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u s  \xE2\x80\xA2  %s", hm,
-               (unsigned)en.seconds, day);
+      snprintf(buf, sizeof(buf), "%s  \xE2\x80\xA2  %u g  \xE2\x80\xA2  %s", hm,
+               (unsigned)en.grams, day);
     }
     lv_obj_t *tl = lv_label_create(card);
     lv_label_set_text(tl, buf);
@@ -1032,8 +1122,7 @@ void rebuildScheduleList() {
     lv_obj_set_size(sw, 72, 36);
     if (en.enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, enableSwitchCb, LV_EVENT_VALUE_CHANGED,
-                        (void *)(uintptr_t)((en.hour << 12) | (en.minute << 6) |
-                                            en.seconds));
+                        (void *)(uintptr_t)((en.hour << 8) | en.minute));
 
     lv_obj_t *trash = lv_btn_create(card);
     lv_obj_set_size(trash, 64, 64);
@@ -1048,8 +1137,7 @@ void rebuildScheduleList() {
     lv_obj_set_style_text_font(ti, &lv_font_montserrat_20, 0);
     lv_obj_center(ti);
     lv_obj_add_event_cb(trash, trashCb, LV_EVENT_CLICKED,
-                        (void *)(uintptr_t)((en.hour << 12) | (en.minute << 6) |
-                                            en.seconds));
+                        (void *)(uintptr_t)((en.hour << 8) | en.minute));
   }
 }
 
@@ -1057,14 +1145,13 @@ void openEditor() {
   if (!s_editor) return;
   lv_roller_set_selected(s_r_hour, 7, LV_ANIM_OFF);
   lv_roller_set_selected(s_r_min, 30, LV_ANIM_OFF);
-  spinSetValueQuiet(s_sb_sec, prefs::getDefaultPulse());
+  spinSetValueQuiet(s_sb_sec, prefs::getDefaultGrams()); // v1.10.0: grams
 
-  // v1.9.0 (A1): all day chips checked = daily (the default)
+  // v1.9.0 (A1): all day chips checked = daily (the default). CHECKABLE
+  // chips restyle themselves via the LV_STATE_CHECKED style selectors.
   for (int i = 0; i < 7; i++) {
     if (s_ed_day_btn[i]) {
       lv_obj_add_state(s_ed_day_btn[i], LV_STATE_CHECKED);
-      lv_obj_set_style_bg_color(s_ed_day_btn[i], lv_color_hex(C_AMBER), 0);
-      lv_obj_set_style_text_color(s_ed_day_btn[i], lv_color_hex(C_INK), 0);
     }
   }
   // v1.9.0 (A2): clear the per-tank pulse overrides
@@ -1293,7 +1380,9 @@ void buildSchedule() {
   lv_obj_set_style_border_width(add, 2, 0);
   lv_obj_add_event_cb(add, addBtnCb, LV_EVENT_CLICKED, nullptr);
 
-  rebuildScheduleList();
+  // init-time direct render (LVGL task, no indev traffic yet)
+  fillSchedSnap();
+  rebuildScheduleList(s_rb.sched, s_rb.schedN);
 
   // --- editor overlay (hidden) ---
   s_editor = lv_obj_create(s_scr[1]);
@@ -1355,12 +1444,12 @@ void buildSchedule() {
   lv_obj_set_flex_flow(col_s, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(col_s, 6, 0);
   lv_obj_t *ls = lv_label_create(col_s);
-  lv_label_set_text(ls, "SECONDS");
+  lv_label_set_text(ls, "GRAMS"); // v1.10.0: portions are grams now
   lv_obj_set_style_text_font(ls, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(ls, lv_color_hex(C_MUTED), 0);
-  s_sb_sec = makeSpinRow(col_s, 1, 30, prefs::getDefaultPulse(), nullptr);
+  s_sb_sec = makeSpinRow(col_s, 1, 500, prefs::getDefaultGrams(), nullptr);
 
-  // v1.9.0 (A3): portion presets S/M/L under the seconds spinbox
+  // v1.9.0 (A3): portion presets S/M/L under the grams spinbox
   lv_obj_t *preset_row = lv_obj_create(col_s);
   lv_obj_remove_style_all(preset_row);
   lv_obj_set_size(preset_row, LV_SIZE_CONTENT, 40);
@@ -1368,12 +1457,12 @@ void buildSchedule() {
   lv_obj_set_style_pad_column(preset_row, 6, 0);
   lv_obj_clear_flag(preset_row, LV_OBJ_FLAG_SCROLLABLE);
   static const char *PRESETS[3] = {"S", "M", "L"};
-  static const int32_t PRESET_S[3] = {2, 5, 10};
+  static const int32_t PRESET_G[3] = {5, 15, 30}; // v1.10.0: grams
   for (int i = 0; i < 3; i++) {
     lv_obj_t *p = makeBtn(preset_row, PRESETS[i], C_CARD, C_MUTED, C_CARD_HI,
                           44, 40);
     lv_obj_add_event_cb(p, presetCb, LV_EVENT_CLICKED,
-                        (void *)(intptr_t)PRESET_S[i]);
+                        (void *)(intptr_t)PRESET_G[i]);
   }
 
   // P5: tank checkboxes column (rebuilt for the current count at openEditor)
@@ -1405,10 +1494,18 @@ void buildSchedule() {
   lv_obj_clear_flag(s_ed_days_row, LV_OBJ_FLAG_SCROLLABLE);
   static const char *DAY_LETTERS[7] = {"M", "T", "W", "T", "F", "S", "S"};
   for (int i = 0; i < 7; i++) {
-    lv_obj_t *chip = makeBtn(s_ed_days_row, DAY_LETTERS[i], C_AMBER, C_INK,
+    lv_obj_t *chip = makeBtn(s_ed_days_row, DAY_LETTERS[i], C_CARD, C_MUTED,
                              C_CARD_HI, 72, 48);
+    // v1.10.0 FIX (weekly schedule): the day chips need LV_OBJ_FLAG_CHECKABLE
+    // for LVGL to toggle LV_STATE_CHECKED on tap. The old code relied on a
+    // click callback to restyle a state that never toggled, so every entry
+    // stayed "Daily" no matter what the user picked. Checked styling is now
+    // expressed as state styles (applied automatically on toggle).
+    lv_obj_add_flag(chip, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_set_style_bg_color(chip, lv_color_hex(C_AMBER), LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(chip, lv_color_hex(C_INK), LV_STATE_CHECKED);
     lv_obj_add_state(chip, LV_STATE_CHECKED); // daily by default
-    lv_obj_add_event_cb(chip, dayChipCb, LV_EVENT_CLICKED, nullptr);
+    // no click callback needed: CHECKABLE + state styles handle everything
     s_ed_day_btn[i] = chip;
   }
 
@@ -1421,7 +1518,7 @@ void buildSchedule() {
   lv_obj_set_style_pad_row(sec_wrap, 4, 0);
   lv_obj_clear_flag(sec_wrap, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t *lost = lv_label_create(sec_wrap);
-  lv_label_set_text(lost, "PER-TANK SECONDS (0 = same for all)");
+  lv_label_set_text(lost, "PER-TANK GRAMS (0 = same for all)"); // v1.10.0
   lv_obj_set_style_text_font(lost, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(lost, lv_color_hex(C_MUTED), 0);
   s_ed_secs_row = lv_obj_create(sec_wrap);
@@ -1445,7 +1542,7 @@ void buildSchedule() {
     lv_obj_set_style_text_color(lab, lv_color_hex(C_MUTED), 0);
     lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lab, 110);
-    lv_obj_t *sb = makeSpinbox(cell, 0, 30, 0, 110, 48);
+    lv_obj_t *sb = makeSpinbox(cell, 0, 500, 0, 110, 48); // v1.10.0: grams
     s_ed_sec_sb[i] = sb;
   }
 
@@ -1525,11 +1622,15 @@ void buildSettings() {
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(card_feed, 12, 0);
   lv_obj_t *lbl_p = lv_label_create(card_feed);
-  lv_label_set_text(lbl_p, "Default pulse seconds");
+  lv_label_set_text(lbl_p, "Default portion (grams)"); // v1.10.0: grams
   lv_obj_set_style_text_font(lbl_p, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(lbl_p, lv_color_hex(C_TEXT), 0);
   lv_obj_set_flex_grow(lbl_p, 1);
-  s_sb_pulse = makeSpinRow(card_feed, 1, 30, prefs::getDefaultPulse(), pulseSpinCb);
+  s_sb_pulse = makeSpinRow(card_feed, 1, 500, prefs::getDefaultGrams(),
+                           portionSpinCb);
+
+  // -- v1.10.0: on-display WiFi manager card (scan + connect from the panel)
+  buildWifiCard(list);
 
   // -- v1.9.0 (A5/F3): Feeding policy card (vacation + guards + catch-up)
   lv_obj_t *card_pol = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
@@ -2466,7 +2567,7 @@ void buildTankOverlay() {
     lv_obj_set_style_pad_row(col, 4, 0);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *t = lv_label_create(col);
-    lv_label_set_text(t, "FOOD RATE (G/S, 0 = OFF)");
+    lv_label_set_text(t, "FOOD RATE (G/S, 0 = NOMINAL)");
     lv_obj_set_style_text_font(t, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(t, lv_color_hex(C_MUTED), 0);
     s_tank_sb_gps = makeSpinRow(col, 0, 100, 0, nullptr);
@@ -2479,10 +2580,10 @@ void buildTankOverlay() {
     lv_obj_set_style_pad_row(col, 4, 0);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *t = lv_label_create(col);
-    lv_label_set_text(t, "HOPPER SIZE (SECONDS OF FEED)");
+    lv_label_set_text(t, "HOPPER SIZE (GRAMS)"); // v1.10.0: caps are grams
     lv_obj_set_style_text_font(t, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(t, lv_color_hex(C_MUTED), 0);
-    // 5-digit spinbox: up to 60000 s (~16 h of pulse) is far beyond any hopper
+    // 5-digit spinbox: up to 60000 g of feed capacity
     s_tank_sb_hcap = makeSpinRow(col, 0, 60000, 0, nullptr);
     lv_spinbox_set_digit_format(s_tank_sb_hcap, 5, 0);
   }
@@ -2950,17 +3051,17 @@ void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on) {
   applyBacklight();
 }
 
-void ui_request_feed(uint8_t seconds) {
-  if (seconds < 1 || seconds > CATFISH_PULSE_S_LIMIT) {
-    uint8_t d = prefs::getDefaultPulse();
-    seconds = (d >= 1 && d <= CATFISH_PULSE_S_LIMIT) ? d : CATFISH_DEFAULT_PULSE_S;
+void ui_request_feed(uint16_t grams) {
+  if (grams < 1 || grams > CATFISH_MAX_GRAMS) {
+    const uint16_t d = prefs::getDefaultGrams();
+    grams = (d >= 1 && d <= CATFISH_MAX_GRAMS) ? d : CATFISH_DEFAULT_GRAMS;
   }
   UiEvent ev;
   ev.type = UI_EVT_FEED;
-  ev.a = seconds;
-  ev.flag = true; // manual
+  ev.grams = grams; // v1.10.0: portion in grams
+  ev.flag = true;   // manual
   uiEventSend(ev);
-  Serial.printf("[UI] feed requested: %u s\n", (unsigned)seconds);
+  Serial.printf("[UI] feed requested: %u g\n", (unsigned)grams);
 }
 
 void ui_set_feed_busy(bool busy) {
@@ -2992,20 +3093,11 @@ void ui_set_scan_busy(bool busy) {
 
 void ui_tanks_rebuild(uint8_t count, const String names[CATFISH_MAX_TANKS],
                       uint8_t selected) {
-  if (count < 1) count = 1;
-  if (count > CATFISH_MAX_TANKS) count = CATFISH_MAX_TANKS;
-  s_tank_count = count;
-  s_sel_tank = (selected == 0xFE || selected < count) ? selected : 0;
-  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
-    strlcpy(s_tank_names[i], names[i].c_str(), sizeof(s_tank_names[i]));
-    if (!s_tank_names[i][0])
-      snprintf(s_tank_names[i], sizeof(s_tank_names[i]), "Tank %u",
-               (unsigned)(i + 1));
-  }
-  if (s_tank_sb_count) spinSetValueQuiet(s_tank_sb_count, s_tank_count);
-  rebuildTankChips();
-  rebuildTankRows();
-  rebuildScheduleList(); // entry labels carry tank tags when count > 1
+  // v1.10.0: the actual lv_obj_clean()/rebuild work is DEFERRED into the
+  // LVGL task (lv_async_call) so a rebuild triggered by a chip/row/trash tap
+  // never deletes the widget whose event is still being dispatched — that
+  // cross-task delete-while-dispatching is what hung the device.
+  tanksRebuildRequest(count, names, selected);
 }
 
 void ui_tanks_state(const bool online[CATFISH_MAX_TANKS],
@@ -3026,7 +3118,7 @@ void ui_tanks_state(const bool online[CATFISH_MAX_TANKS],
   (void)feeding; // chips stay name-only; feeding shows on the Home relay card
 }
 
-void ui_schedule_refresh() { rebuildScheduleList(); }
+void ui_schedule_refresh() { schedRefreshRequest(); }
 
 void ui_editor_close() { closeEditor(); }
 
@@ -3044,8 +3136,209 @@ void ui_set_mqtt_broker(const String &text) {
   if (s_mq_broker) lv_label_set_text(s_mq_broker, text.c_str());
 }
 
-void ui_set_pulse(uint8_t seconds) {
-  spinSetValueQuiet(s_sb_pulse, seconds);
+void ui_set_portion(uint16_t grams) { // v1.10.0 (was ui_set_pulse, seconds)
+  spinSetValueQuiet(s_sb_pulse, (int32_t)catfishClampGrams(grams));
+}
+
+// ---------------------------------------------------------------------------
+// v1.10.0: on-display WiFi manager (Settings > WIFI card + password overlay)
+// ---------------------------------------------------------------------------
+lv_obj_t *s_wifi_card_lbl = nullptr;  // scan status line
+lv_obj_t *s_wifi_scan_btn = nullptr;  // "Scan networks"
+lv_obj_t *s_wifi_list = nullptr;      // AP results container
+lv_obj_t *s_wifi_overlay = nullptr;   // password overlay (lv_layer_top)
+lv_obj_t *s_wifi_ta_pass = nullptr;
+lv_obj_t *s_wifi_kb = nullptr;
+lv_obj_t *s_wifi_ssid_lbl = nullptr;
+char s_wifi_pick_ssid[33] = {0};
+
+void wifiScanBtnCb(lv_event_t *e) {
+  (void)e;
+  UiEvent ev;
+  ev.type = UI_EVT_WIFI_SCAN;
+  uiEventSend(ev); // loop() calls net_wifi::requestScan()
+}
+
+void wifiPickCb(lv_event_t *e) {
+  const uintptr_t idx = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  lv_obj_t *btn = lv_obj_get_child(s_wifi_list, idx);
+  if (!btn) return;
+  lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+  if (!lbl) return;
+  // the row label is "<secure mark><ssid>   (<rssi>)" — recover the SSID the
+  // same way it was built (secure mark is the SETTINGS symbol, 2 glyphs)
+  const char *txt = lv_label_get_text(lbl);
+  const char *start = txt;
+  if (strncmp(start, LV_SYMBOL_SETTINGS, strlen(LV_SYMBOL_SETTINGS)) == 0)
+    start += strlen(LV_SYMBOL_SETTINGS);
+  strlcpy(s_wifi_pick_ssid, start, sizeof(s_wifi_pick_ssid));
+  char *cut = strrchr(s_wifi_pick_ssid, '(');
+  if (cut && cut > s_wifi_pick_ssid) {
+    cut--; // drop the space before the parenthesis too
+    while (cut > s_wifi_pick_ssid && *cut == ' ') cut--;
+    cut[1] = '\0';
+  }
+  // open the password overlay (keyboard appears on field focus)
+  if (!s_wifi_overlay) return;
+  lv_label_set_text_fmt(s_wifi_ssid_lbl, "Connect to: %s", s_wifi_pick_ssid);
+  lv_textarea_set_text(s_wifi_ta_pass, "");
+  lv_obj_add_flag(s_wifi_kb, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_wifi_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_wifi_overlay);
+}
+
+void wifiTaFocusCb(lv_event_t *e) {
+  kbShowFor(s_wifi_kb, (lv_obj_t *)lv_event_get_target(e));
+}
+
+void wifiConnectCb(lv_event_t *e) {
+  (void)e;
+  if (!s_wifi_pick_ssid[0]) return;
+  UiEvent ev;
+  ev.type = UI_EVT_WIFI_CONNECT;
+  strlcpy(ev.wifiSsid, s_wifi_pick_ssid, sizeof(ev.wifiSsid));
+  strlcpy(ev.wifiPass, lv_textarea_get_text(s_wifi_ta_pass),
+          sizeof(ev.wifiPass));
+  if (uiEventSend(ev)) {
+    lv_obj_add_flag(s_wifi_overlay, LV_OBJ_FLAG_HIDDEN);
+    kbHide(s_wifi_kb);
+  }
+}
+
+void wifiCancelCb(lv_event_t *e) {
+  (void)e;
+  lv_obj_add_flag(s_wifi_overlay, LV_OBJ_FLAG_HIDDEN);
+  kbHide(s_wifi_kb);
+}
+
+void buildWifiCard(lv_obj_t *parent) {
+  lv_obj_t *card = makeCard(parent, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 8, 0);
+  makeTitle(card, "WIFI");
+
+  s_wifi_card_lbl = lv_label_create(card);
+  lv_label_set_text(s_wifi_card_lbl, "Pick a network to connect.");
+  lv_obj_set_style_text_font(s_wifi_card_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_wifi_card_lbl, lv_color_hex(C_MUTED), 0);
+
+  s_wifi_scan_btn = makeBtn(card, LV_SYMBOL_WIFI "  Scan networks", C_CARD,
+                            C_AMBER, C_CARD_HI, lv_pct(100), 56);
+  lv_obj_set_style_border_color(s_wifi_scan_btn, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_border_width(s_wifi_scan_btn, 2, 0);
+  lv_obj_set_style_bg_color(s_wifi_scan_btn, lv_color_hex(C_CARD),
+                            LV_STATE_DISABLED);
+  lv_obj_set_style_text_color(s_wifi_scan_btn, lv_color_hex(C_MUTED),
+                              LV_STATE_DISABLED);
+  lv_obj_add_event_cb(s_wifi_scan_btn, wifiScanBtnCb, LV_EVENT_CLICKED, nullptr);
+
+  s_wifi_list = lv_obj_create(card);
+  lv_obj_remove_style_all(s_wifi_list);
+  lv_obj_set_width(s_wifi_list, lv_pct(100));
+  lv_obj_set_height(s_wifi_list, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(s_wifi_list, 6, 0);
+  lv_obj_clear_flag(s_wifi_list, LV_OBJ_FLAG_SCROLLABLE);
+
+  // password overlay on the top layer (same pattern as the token editor)
+  s_wifi_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_wifi_overlay);
+  lv_obj_set_size(s_wifi_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_wifi_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_wifi_overlay, LV_OPA_70, 0);
+  lv_obj_add_flag(s_wifi_overlay, LV_OBJ_FLAG_CLICKABLE); // swallow clicks
+  lv_obj_add_flag(s_wifi_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_wifi_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *ocard = makeCard(s_wifi_overlay, 720, 380);
+  lv_obj_align(ocard, LV_ALIGN_TOP_MID, 0, 48);
+  lv_obj_set_flex_flow(ocard, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(ocard, 10, 0);
+  lv_obj_add_flag(ocard, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(ocard);
+  lv_label_set_text(title, "WIFI PASSWORD");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  s_wifi_ssid_lbl = lv_label_create(ocard);
+  lv_label_set_text(s_wifi_ssid_lbl, "Connect to:");
+  lv_obj_set_style_text_font(s_wifi_ssid_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(s_wifi_ssid_lbl, lv_color_hex(C_TEXT), 0);
+
+  s_wifi_ta_pass = lv_textarea_create(ocard);
+  lv_textarea_set_one_line(s_wifi_ta_pass, true);
+  lv_textarea_set_max_length(s_wifi_ta_pass, 64);
+  lv_textarea_set_password_mode(s_wifi_ta_pass, true);
+  lv_textarea_set_placeholder_text(s_wifi_ta_pass, "wifi password");
+  lv_obj_set_width(s_wifi_ta_pass, lv_pct(100));
+  lv_obj_set_style_bg_color(s_wifi_ta_pass, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_wifi_ta_pass, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_color(s_wifi_ta_pass, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_style_text_font(s_wifi_ta_pass, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_border_color(s_wifi_ta_pass, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(s_wifi_ta_pass, 1, 0);
+  lv_obj_set_style_radius(s_wifi_ta_pass, 8, 0);
+  lv_obj_set_style_pad_all(s_wifi_ta_pass, 10, 0);
+  lv_obj_add_event_cb(s_wifi_ta_pass, wifiTaFocusCb, LV_EVENT_FOCUSED, nullptr);
+
+  lv_obj_t *btns = lv_obj_create(ocard);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *ok = makeBtn(btns, LV_SYMBOL_OK "  Connect", C_AMBER, C_INK,
+                         C_AMBER_HI, 120, 64);
+  lv_obj_set_flex_grow(ok, 1);
+  lv_obj_add_event_cb(ok, wifiConnectCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *cancel = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                             C_CARD_HI, 120, 64);
+  lv_obj_set_flex_grow(cancel, 1);
+  lv_obj_add_event_cb(cancel, wifiCancelCb, LV_EVENT_CLICKED, nullptr);
+
+  s_wifi_kb = lv_keyboard_create(s_wifi_overlay);
+  lv_obj_set_size(s_wifi_kb, lv_pct(100), 200);
+  lv_obj_align(s_wifi_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  kbStyle(s_wifi_kb);
+  lv_obj_add_event_cb(s_wifi_kb, kbReadyCb, LV_EVENT_READY, nullptr);
+  lv_obj_add_event_cb(s_wifi_kb, kbCancelCb, LV_EVENT_CANCEL, nullptr);
+  lv_keyboard_set_textarea(s_wifi_kb, nullptr);
+  lv_obj_add_flag(s_wifi_kb, LV_OBJ_FLAG_HIDDEN); // appears on field focus
+}
+
+void ui_wifi_scan_busy(bool busy) {
+  if (s_wifi_scan_btn) {
+    if (busy)
+      lv_obj_add_state(s_wifi_scan_btn, LV_STATE_DISABLED);
+    else
+      lv_obj_clear_state(s_wifi_scan_btn, LV_STATE_DISABLED);
+  }
+  if (s_wifi_card_lbl && busy)
+    lv_label_set_text(s_wifi_card_lbl, "Scanning...");
+}
+
+void ui_wifi_scan_list(uint8_t n, const String items[]) {
+  if (!s_wifi_list) return;
+  lv_obj_clean(s_wifi_list);
+  if (n == 0) {
+    if (s_wifi_card_lbl)
+      lv_label_set_text(s_wifi_card_lbl, "No networks found. Scan again?");
+    return;
+  }
+  if (s_wifi_card_lbl)
+    lv_label_set_text_fmt(s_wifi_card_lbl, "%u network(s) — tap one to connect",
+                          (unsigned)n);
+  for (uint8_t i = 0; i < n && i < 10; i++) {
+    lv_obj_t *row = makeBtn(s_wifi_list, items[i].c_str(), C_CARD, C_TEXT,
+                            C_CARD_HI, lv_pct(100), 52);
+    lv_obj_add_event_cb(row, wifiPickCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)i);
+  }
 }
 
 void ui_set_hour12(bool h12) {
@@ -3068,7 +3361,7 @@ void ui_set_hour12(bool h12) {
   s_clock_cache[0] = '\0';
   s_val_cache[0] = '\0';
   s_sub_cache[0] = '\0';
-  rebuildScheduleList(); // schedule card labels carry the format too
+  schedRefreshRequest(); // schedule card labels carry the format too
 }
 
 void ui_set_rtc(const String &text) {
@@ -3184,7 +3477,7 @@ void ui_set_history(const String &json) {
   for (JsonObject o : doc.as<JsonArray>()) {
     const uint32_t e = (uint32_t)(o["e"] | 0);
     const uint8_t m = (uint8_t)(o["m"] | 1);
-    const uint8_t s = (uint8_t)(o["s"] | 0);
+    const uint16_t g = (uint16_t)(o["g"] | 0); // v1.10.0: grams (legacy "s")
     const bool ok = ((o["ok"] | 0) != 0);
     const uint8_t f = (uint8_t)(o["f"] | 0);
     const time_t t = (time_t)e;
@@ -3213,11 +3506,11 @@ void ui_set_history(const String &json) {
     }
     char line[64];
     if (ok)
-      snprintf(line, sizeof(line), "%s  OK   T%s  %us%s\n", when,
-               tanks[0] ? tanks : "1", (unsigned)s, flag);
+      snprintf(line, sizeof(line), "%s  OK   T%s  %ug%s\n", when,
+               tanks[0] ? tanks : "1", (unsigned)g, flag);
     else
-      snprintf(line, sizeof(line), "%s  FAIL T%s  %us%s\n", when,
-               tanks[0] ? tanks : "1", (unsigned)s, flag);
+      snprintf(line, sizeof(line), "%s  FAIL T%s  %ug%s\n", when,
+               tanks[0] ? tanks : "1", (unsigned)g, flag);
     out += line;
     if (++n >= 24) break;
   }
