@@ -266,6 +266,36 @@ its very first run — both bugs are live on hardware, not emulator artifacts:
   assert the effects (NVS persist, scheduler state, WiFi-down abort). Runs in
   CI on every push/PR as the "QEMU smoke test" job.
 
+## Persistence & SD fixes (v1.8.4)
+
+Field-reported: WiFi/time/feed-records "not saved after every power-off", and
+"no sd card" in the Settings card. Two firmware root causes confirmed against
+the library sources, plus hardening for marginal SD setups:
+
+- **WiFi credentials lost on every power cycle** — `net_wifi.cpp` called
+  `WiFi.persistent(false)` *before* the first `WiFi.mode(WIFI_STA)`. On
+  arduino-esp32 the storage mode is decided exactly once, in
+  `wifiLowLevelInit()` (`esp_wifi_set_storage(WIFI_STORAGE_RAM)` under
+  `lowLevelInitDone`), so the whole session never wrote the STA config to
+  NVS. WiFiManager 2.0.17's own temporary `WiFi.persistent(true)` around its
+  `WiFi.begin()` could not undo that (the Arduino flag is not re-consulted),
+  so every boot opened the setup portal again. Fix: keep persistence on
+  (`WIFI_STORAGE_FLASH`); the driver writes NVS only when the config actually
+  changes — no meaningful flash wear.
+- **Time lost between sessions** was mostly a downstream effect: no saved
+  WiFi → no NTP → the PCF85063 was never refreshed. The write-once-after-NTP
+  trigger is now supplemented by an **hourly RTC rewrite** (drift correction;
+  also recovers a first write that lost an I2C transaction to a concurrent
+  touch poll). If the Settings card shows *battery dead/absent* after this
+  release, the CR927 cell itself needs replacing — that part is hardware.
+- **SD "no card" hardening**: the boot mount now retries at 20 → 10 → 4 MHz
+  (marginal cards / slot wiring), and while no card is mounted the firmware
+  **rechecks every 10 s** (one speed per pass, ≤ ~0.5 s loop cost) so a card
+  inserted after boot — or one that needed the slower clock — mounts without
+  a reboot; the Settings card label and a toast update on success. Cards
+  must be FAT-formatted (FAT32 for ≤ 32 GB); if an SDXC card still refuses,
+  re-format it FAT32 on a PC.
+
 ## OTA updates
 
 **Both units run ArduinoOTA**, so firmware updates need no cable once they are on the network:

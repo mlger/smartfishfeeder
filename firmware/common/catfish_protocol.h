@@ -17,7 +17,7 @@
 // strings from this). The #ifndef guard lets an external -DCATFISH_APP_VERSION
 // override it without redefinition warnings.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.8.3"
+#define CATFISH_APP_VERSION "1.8.4"
 #endif
 
 // ------------------------------------------------------------ protocol version

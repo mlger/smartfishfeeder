@@ -64,6 +64,7 @@ static uint32_t g_qemu_wifi_aborts = 0;
 static uint32_t s_t_1s = 0;
 static uint32_t s_t_30s = 0;
 static uint32_t s_t_60s = 0;
+static uint32_t s_t_sd_recheck = 0; // v1.8.4 SD hot-plug recheck cadence
 
 // Scheduled-feed retries: one delayed attempt per failed scheduled feed.
 // Two slots cover the (rare) case of two entries failing in the same ~30 s
@@ -406,6 +407,7 @@ static bool s_ota_ready = false;
 static bool s_rtc_present = false;
 static bool s_rtc_ntp_synced = false;
 static String s_rtc_status = "not present";
+static uint32_t s_rtc_last_write_ms = 0; // v1.8.4 hourly drift-correction rewrite
 
 // "Plausible" floor: 2025-01-01 UTC, matching feed_scheduler::timeValid().
 // An RTC older than this was never set (fresh board / battery just added) —
@@ -1238,10 +1240,14 @@ void loop() {
 
     // v1.6.0: once NTP has actually synced (not the RTC boot restore), write
     // the wall clock back into the PCF85063 so the CR927 cell stays current.
+    // v1.8.4: also re-write hourly — corrects chip drift, refreshes the cell
+    // backup on long uptimes, and recovers a first write that lost an I2C
+    // transaction to a concurrent touch poll.
     if (s_rtc_present && !s_rtc_ntp_synced &&
         sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
       if (pcf85063::writeUtc(time(nullptr))) {
         s_rtc_ntp_synced = true;
+        s_rtc_last_write_ms = now;
         if (s_rtc_status != "battery OK") {
           s_rtc_status = "battery OK";
           lvgl_port_lock(-1);
@@ -1249,6 +1255,13 @@ void loop() {
           lvgl_port_unlock();
         }
         Serial.println("[SYS] RTC updated from NTP");
+      }
+    } else if (s_rtc_present && s_rtc_ntp_synced && s_rtc_last_write_ms != 0 &&
+               time(nullptr) > CATFISH_RTC_MIN_EPOCH &&
+               (now - s_rtc_last_write_ms) >= 3600000UL) {
+      if (pcf85063::writeUtc(time(nullptr))) {
+        s_rtc_last_write_ms = now;
+        Serial.println("[SYS] RTC drift-correction rewrite");
       }
     }
 
@@ -1305,6 +1318,22 @@ void loop() {
     ui_set_wifi(net_wifi::wifi_is_connected(), net_wifi::wifi_ssid(),
                 net_wifi::wifi_ip(), net_wifi::wifi_rssi());
     lvgl_port_unlock();
+  }
+
+  // ---------------- 10 s block: SD hot-plug recheck (v1.8.4) ----------------
+  // While no card is mounted, retry one mount speed per pass — rescues cards
+  // inserted after boot and marginal cards that need a slower SPI clock. A
+  // cardless slot costs ≤ ~0.5 s per recheck (see sd_log::remount()).
+  if (sd_log::state() == sd_log::State::NoCard &&
+      (now - s_t_sd_recheck) >= 10000UL) {
+    s_t_sd_recheck = now;
+    if (sd_log::remount()) {
+      Serial.println("[SD] card mounted on recheck");
+      uiToast("SD card detected");
+      lvgl_port_lock(-1);
+      ui_set_sd(sd_log::summary());
+      lvgl_port_unlock();
+    }
   }
 
   // ---------------- 60 s block: probe every configured tank (via worker) ----
