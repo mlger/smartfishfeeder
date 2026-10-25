@@ -189,10 +189,10 @@ jobs:
           restore-keys: |
             pio-display-unit-qemu-${{ runner.os }}-
 
-      - name: Install QEMU runtime dependency
+      - name: Install QEMU runtime dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q libslirp0
+          sudo apt-get install -y -q libslirp0 libsdl2-2.0-0 libpixman-1-0
 
       - name: Download Espressif QEMU (pinned esp32s3-capable release)
         run: |
