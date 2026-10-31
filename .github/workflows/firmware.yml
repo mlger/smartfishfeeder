@@ -395,9 +395,14 @@ jobs:
               path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
           def fetch_releases():
-              """List releases; on a v* tag push the release job attaches assets
-              concurrently, so poll briefly until this tag's release is usable."""
-              deadline = time.monotonic() + 300 if REF_TYPE == "tag" else time.monotonic()
+              """List releases, waiting out concurrent publish races:
+              - v* tag push: the release job attaches assets in parallel, so
+                poll until this tag's release is usable (max 5 min).
+              - main push: the release-latest job delete/recreates the rolling
+                'latest' prerelease concurrently and it briefly disappears, so
+                poll until it is back (max 2 min), then ship what we have."""
+              wait_tag = REF_TYPE == "tag"
+              deadline = time.monotonic() + (300 if wait_tag else 120)
               while True:
                   try:
                       rels = gh_json(API)
@@ -407,15 +412,19 @@ jobs:
                           continue
                       print(f"::warning::GitHub release list unavailable ({exc})")
                       return None
-                  if REF_TYPE != "tag":
+                  def usable(rel):
+                      return (rel is not None
+                              and pick(rel.get("assets", []), "display") is not None
+                              and pick(rel.get("assets", []), "relay") is not None)
+                  tag_ok = True
+                  if wait_tag:
+                      tag_ok = usable(next((r for r in rels if r.get("tag_name") == REF_NAME), None))
+                  latest_ok = usable(next((r for r in rels if r.get("tag_name") == "latest"), None))
+                  if (tag_ok and latest_ok) or time.monotonic() >= deadline:
+                      if not latest_ok:
+                          print("::warning::rolling 'latest' release not usable yet; shipping without it")
                       return rels
-                  rel = next((r for r in rels if r.get("tag_name") == REF_NAME), None)
-                  if rel and pick(rel.get("assets", []), "display") and pick(rel.get("assets", []), "relay"):
-                      return rels
-                  if time.monotonic() >= deadline:
-                      print(f"::warning::release {REF_NAME} not usable yet; mirroring what exists")
-                      return rels
-                  time.sleep(20)
+                  time.sleep(15)
 
           releases = fetch_releases()
           entries = []
