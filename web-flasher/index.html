@@ -67,6 +67,68 @@
 
     .tagline { margin: 0 auto; max-width: 620px; color: var(--muted); }
 
+    /* ============ Version picker ============ */
+    .version-panel {
+      background: var(--pond-card);
+      border: 1px solid var(--pond-card-edge);
+      border-radius: 16px;
+      padding: 1.4rem;
+      margin-bottom: 1.75rem;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .version-panel h2 { margin: 0 0 0.4rem; font-size: 1.2rem; color: #f4f9f7; }
+
+    .vp-desc { margin: 0 0 0.9rem; color: var(--muted); font-size: 0.92rem; }
+
+    .vp-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .vp-row select {
+      flex: 0 1 260px;
+      min-height: 44px; /* touch-friendly */
+      background: var(--pond);
+      color: var(--text);
+      border: 1px solid var(--amber-dim);
+      border-radius: 10px;
+      padding: 0.45rem 0.75rem;
+      font-size: 0.95rem;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .vp-row select:focus-visible {
+      outline: 2px solid var(--amber);
+      outline-offset: 2px;
+    }
+
+    .vp-meta { color: var(--muted); font-size: 0.85rem; }
+
+    .vp-meta a { color: var(--amber); text-decoration: none; }
+    .vp-meta a:hover { text-decoration: underline; }
+
+    .vp-error {
+      margin: 0.75rem 0 0;
+      color: var(--danger);
+      font-size: 0.88rem;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -171,13 +233,35 @@
       <span class="bubble">Catfish Pond &middot; Firmware Installer</span>
       <h1>Catfish Feeder — Web Flasher</h1>
       <p class="tagline">
-        Install the latest Catfish Feeder firmware straight from your browser — no
-        toolchain, no drivers to hunt down, no command line. Everything is served
-        from this page.
+        Install any Catfish Feeder firmware release straight from your browser —
+        pick a version below, no toolchain, no drivers to hunt down, no command
+        line.
       </p>
     </header>
 
     <main>
+      <!-- ============ Version picker ============ -->
+      <section class="version-panel" aria-labelledby="fw-version-heading">
+        <h2 id="fw-version-heading">Firmware version</h2>
+        <p class="vp-desc">
+          Choose which build to install — every GitHub release is mirrored on
+          this page. Defaults to the newest stable release.
+        </p>
+        <div class="vp-row">
+          <label class="sr-only" for="fw-version-select">Firmware version</label>
+          <select id="fw-version-select" aria-label="Firmware version">
+            <option value="-1" selected>Loading release versions&hellip;</option>
+          </select>
+          <span id="fw-version-meta" class="vp-meta" role="status" aria-live="polite">
+            loading release list&hellip;
+          </span>
+        </div>
+        <p id="fw-version-error" class="vp-error" hidden>
+          Couldn&rsquo;t load the release list — the install buttons below will
+          flash the most recent <code>main</code> build instead.
+        </p>
+      </section>
+
       <div class="grid">
         <!-- ============ Display Unit ============ -->
         <section class="device">
@@ -187,16 +271,18 @@
             The 4.3&Prime; 800&times;480 touch panel: pond dashboard, feeding
             schedule, manual feed trigger.
           </p>
-          <esp-web-install-button manifest="manifest-display.json">
-            <button slot="activate">Install Display Unit firmware</button>
-            <span slot="unsupported">
-              Web Serial is not available in this browser. Use Chrome, Edge or
-              Opera on a desktop computer.
-            </span>
-            <span slot="not-allowed">
-              Flashing requires a secure context — open this page over HTTPS.
-            </span>
-          </esp-web-install-button>
+          <div id="install-display">
+            <esp-web-install-button manifest="manifest-display.json">
+              <button slot="activate">Install Display Unit firmware</button>
+              <span slot="unsupported">
+                Web Serial is not available in this browser. Use Chrome, Edge or
+                Opera on a desktop computer.
+              </span>
+              <span slot="not-allowed">
+                Flashing requires a secure context — open this page over HTTPS.
+              </span>
+            </esp-web-install-button>
+          </div>
           <p class="hint">
             <strong>Connect via USB</strong>, then click Install and pick the
             board&rsquo;s serial port when the browser asks. Works in
@@ -216,18 +302,20 @@
           <span class="chip">ESP8266 NodeMCU V3</span>
           <p>
             The feeder motor driver: receives feed commands from the Display
-            Unit over Wi&#8209;Fi and pulses the relay.
+            Unit over ESP&#8209;Now / Wi&#8209;Fi and pulses the relay.
           </p>
-          <esp-web-install-button manifest="manifest-relay.json">
-            <button slot="activate">Install Relay Unit firmware</button>
-            <span slot="unsupported">
-              Web Serial is not available in this browser. Use Chrome, Edge or
-              Opera on a desktop computer.
-            </span>
-            <span slot="not-allowed">
-              Flashing requires a secure context — open this page over HTTPS.
-            </span>
-          </esp-web-install-button>
+          <div id="install-relay">
+            <esp-web-install-button manifest="manifest-relay.json">
+              <button slot="activate">Install Relay Unit firmware</button>
+              <span slot="unsupported">
+                Web Serial is not available in this browser. Use Chrome, Edge or
+                Opera on a desktop computer.
+              </span>
+              <span slot="not-allowed">
+                Flashing requires a secure context — open this page over HTTPS.
+              </span>
+            </esp-web-install-button>
+          </div>
           <p class="hint">
             <strong>Connect via USB</strong> (micro&#8209;USB on the NodeMCU),
             then click Install. Works in <strong>Chrome, Edge or Opera</strong>
@@ -319,10 +407,106 @@
         </p>
         <p>
           Built with <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.
-          Firmware version in the manifests is set automatically by CI on every push to <code>main</code>.
+          The version picker above mirrors every GitHub release — CI refreshes it
+          on every push to <code>main</code> and on each new release.
         </p>
       </footer>
     </main>
   </div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      var select = document.getElementById('fw-version-select');
+      var meta = document.getElementById('fw-version-meta');
+      var err = document.getElementById('fw-version-error');
+      var versions = [];
+
+      function esc(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+      }
+
+      function fmtDate(iso) {
+        try {
+          return new Date(iso).toLocaleDateString(undefined, {
+            year: 'numeric', month: 'short', day: 'numeric'
+          });
+        } catch (e) { return ''; }
+      }
+
+      function releaseUrl(tag) {
+        return 'https://github.com/mlger/smartfishfeeder/releases/tag/'
+          + encodeURIComponent(tag);
+      }
+
+      function installButtonHtml(manifestPath, label) {
+        return '<esp-web-install-button manifest="' + esc(manifestPath) + '">'
+          + '<button slot="activate">' + esc(label) + '</button>'
+          + '<span slot="unsupported">Web Serial is not available in this browser. '
+          + 'Use Chrome, Edge or Opera on a desktop computer.</span>'
+          + '<span slot="not-allowed">Flashing requires a secure context — '
+          + 'open this page over HTTPS.</span>'
+          + '</esp-web-install-button>';
+      }
+
+      // Re-create the install buttons so ESP Web Tools reads the fresh manifest
+      // (swapping only the attribute is unreliable once the element is upgraded).
+      function applyVersion(idx) {
+        var v = versions[idx];
+        if (!v) return;
+        document.getElementById('install-display').innerHTML =
+          installButtonHtml(v.displayManifest, 'Install Display Unit firmware');
+        document.getElementById('install-relay').innerHTML =
+          installButtonHtml(v.relayManifest, 'Install Relay Unit firmware');
+
+        var bits = [];
+        if (v.publishedAt) bits.push('published ' + fmtDate(v.publishedAt));
+        bits.push(v.stable ? 'stable release' : 'rolling build');
+        meta.innerHTML = esc(bits.join(' · '))
+          + ' · <a href="' + esc(releaseUrl(v.tag)) + '" target="_blank" '
+          + 'rel="noopener noreferrer">release notes</a>';
+      }
+
+      fetch('versions.json', { cache: 'no-store' })
+        .then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function (data) {
+          versions = (data && data.versions) || [];
+          if (!versions.length) throw new Error('no versions indexed');
+          select.textContent = '';
+          versions.forEach(function (v, i) {
+            var opt = document.createElement('option');
+            opt.value = String(i);
+            opt.textContent = v.label || v.tag;
+            select.appendChild(opt);
+          });
+          var def = versions.findIndex(function (v) { return v.stable; });
+          if (def < 0) def = 0;
+          select.value = String(def);
+          applyVersion(def);
+        })
+        .catch(function () {
+          err.hidden = false;
+          select.textContent = '';
+          var opt = document.createElement('option');
+          opt.value = '-1';
+          opt.textContent = 'main build (dev)';
+          opt.selected = true;
+          select.disabled = true;
+          select.appendChild(opt);
+          meta.textContent = 'installing the most recent main build';
+        });
+
+      select.addEventListener('change', function () {
+        var idx = Number(select.value);
+        if (idx >= 0) applyVersion(idx);
+      });
+    })();
+  </script>
 </body>
 </html>

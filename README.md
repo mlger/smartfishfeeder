@@ -64,9 +64,10 @@ Full wiring and assembly instructions: [docs/hardware.md](docs/hardware.md).
 ### A. Flash from the browser (easiest)
 
 1. Open the web flasher: **https://mlger.github.io/smartfishfeeder/** in Chrome or Edge (Web Serial required).
-2. Connect the Display Unit with a USB-C data cable, click **Connect**, then **Install** — ESP Web Tools writes all four images (bootloader, partitions, boot_app0, firmware) at the correct offsets.
-3. Repeat with the Relay Unit over micro-USB (single `firmware.bin` at `0x0`).
-4. On first boot each unit opens a WiFiManager access point — join `CatfishFeeder-Setup` / `CatfishRelay-Setup` from your phone and pick your WiFi.
+2. Pick a **firmware version** from the dropdown (defaults to the newest stable release; older releases and the rolling `main` build are listed too).
+3. Connect the Display Unit with a USB-C data cable, click **Connect**, then **Install** — ESP Web Tools writes all four images (bootloader, partitions, boot_app0, firmware) at the correct offsets.
+4. Repeat with the Relay Unit over micro-USB (single `firmware.bin` at `0x0`).
+5. On first boot each unit opens a WiFiManager access point — join `CatfishFeeder-Setup` / `CatfishRelay-Setup` from your phone and pick your WiFi.
 
 ### B. Build and flash with PlatformIO
 
