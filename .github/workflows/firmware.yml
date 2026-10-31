@@ -5,7 +5,11 @@
 #   image (bootloader @0x0, partitions @0x8000, boot_app0 @0xe000, app @0x10000,
 #   DIO flash mode) used directly by the web flasher.
 # - Relay unit: espressif8266 produces a self-contained firmware.bin flashed at 0x0.
-# - Serves web-flasher/ + fresh firmware manifests on GitHub Pages (build_type=workflow)
+# - Serves web-flasher/ + firmware manifests on GitHub Pages (build_type=workflow).
+#   The flasher has a version picker: CI mirrors the web-flashable image of recent
+#   releases under fw/<tag>/ and writes versions.json + per-release manifests.
+#   Release downloads are NOT CORS-enabled, so binaries must live on the Pages
+#   origin for ESP Web Tools to fetch them.
 # - Attaches firmware binaries to GitHub releases on v* tags, and maintains a
 #   rolling "latest" prerelease on every main build (so firmware is always
 #   attached to a release without needing a tag)
@@ -231,7 +235,9 @@ jobs:
   deploy-pages:
     name: Deploy web flasher to GitHub Pages
     needs: [build-display-unit, build-relay-unit, qemu-smoke]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    # main pushes keep the rolling dev image fresh; v* tag pushes refresh the
+    # release mirror immediately after a release is published.
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -266,7 +272,7 @@ jobs:
           cp dist/display-unit/firmware.factory.bin site/fw/display-unit-merged.bin
           cp dist/relay-unit/relay-unit-firmware.bin site/fw/relay-unit-firmware.bin
 
-      - name: Generate firmware manifests (version = short commit SHA)
+      - name: Generate dev manifests (version = short commit SHA)
         run: |
           python3 - <<'PY'
           import json
@@ -315,6 +321,163 @@ jobs:
               f.write("\n")
 
           print("wrote manifests with version", version)
+          PY
+
+      # Mirror the web-flashable image of recent GitHub releases under
+      # site/fw/<tag>/ and index them in versions.json for the flasher's
+      # version picker. The site-local fw/ copy (dev manifests above) stays
+      # as a fallback when the release list is unavailable.
+      - name: Mirror release firmware for the version picker
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.request
+
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          TOKEN = os.environ.get("GH_TOKEN", "")
+          REF_NAME = os.environ.get("GITHUB_REF_NAME", "")
+          REF_TYPE = os.environ.get("GITHUB_REF_TYPE", "")
+          SITE = pathlib.Path("site")
+          MAX_STABLE = 10  # mirror cap — keeps the Pages artifact bounded
+          API = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
+
+          def gh_json(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "catfish-pages-mirror",
+              })
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          def download(url, dest):
+              # No auth header here: browser_download_url 302s to a signed
+              # release-assets URL and forwarding Authorization cross-host fails.
+              req = urllib.request.Request(url, headers={"User-Agent": "catfish-pages-mirror"})
+              with urllib.request.urlopen(req, timeout=600) as resp:
+                  data = resp.read()
+              dest.write_bytes(data)
+              return len(data)
+
+          def pick(assets, kind):
+              """Choose the web-flashable binary for one unit from a release."""
+              if kind == "display":
+                  prefixes = ("merged-firmware-", "catfish-display-unit-latest.")
+                  banned = ("-app-", "-bootloader-", "-partitions-")
+              else:
+                  prefixes = ("relay-unit-firmware-", "catfish-relay-unit-latest.")
+                  banned = ()
+              for prefix in prefixes:
+                  for asset in assets:
+                      name = asset["name"]
+                      if (name.startswith(prefix) and name.endswith(".bin")
+                              and not any(b in name for b in banned)):
+                          return asset
+              return None
+
+          def manifest(name, version, chip, part):
+              return {
+                  "name": name,
+                  "version": version,
+                  "new_install_prompt_erase": True,
+                  "builds": [{"chipFamily": chip, "parts": [{"path": part, "offset": 0}]}],
+              }
+
+          def write_json(path, payload):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+          def fetch_releases():
+              """List releases; on a v* tag push the release job attaches assets
+              concurrently, so poll briefly until this tag's release is usable."""
+              deadline = time.monotonic() + 300 if REF_TYPE == "tag" else time.monotonic()
+              while True:
+                  try:
+                      rels = gh_json(API)
+                  except Exception as exc:
+                      if time.monotonic() < deadline:
+                          time.sleep(20)
+                          continue
+                      print(f"::warning::GitHub release list unavailable ({exc})")
+                      return None
+                  if REF_TYPE != "tag":
+                      return rels
+                  rel = next((r for r in rels if r.get("tag_name") == REF_NAME), None)
+                  if rel and pick(rel.get("assets", []), "display") and pick(rel.get("assets", []), "relay"):
+                      return rels
+                  if time.monotonic() >= deadline:
+                      print(f"::warning::release {REF_NAME} not usable yet; mirroring what exists")
+                      return rels
+                  time.sleep(20)
+
+          releases = fetch_releases()
+          entries = []
+          skipped = []
+          stable_mirrored = 0
+          if releases:
+              for rel in releases:
+                  tag = rel.get("tag_name", "")
+                  if rel.get("draft") or not tag or not all(c.isalnum() or c in ".-_" for c in tag):
+                      skipped.append((tag or "?", "draft or unsafe tag name"))
+                      continue
+                  rolling = tag == "latest"
+                  if not rolling and stable_mirrored >= MAX_STABLE:
+                      continue
+                  disp = pick(rel.get("assets", []), "display")
+                  relay = pick(rel.get("assets", []), "relay")
+                  if disp is None or relay is None:
+                      skipped.append((tag, "missing web-flashable asset"))
+                      continue
+                  fwdir = SITE / "fw" / tag
+                  try:
+                      dsize = download(disp["browser_download_url"], fwdir / "display-unit-merged.bin")
+                      rsize = download(relay["browser_download_url"], fwdir / "relay-unit-firmware.bin")
+                  except Exception as exc:
+                      skipped.append((tag, f"download failed ({exc})"))
+                      continue
+                  write_json(SITE / f"manifest-display-{tag}.json",
+                             manifest(f"Catfish Feeder \u2014 Display Unit {tag}", tag,
+                                      "ESP32-S3", f"./fw/{tag}/display-unit-merged.bin"))
+                  write_json(SITE / f"manifest-relay-{tag}.json",
+                             manifest(f"Catfish Feeder \u2014 Relay Unit {tag}", tag,
+                                      "ESP8266", f"./fw/{tag}/relay-unit-firmware.bin"))
+                  entries.append({
+                      "tag": tag,
+                      "label": f"{tag} (rolling main build)" if rolling else tag,
+                      "stable": not rel.get("prerelease", False),
+                      "rolling": rolling,
+                      "publishedAt": rel.get("published_at", ""),
+                      "displayManifest": f"manifest-display-{tag}.json",
+                      "relayManifest": f"manifest-relay-{tag}.json",
+                  })
+                  if not rolling:
+                      stable_mirrored += 1
+                  print(f"mirrored {tag}: display {dsize} bytes, relay {rsize} bytes")
+
+          # Rolling latest goes last so the newest stable release is the default pick.
+          entries.sort(key=lambda e: e["rolling"])
+          write_json(SITE / "versions.json", {
+              "generatedAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "repo": REPO,
+              "versions": entries,
+          })
+          print(f"versions.json written with {len(entries)} selectable versions")
+          for tag, why in skipped:
+              print(f"  skipped {tag}: {why}")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary and entries:
+              rows = "\n".join(
+                  f"| `{e['tag']}` | {'stable' if e['stable'] else 'rolling'} |" for e in entries)
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n### Web flasher version picker\n\n| Tag | Channel |\n|---|---|\n"
+                           + rows + "\n")
           PY
 
       - name: Configure Pages

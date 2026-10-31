@@ -87,8 +87,19 @@ Settings live in `~/.claude-mem/settings.json` (user-local, never committed).
 ## CI / Pages / web flasher
 
 - `.github/workflows/firmware.yml` ("Firmware") builds both units, merges the
-  ESP32-S3 image, deploys `web-flasher/` to GitHub Pages on `main`, and
-  attaches bins to `v*` tag releases.
+  ESP32-S3 image, deploys `web-flasher/` to GitHub Pages on `main` **and on
+  `v*` tag pushes**, and attaches bins to `v*` tag releases.
+- **Web flasher version picker**: the Pages deploy mirrors each release's
+  flashable images under `fw/<tag>/` and writes `versions.json` plus
+  per-release manifests (`manifest-display-<tag>.json`,
+  `manifest-relay-<tag>.json`, version = the tag). The page's dropdown lists
+  every mirrored release, defaulting to the newest stable; the site-local
+  `fw/` copy (manifests with version = short SHA) remains as the fallback
+  "main build" when the release list can't be loaded. GitHub release assets
+  are served without CORS headers, so the binaries must be mirrored onto the
+  Pages origin for ESP Web Tools to fetch them. Up to 10 stable releases are
+  mirrored; on a tag push the mirror step polls briefly for the release that
+  the parallel `release` job is attaching.
 - Firmware releases, two channels:
   - **Tagged release** (stable): push a `v*` tag whose number equals
     `CATFISH_APP_VERSION` in `firmware/common/catfish_protocol.h` — e.g. after
