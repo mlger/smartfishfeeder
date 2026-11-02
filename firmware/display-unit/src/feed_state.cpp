@@ -27,6 +27,9 @@ struct RetrySlot {
   bool active = false;
   uint8_t hour = 0, minute = 0, tankMask = 0;
   uint16_t grams = 0; // v1.10.0: portion (g)
+  // v1.10.1: per-tank portion overrides pinned at arm time (0 = shared grams);
+  // persisted as the "gt" array so retries survive power cycles with them.
+  uint16_t gramTank[4] = {0, 0, 0, 0};
   uint8_t attempts = 0;
   uint32_t dueEpoch = 0; // 0 = in flight (a retry was handed out, not resolved)
 };
@@ -86,6 +89,8 @@ void persistRetry() {
     o["h"] = s_retry[i].hour;
     o["m"] = s_retry[i].minute;
     o["g"] = s_retry[i].grams;
+    JsonArray gt = o["gt"].to<JsonArray>(); // v1.10.1: per-tank gram overrides
+    for (int k = 0; k < 4; k++) gt.add(s_retry[i].gramTank[k]);
     o["t"] = s_retry[i].tankMask;
     o["a"] = s_retry[i].attempts;
     o["due"] = s_retry[i].dueEpoch;
@@ -196,6 +201,14 @@ void init() {
             s.grams = catfishSecondsToGrams((uint8_t)(o["s"] | 3),
                                             prefs::getTankGps(1));
           }
+          // v1.10.1: per-tank gram overrides ("gt", 4 entries); absent in
+          // pre-1.10.1 blobs -> zeros = shared grams (unchanged behaviour).
+          JsonArray gt = o["gt"].as<JsonArray>();
+          int k = 0;
+          for (JsonVariant gv : gt) {
+            if (k >= 4) break;
+            s.gramTank[k++] = (uint16_t)(gv | 0);
+          }
           s.tankMask = (uint8_t)(o["t"] | 1);
           s.attempts = (uint8_t)(o["a"] | 1);
           s.dueEpoch = (uint32_t)(o["due"] | 0);
@@ -262,7 +275,7 @@ void init() {
 
 // ------------------------------------------------------------ retry journal
 bool journalArm(uint8_t hour, uint8_t minute, uint16_t grams,
-                uint8_t tankMask) {
+                uint8_t tankMask, const uint16_t *gramTank) {
   const uint32_t now = (uint32_t)nowTime();
   RetrySlot *slot = nullptr;
   for (int i = 0; i < RETRY_SLOTS; i++) {
@@ -286,6 +299,8 @@ bool journalArm(uint8_t hour, uint8_t minute, uint16_t grams,
   slot->hour = hour;
   slot->minute = minute;
   slot->grams = grams;
+  for (int k = 0; k < 4; k++) // v1.10.1: pin per-tank portions (null = shared)
+    slot->gramTank[k] = (gramTank && gramTank[k]) ? gramTank[k] : 0;
   slot->tankMask = tankMask ? tankMask : 0x01;
   slot->attempts = slot->attempts ? slot->attempts : 1;
   const uint8_t bi = slot->attempts - 1;
@@ -311,6 +326,7 @@ bool journalDue(uint32_t nowEpoch, RetryDue &out) {
     out.minute = s.minute;
     out.grams = s.grams;
     out.tankMask = s.tankMask;
+    for (int k = 0; k < 4; k++) out.gramTank[k] = s.gramTank[k]; // v1.10.1
     s.dueEpoch = 0; // in flight until clear/fail resolves it
     persistRetry();
     Serial.printf("[FEED] retry due %02u:%02u (attempt %u)\n",

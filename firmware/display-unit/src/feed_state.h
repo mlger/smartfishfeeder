@@ -77,16 +77,23 @@ struct RetryDue {
   uint8_t minute = 0;
   uint16_t grams = 0; // v1.10.0: portion (g)
   uint8_t tankMask = 0;
+  // v1.10.1: per-tank portion override in grams (0 = shared @p grams), pinned
+  // at journalArm() so a retried partial feed re-feeds the failed tanks with
+  // the ORIGINALLY requested portions, not the shared entry grams.
+  uint16_t gramTank[4] = {0, 0, 0, 0};
 };
 
 /**
  * Arm (or refresh) the journal after a FAILED scheduled/catch-up attempt.
  * A fresh slot starts at attempts=1 with the first backoff (30 s); re-arming
  * an existing (h,m) slot advances the attempt counter — see journalFail().
+ * @param gramTank optional per-tank portion overrides (index t-1, 0 = shared
+ *                 grams); copied into the slot so retries re-feed the same
+ *                 portions (v1.10.1).
  * @return false when both slots are full AND no slot matches (h,m).
  */
 bool journalArm(uint8_t hour, uint8_t minute, uint16_t grams,
-                uint8_t tankMask);
+                uint8_t tankMask, const uint16_t *gramTank = nullptr);
 
 /**
  * @return true when a slot is due at @p nowEpoch (out filled; the slot goes

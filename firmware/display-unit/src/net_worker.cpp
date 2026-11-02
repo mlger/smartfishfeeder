@@ -50,6 +50,7 @@ void workerTask(void * /*param*/) {
       r.hour = cmd.hour;
       r.minute = cmd.minute;
       r.grams = cmd.grams;
+      for (int k = 0; k < 4; k++) r.gramTank[k] = cmd.gramTank[k]; // v1.10.1 echo
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
         if (!(mask & (1u << (t - 1)))) continue;
         // v1.10.0: per-tank wire pulse precomputed by main from the portion
@@ -164,7 +165,7 @@ bool begin() {
 
 bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
                  uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
-                 bool catchup) {
+                 bool catchup, const uint16_t *gramTank) {
   if (!s_cmdq) return false;
   Cmd c;
   c.type = Cmd::CMD_FEED;
@@ -177,6 +178,9 @@ bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
   c.tankMask = tankMask;
   if (secPerTank) {
     for (int i = 0; i < 4; i++) c.secPerTank[i] = secPerTank[i];
+  }
+  if (gramTank) {
+    for (int i = 0; i < 4; i++) c.gramTank[i] = gramTank[i]; // v1.10.1
   }
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }

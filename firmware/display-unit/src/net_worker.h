@@ -40,6 +40,10 @@ struct Cmd {
   // v1.10.0: per-tank wire pulse (seconds) precomputed by main from the
   // portion + the tank's calibrated g/s rate; index t-1, 0 = skip tank.
   uint8_t secPerTank[4] = {0, 0, 0, 0};
+  // v1.10.1: requested per-tank portion overrides (grams, index t-1, 0 =
+  // shared) — echoed into the Result so a failed attempt can re-arm the
+  // journal with the SAME portions it was asked to feed.
+  uint16_t gramTank[4] = {0, 0, 0, 0};
   bool report = false; // PROBE: toast the outcome
   bool verify = false; // v1.9.0 (B3): probe runs inside the pulse-verify window
   char token[CATFISH_TOKEN_LEN] = {0}; // TOKEN_ROTATE: new token for the relay
@@ -65,6 +69,8 @@ struct Result {
   uint8_t hour = 0;
   uint8_t minute = 0;
   uint16_t grams = 0;  // v1.10.0: requested portion (g) echo
+  // v1.10.1: requested per-tank portion overrides echo (0 = shared grams)
+  uint16_t gramTank[4] = {0, 0, 0, 0};
   uint8_t seconds = 0; // applied pulse seconds (relay may have clamped)
   bool clamped = false; // relay clamp note present
   char note[64] = {0}; // relay clamp note text ("")
@@ -102,11 +108,15 @@ bool begin();
  * @p grams requested portion in grams (echo/bookkeeping).
  * @p secPerTank per-tank wire pulse in seconds precomputed by main
  * (catfishGramsToSeconds), may be nullptr (then tank 1 gets 1 s minimum).
+ * @p gramTank requested per-tank portion overrides in grams (may be nullptr;
+ * echoed back on the Result so a failed attempt re-arms the journal with the
+ * SAME portions, v1.10.1).
  * @return false when the command queue is full.
  */
 bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
                  uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
-                 bool catchup = false);
+                 bool catchup = false,
+                 const uint16_t *gramTank = nullptr);
 
 /** Queue a per-tank relay probe (discover-if-needed + GET /status). */
 bool enqueueProbe(bool report, uint8_t tank1, bool verify = false);

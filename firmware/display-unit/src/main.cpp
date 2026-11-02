@@ -600,8 +600,8 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
     } else if (!retry) {
       // H2: a scheduled feed must survive a WiFi blip at fire time - arm a
       // delayed attempt in the PERSISTENT journal (v1.9.0) instead of
-      // silently dropping it.
-      if (feed_state::journalArm(hour, minute, grams, tankMask)) {
+      // silently dropping it. v1.10.1: per-tank gram overrides pinned too.
+      if (feed_state::journalArm(hour, minute, grams, tankMask, gramTank)) {
         uiToast("No WiFi - feed will retry");
       } else {
         uiToast(String("Feed FAILED: no WiFi"));
@@ -619,16 +619,17 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
     return;
   }
   if (!net_worker::enqueueFeed(grams, secPerTank, manual, hour, minute, retry,
-                               tankMask, src == feed_state::SRC_CATCHUP)) {
+                               tankMask, src == feed_state::SRC_CATCHUP,
+                               gramTank)) {
     // v1.8.2: a scheduled feed dropped because the worker queue was full gets
     // a journal slot instead of being lost with a misleading "try again" toast.
     if (!manual && !retry) {
-      feed_state::journalArm(hour, minute, grams, tankMask);
+      feed_state::journalArm(hour, minute, grams, tankMask, gramTank);
       uiToast("Feeder busy - feed will retry");
       Serial.println("[FEED] worker queue full, scheduled feed retry armed");
     } else if (!manual && retry) {
       // defer the in-flight retry by re-arming it (attempt count preserved)
-      feed_state::journalArm(hour, minute, grams, tankMask);
+      feed_state::journalArm(hour, minute, grams, tankMask, gramTank);
       uiToast("Feeder busy - retry deferred");
     } else {
       uiToast("Too busy, try again");
@@ -1156,7 +1157,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
         // tank 2 (P5 intent).
         if (!r.manual && !r.retry) {
           if (feed_state::journalArm(r.hour, r.minute, r.grams,
-                                     r.tanksFail)) {
+                                     r.tanksFail, r.gramTank)) {
             uiToast("Some tanks failed - retrying in 30 s");
             Serial.printf("[FEED] partial scheduled feed, retry armed (mask 0x%X)\n",
                           (unsigned)r.tanksFail);
@@ -1191,7 +1192,8 @@ static void handleWorkerResult(const net_worker::Result &r) {
         Serial.printf("[FEED] scheduled feed FAILED (%s) - %s\n", r.error,
                       more ? "another retry armed" : "journal gave up");
       } else if (feed_state::journalArm(r.hour, r.minute, r.grams,
-                                        r.tanksFail ? r.tanksFail : 0x01)) {
+                                        r.tanksFail ? r.tanksFail : 0x01,
+                                        r.gramTank)) {
         uiToast("Feed failed - retrying in 30 s");
         Serial.printf("[FEED] scheduled feed failed (%s), retry armed\n",
                       r.error);
@@ -1675,8 +1677,10 @@ void loop() {
       Serial.printf("[FEED] retrying scheduled feed %02u:%02u (%u g, tanks 0x%X)\n",
                     (unsigned)rd.hour, (unsigned)rd.minute,
                     (unsigned)rd.grams, (unsigned)rd.tankMask);
+      // v1.10.1: pass the pinned per-tank gram overrides so the retry feeds
+      // the SAME portions the original attempt was asked for.
       requestFeed(rd.grams, false, rd.hour, rd.minute, true, rd.tankMask,
-                  nullptr, feed_state::SRC_SCHED);
+                  rd.gramTank, feed_state::SRC_SCHED);
     }
 
     // v1.9.0 (B3): fire armed pulse-verify probes (mid-pulse)

@@ -263,6 +263,50 @@ void test_journal_legacy_s_blob_migrates_to_grams(void) {
   TEST_ASSERT_EQUAL_UINT16(30, out.grams);
 }
 
+// v1.10.1: per-tank gram overrides pinned at arm time are handed out on due
+// (a retried partial feed must re-feed the ORIGINAL portions, not shared).
+void test_journal_pins_per_tank_grams(void) {
+  const uint32_t t0 = anchorEpoch();
+  const uint16_t gt[4] = {10, 0, 25, 0}; // tank 2 skipped, tank 3 override
+  TEST_ASSERT_TRUE(feed_state::journalArm(7, 30, 5, 0x05, gt));
+
+  feed_state::RetryDue out;
+  TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 30, out));
+  TEST_ASSERT_EQUAL_UINT8(7, out.hour);
+  TEST_ASSERT_EQUAL_UINT8(30, out.minute);
+  TEST_ASSERT_EQUAL_UINT16(5, out.grams); // shared portion still carried
+  TEST_ASSERT_EQUAL_UINT8(0x05, out.tankMask);
+  TEST_ASSERT_EQUAL_UINT16(10, out.gramTank[0]);
+  TEST_ASSERT_EQUAL_UINT16(0, out.gramTank[1]);
+  TEST_ASSERT_EQUAL_UINT16(25, out.gramTank[2]);
+  TEST_ASSERT_EQUAL_UINT16(0, out.gramTank[3]);
+}
+
+// v1.10.1: arming WITHOUT overrides keeps zeros = shared grams (pre-1.10.1
+// behaviour unchanged), and the overrides survive a re-init ("gt" blob key).
+void test_journal_per_tank_grams_null_and_reinit(void) {
+  const uint32_t t0 = anchorEpoch();
+  TEST_ASSERT_TRUE(feed_state::journalArm(7, 30, 5, 0x01, nullptr));
+  feed_state::RetryDue out;
+  TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 30, out));
+  for (int i = 0; i < 4; i++) TEST_ASSERT_EQUAL_UINT16(0, out.gramTank[i]);
+  feed_state::journalClearFor(7, 30); // drop the shared-grams slot
+
+  // armed with overrides -> "power cycle" -> overrides reload from prefs
+  const uint16_t gt[4] = {0, 40, 0, 8};
+  TEST_ASSERT_TRUE(feed_state::journalArm(8, 15, 9, 0x0A, gt));
+  feed_state::init(); // re-init reloads the blobs the mock prefs now hold
+  TEST_ASSERT_EQUAL_INT(1, feed_state::journalCount());
+  TEST_ASSERT_TRUE(feed_state::journalDue(t0 + 30, out));
+  TEST_ASSERT_EQUAL_UINT8(8, out.hour);
+  TEST_ASSERT_EQUAL_UINT16(9, out.grams);
+  TEST_ASSERT_EQUAL_UINT8(0x0A, out.tankMask);
+  TEST_ASSERT_EQUAL_UINT16(0, out.gramTank[0]);
+  TEST_ASSERT_EQUAL_UINT16(40, out.gramTank[1]);
+  TEST_ASSERT_EQUAL_UINT16(0, out.gramTank[2]);
+  TEST_ASSERT_EQUAL_UINT16(8, out.gramTank[3]);
+}
+
 // ---------------------------------------------------------------------------
 // E4: skip-next
 // ---------------------------------------------------------------------------
@@ -589,6 +633,8 @@ int main(void) {
   RUN_TEST(test_journal_survives_reinit_from_prefs);
   RUN_TEST(test_journal_inflight_slot_becomes_due_after_reinit);
   RUN_TEST(test_journal_legacy_s_blob_migrates_to_grams);
+  RUN_TEST(test_journal_pins_per_tank_grams);
+  RUN_TEST(test_journal_per_tank_grams_null_and_reinit);
   RUN_TEST(test_skip_next_consumed_exactly_once);
   RUN_TEST(test_skip_next_other_identity_does_not_consume);
   RUN_TEST(test_scan_catchup_fires_within_window_once);
