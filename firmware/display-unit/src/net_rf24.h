@@ -12,6 +12,12 @@
  *   nRF24 CSN  -> GPIO44 (RS485 TXD terminal, freed for this)
  *   IRQ        -> not connected (polling task)
  *
+ * IMPORTANT: GPIO43/44 are the ESP32-S3's UART0 TXD/RXD defaults. The
+ * display-unit env therefore pins the serial console to the native USB CDC
+ * (-DARDUINO_USB_MODE=1 -DARDUINO_USB_CDC_ON_BOOT=1 in platformio.ini),
+ * freeing 43/44 for GPIO. If you build a custom env without those flags,
+ * Serial claims 43/44 and the radio (and logging) break — v1.10.1.
+ *
  * All radio transfers go through spi_bus_guard so the card and the radio
  * coexist on one controller. A 4 KB "rf-task" polls the radio every 50 ms
  * and pushes accepted node datagrams into the shared UiEvent queue.
