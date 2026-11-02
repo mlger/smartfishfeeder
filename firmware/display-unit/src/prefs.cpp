@@ -23,6 +23,11 @@ uint8_t s_pulse = CATFISH_DEFAULT_PULSE_S;
 uint32_t s_last_fed = 0;
 bool s_bl_on = true;
 bool s_hour12 = false;
+// v1.10.1: OTA password (generated on first boot) + explicit open opt-out.
+// loop()-context only (ensureOtaPassword/setup + the Settings switch event);
+// the LVGL task reads getOtaPwd() only while building the Settings screen.
+char s_ota_pwd[24] = {0};
+bool s_ota_open = false;
 
 // Multi-tank (Phase 5): 1-based tank ids, indexes below are tank-1.
 uint8_t s_tank_count = 1;
@@ -120,6 +125,11 @@ bool begin() {
   s_last_fed = s_nvs.getULong("lastFed", 0);
   s_bl_on = s_nvs.getBool("blOn", true);
   s_hour12 = s_nvs.getBool("fmt12", false);
+
+  // ---- OTA (v1.10.1) ----
+  s_ota_open = s_nvs.getBool("otaOpen", false);
+  v = s_nvs.getString("otaPwd", "");
+  strlcpy(s_ota_pwd, v.c_str(), sizeof(s_ota_pwd));
 
   s_mq_en = s_nvs.getBool("mqEn", false);
   v = s_nvs.getString("mqHost", "");
@@ -481,6 +491,22 @@ bool getHour12() { return s_hour12; }
 void setHour12(bool h12) {
   s_hour12 = h12;
   if (s_loaded && !s_nvs.putBool("fmt12", h12)) nvsLogFail("fmt12");
+}
+
+// ---------------------------------------------------------------- OTA (v1.10.1)
+String getOtaPwd() { return String(s_ota_pwd); }
+
+void setOtaPwd(const String &pwd) {
+  strlcpy(s_ota_pwd, pwd.c_str(), sizeof(s_ota_pwd));
+  if (s_loaded && s_nvs.putString("otaPwd", String(s_ota_pwd)) == 0)
+    nvsLogFail("otaPwd");
+}
+
+bool getOtaOpen() { return s_ota_open; }
+
+void setOtaOpen(bool open) {
+  s_ota_open = open;
+  if (s_loaded && !s_nvs.putBool("otaOpen", open)) nvsLogFail("otaOpen");
 }
 
 // ---------------------------------------------------------------- MQTT

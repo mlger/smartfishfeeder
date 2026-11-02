@@ -102,6 +102,14 @@ void setBacklightOn(bool on);
 bool getHour12();
 void setHour12(bool h12);
 
+// ---- Firmware OTA (v1.10.1) ----
+/** ArduinoOTA password (generated on first boot; shown in Settings > OTA UPDATE). */
+String getOtaPwd();
+void setOtaPwd(const String &pwd);
+/** Explicit opt-out: true = open OTA, no password. Default false. */
+bool getOtaOpen();
+void setOtaOpen(bool open);
+
 // ---- History ----
 /** Unix epoch (UTC) of last successful feed, 0 = never. */
 uint32_t getLastFedEpoch();

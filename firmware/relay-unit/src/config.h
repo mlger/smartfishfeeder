@@ -75,9 +75,11 @@
 #define DEFAULT_MAX_PULSE_S 30 // per-device soft cap (EEPROM-editable via /config)
 
 // ------------------------------------------------------------- OTA (ArduinoOTA)
-// Open OTA is a documented decision for this LAN-only appliance. To require a
-// password, add e.g.  -DOTA_PASSWORD=\"s3cret\"  to build_flags (or inject it
-// from CI). Empty string keeps the historical open behaviour.
+// v1.10.1: ArduinoOTA is PASSWORD-PROTECTED by default. A random password is
+// generated on first boot into a dedicated EEPROM record (OtaConfig in
+// main.cpp) and is read/set via the token-authenticated POST /config
+// ("otaPwd" / "otaOpen" keys). A build-time -DOTA_PASSWORD=\"s3cret\" wins
+// over the EEPROM record; "otaOpen":true is the explicit opt-out.
 #ifndef OTA_PASSWORD
 #define OTA_PASSWORD ""
 #endif
@@ -96,6 +98,9 @@
 // install keeps the original token/pulse blob byte-for-byte intact.
 #define MECH_EEPROM_OFFSET 64
 #define MECH_MAGIC         0x4D454348UL  // "MECH" in ASCII
+// v1.10.1: third ADDITIVE record — ArduinoOTA password (see main.cpp).
+#define OTA_EEPROM_OFFSET  128
+#define OTA_MAGIC          0x4F544131UL  // "OTA1" in ASCII
 
 // -------------------------------------------------------------- identity
 #define AP_NAME            "CatfishRelay-Setup" // WiFiManager fallback AP SSID

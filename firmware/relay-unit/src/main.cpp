@@ -42,8 +42,11 @@
  * NTP epoch once SNTP syncs, otherwise a millis()/1000 pseudo-epoch
  * (see ntpTimeSynced()/currentEpoch()); /status exposes "ntpSynced".
  *
- * OTA: ArduinoOTA is intentionally OPEN (no password) — this is a LAN-only
- * appliance; do not port-forward it. Documented decision (task 4-b).
+ * OTA: v1.10.1 — ArduinoOTA is PASSWORD-PROTECTED by default. A random
+ * password is generated on first boot into a dedicated additive EEPROM record
+ * and read/set via the token-authenticated POST /config ("otaPwd"/"otaOpen").
+ * "otaOpen":true is the explicit opt-out; a build-time -DOTA_PASSWORD wins.
+ * Still a LAN-only appliance — do not port-forward it.
  *
  * Token: DEFAULT_TOKEN "catfish" is the shipped product default (not a
  * secret); rotate on-site via POST /config. Never logged, never persisted
@@ -208,6 +211,70 @@ static void mechConfigLoad() {
   LOG("mech loaded: %s rest=%u feed=%u hz=%u dir=%u", catfishMechName(g_mech.mechanism),
       (unsigned)g_mech.servoRestDeg, (unsigned)g_mech.servoFeedDeg,
       (unsigned)g_mech.stepHz, (unsigned)g_mech.stepDir);
+}
+
+// ---------------------------------------------------------------------------
+// OTA password config — third, ADDITIVE EEPROM record (v1.10.1). ArduinoOTA
+// would otherwise ship wide-open; the relay has no screen to show a generated
+// secret, so the password lives here and is echoed by the token-gated
+// POST /config (same precedent as the pairing token echo). Factory reset
+// regenerates it. Upgrades keep the older records byte-for-byte intact.
+// ---------------------------------------------------------------------------
+struct __attribute__((packed)) OtaConfig {
+  uint32_t magic;    // OTA_MAGIC
+  char pwd[24];      // NUL-terminated ArduinoOTA password
+  uint8_t open;      // 1 = explicit opt-out: open OTA (no password)
+  uint32_t checksum; // FNV-1a over everything above this field
+};
+static_assert(sizeof(OtaConfig) == 33, "OtaConfig EEPROM layout changed");
+
+static OtaConfig g_ota;
+
+static uint32_t otaChecksum(const OtaConfig &o) {
+  return fnv1a(&o, offsetof(OtaConfig, checksum));
+}
+
+static void otaDefaults(OtaConfig &o) {
+  memset(&o, 0, sizeof(o));
+  o.magic = OTA_MAGIC;
+  // Unambiguous alphabet (no 0/O/1/I/l); 10 chars ~ 8e14 keyspace. The radio
+  // noise register (RANDOM_REG32) is the ESP8266's hardware RNG.
+  static const char ALPHA[] = "abcdefghjkmnpqrstuvwxyz23456789";
+  for (int i = 0; i < 10; i++) o.pwd[i] = ALPHA[RANDOM_REG32 % (sizeof(ALPHA) - 1)];
+  o.pwd[10] = '\0';
+  o.open = 0;
+  o.checksum = otaChecksum(o);
+}
+
+static void saveOtaConfig() {
+  g_ota.checksum = otaChecksum(g_ota);
+  EEPROM.put(OTA_EEPROM_OFFSET, g_ota);
+  EEPROM.commit();  // only rewrites flash when bytes actually changed
+}
+
+static void otaConfigLoad() {
+  OtaConfig o;
+  EEPROM.get(OTA_EEPROM_OFFSET, o);
+  if ((o.magic != OTA_MAGIC) || (o.checksum != otaChecksum(o))) {
+    LOG("ota EEPROM empty/invalid -> generating password");
+    otaDefaults(o);
+    g_ota = o;
+    saveOtaConfig();
+    return;
+  }
+  // Belt and braces: never trust flash-resident strings / ranges.
+  o.pwd[sizeof(o.pwd) - 1] = '\0';
+  if (o.open > 1) o.open = 0;
+  if (!o.open && o.pwd[0] == '\0') {
+    LOG("ota record has empty password -> regenerating");
+    otaDefaults(o);
+    g_ota = o;
+    saveOtaConfig();
+    return;
+  }
+  g_ota = o;
+  LOG("ota loaded: open=%u pwdLen=%u", (unsigned)g_ota.open,
+      (unsigned)strlen(g_ota.pwd));
 }
 
 /** STEP/DIR idle-low from the first microseconds (same discipline as RELAY_PIN). */
@@ -466,6 +533,8 @@ static void factoryResetTick() {
     saveConfig();
     mechDefaults(g_mech);  // P4: mechanism record resets too (servo re-parks below)
     saveMechConfig();
+    otaDefaults(g_ota);    // v1.10.1: OTA password regenerates on factory reset
+    saveOtaConfig();
     if (g_mech.mechanism == CATFISH_MECH_SERVO && !g_feeding) mechServoPark();
     g_ledMode = LED_MODE_FEED;  // fast blink as confirmation
     delay(1500);
@@ -701,6 +770,29 @@ static void handleConfig() {
     hasPulse = true;
   }
 
+  // v1.10.1: OTA password / open opt-out (validate first, like everything
+  // else; ArduinoOTA salts the password at begin() so a change needs a
+  // reboot to take effect — noted in the response log line).
+  bool hasOtaPwd = false;
+  char newOtaPwd[24] = {0};
+  if (doc["otaPwd"].is<const char*>()) {
+    const char* op = doc["otaPwd"].as<const char*>();
+    if (op != nullptr && op[0] != '\0') {
+      if (strlen(op) >= sizeof(newOtaPwd)) {
+        sendJsonError(400, "otaPwd_too_long");
+        return;
+      }
+      snprintf(newOtaPwd, sizeof(newOtaPwd), "%s", op);
+      hasOtaPwd = true;
+    }
+  }
+  bool hasOtaOpen = false;
+  bool newOtaOpen = false;
+  if (doc["otaOpen"].is<bool>()) {
+    newOtaOpen = doc["otaOpen"].as<bool>();
+    hasOtaOpen = true;
+  }
+
   // ---- all validation passed: apply ----
   if (newTok != nullptr) {
     snprintf(g_cfg.token, sizeof(g_cfg.token), "%s", newTok);
@@ -749,12 +841,27 @@ static void handleConfig() {
         (unsigned)g_mech.stepHz, (unsigned)g_mech.stepDir);
   }
 
+  // ---- v1.10.1: OTA keys (separate additive record) ----
+  bool otaChanged = false;
+  if (hasOtaPwd && strcmp(newOtaPwd, g_ota.pwd) != 0) {
+    snprintf(g_ota.pwd, sizeof(g_ota.pwd), "%s", newOtaPwd);
+    otaChanged = true;
+  }
+  if (hasOtaOpen && ((uint8_t)(newOtaOpen ? 1 : 0)) != g_ota.open) {
+    g_ota.open = newOtaOpen ? 1 : 0;
+    otaChanged = true;
+  }
+  if (otaChanged) {
+    saveOtaConfig();
+    LOG("ota config updated (applies after reboot)");
+  }
+
   if (changed) saveConfig();
 
   // Echo the effective config back to the authenticated caller (LAN convenience).
   JsonDocument echo;
   echo["ok"] = true;
-  echo["changed"] = (changed || mechChanged);
+  echo["changed"] = (changed || mechChanged || otaChanged);
   echo["token"] = g_cfg.token;
   echo["maxPulseS"] = (int)g_cfg.maxPulseS;
   echo["pulseS"] = (int)g_cfg.pulseS;
@@ -762,6 +869,8 @@ static void handleConfig() {
   echo["servoRestDeg"] = (int)g_mech.servoRestDeg;
   echo["servoFeedDeg"] = (int)g_mech.servoFeedDeg;
   echo["stepHz"] = (int)g_mech.stepHz;
+  echo["otaOpen"] = (g_ota.open != 0);
+  echo["otaPwd"] = g_ota.pwd;
   char buf[320];
   const size_t n = serializeJson(echo, buf, sizeof(buf));
   if (n == 0) {
@@ -810,6 +919,7 @@ void setup() {
 
   configLoad();
   mechConfigLoad();  // additive record at EEPROM offset 64 (P4)
+  otaConfigLoad();   // additive record at EEPROM offset 128 (v1.10.1)
   if (g_mech.mechanism == CATFISH_MECH_SERVO) {
     mechServoPark();  // servo starts parked at its rest angle
     LOG("servo parked at %u deg", (unsigned)g_mech.servoRestDeg);
@@ -856,10 +966,14 @@ void setup() {
 
   ArduinoOTA.setHostname(HOSTNAME);
   if (OTA_PASSWORD[0] != '\0') {
-    ArduinoOTA.setPassword(OTA_PASSWORD);
-    LOG("OTA ready (password protected)");
+    ArduinoOTA.setPassword(OTA_PASSWORD);  // build-time override wins
+    LOG("OTA ready (password protected via build flag)");
+  } else if (g_ota.open) {
+    LOG("OTA ready (OPEN - opted out via POST /config)");
   } else {
-    LOG("OTA ready (LAN, no password)");
+    ArduinoOTA.setPassword(g_ota.pwd);
+    LOG("OTA ready (password protected, %u chars - POST /config to read/set)",
+        (unsigned)strlen(g_ota.pwd));
   }
   ArduinoOTA.begin();
 

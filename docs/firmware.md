@@ -451,7 +451,12 @@ Prefer a browser? The **web dashboard** (http://catfishfeeder.local/) can also f
 
 Requirements: PC and unit on the same LAN, mDNS resolution working (`.local`), and the relay unit idle (the display unit can stay in normal operation).
 
-OTA is **open (no password) by default** — a documented decision for this LAN-only appliance. To require a password, add the credential at build time (per unit):
+OTA is **password-protected by default** (v1.10.1). A random 10-character password (unambiguous alphabet, no `0/O/1/I/l`) is generated on first boot, persisted, and shown on-device:
+
+- **Display unit**: Settings → *OTA UPDATE* shows the password; the *OTA open (no password)* switch is the explicit opt-out (takes effect after a reboot, like any OTA-password change — ArduinoOTA salts the password at `begin()`).
+- **Relay unit** (no screen): the password is echoed by the token-authenticated `POST /config` (`otaPwd` field); set your own with `{"token":"...","otaPwd":"..."}` or opt out with `{"token":"...","otaOpen":true}`. The password lives in a dedicated additive EEPROM record and regenerates on factory reset.
+
+A build-time `-DOTA_PASSWORD` still wins over the generated password on both units (handy for scripted provisioning):
 
 ```sh
 pio run -d firmware/relay-unit -t upload --upload-port catfish-relay.local \
@@ -460,7 +465,7 @@ pio run -d firmware/display-unit -t upload --upload-port catfishfeeder.local \
     --build-flag '-DOTA_PASSWORD="s3cret"'
 ```
 
-(or add `-DOTA_PASSWORD=\"s3cret\"` to `build_flags` in the unit's `platformio.ini` — both `main.cpp` files fall back to an empty password when the flag is absent).
+Then upload with the matching password — PlatformIO prompts (or use `--upload-port` + `upload_flags = -p`, the IDE asks once per session).
 
 ## Partitions & PSRAM notes
 

@@ -11,7 +11,7 @@ Design goals: LAN-only, zero cloud dependencies, minimal auth. For the wiring an
 | mDNS hostname | `catfish-relay.local` (HTTP port 80) |
 | UDP discovery port | `5050` |
 | Feed token | sent **inside the JSON body** (or `?token=` on the GET variant), default **`catfish`** |
-| OTA service | ArduinoOTA (upload via PlatformIO, see [firmware.md](firmware.md)); password optional via build flag |
+| OTA service | ArduinoOTA (upload via PlatformIO, see [firmware.md](firmware.md)); password-protected by default (v1.10.1, generated per device — see firmware.md § OTA updates) |
 
 Requests that change state (`POST /feed`, `POST /config`) require the token. Read-only endpoints (`GET /status`, `GET /health`) do not.
 
@@ -149,11 +149,13 @@ Changes device configuration. Requires the **current** token for auth; an option
 | `servoFeedDeg` | integer | no | Servo feed angle, clamped to 0-180 |
 | `stepHz` | integer | no | Stepper step rate, clamped to 1-1000 steps/s |
 | `stepDir` | integer | no | Stepper DIR level during feed, 0 or 1 |
+| `otaPwd` | string | no | New ArduinoOTA password (non-empty, shorter than 24 chars, v1.10.1+). Persists in a dedicated EEPROM record; takes effect after a reboot |
+| `otaOpen` | boolean | no | `true` = explicit opt-out: open OTA with no password (v1.10.1+). Takes effect after a reboot |
 
 | Status | Meaning |
 |--------|---------|
-| 200 | Config updated — response echoes the applied config (including the mechanism block) |
-| 400 | Malformed JSON, out-of-range values, unknown `mechanism`, or token too long |
+| 200 | Config updated — response echoes the applied config (including the mechanism block and the OTA password state) |
+| 400 | Malformed JSON, out-of-range values, unknown `mechanism`, or token/`otaPwd` too long |
 | 403 | Wrong current token |
 
 ```sh

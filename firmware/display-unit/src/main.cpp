@@ -44,14 +44,17 @@
 #include <catfish_mech.h>
 #include <catfish_time.h>
 #include <esp_sntp.h>
+#include <esp_random.h>
 
 using namespace esp_panel::board;
 using namespace ui; // UI entry points (ui_init/ui_tick/ui_set_*/UiEvent)
 
 // ------------------------------------------------------------------ OTA
-// ArduinoOTA is open by default on this LAN-only appliance (same decision as
-// the relay unit). To require a password, add -DOTA_PASSWORD=\"s3cret\" to
-// build_flags (or inject it from CI). Empty string keeps the open behaviour.
+// v1.10.1: ArduinoOTA is PASSWORD-PROTECTED by default. A random password is
+// generated on first boot, persisted in NVS and shown on the Settings >
+// OTA UPDATE card; the explicit opt-out is that card's "Open" switch.
+// A build-time -DOTA_PASSWORD=\"s3cret\" (or CI injection) still wins over
+// the generated password for scripted provisioning.
 #ifndef OTA_PASSWORD
 #define OTA_PASSWORD ""
 #endif
@@ -464,6 +467,37 @@ static void webPublishSnapshot() {
 static bool s_ota_ready = false;
 
 // ---------------------------------------------------------------------------
+// v1.10.1: OTA password lifecycle. Generated once on first boot, persisted via
+// prefs and shown on the Settings > OTA UPDATE card. Kept in a static buffer
+// because ArduinoOTA stores the pointer it is handed. ArduinoOTA salts the
+// password inside begin(), so a Settings "Open" toggle takes effect on the
+// NEXT boot (the toast says so).
+// ---------------------------------------------------------------------------
+static char s_ota_pwd[24] = {0};
+
+static void otaGeneratePassword(char *buf, size_t cap) {
+  // Unambiguous alphabet (no 0/O/1/I/l); 10 chars ~ 8e14 keyspace.
+  static const char ALPHABET[] = "abcdefghjkmnpqrstuvwxyz23456789";
+  const size_t n = (cap > 11) ? 10 : (cap - 1);
+  for (size_t i = 0; i < n; i++)
+    buf[i] = ALPHABET[esp_random() % (sizeof(ALPHABET) - 1)];
+  buf[n] = '\0';
+}
+
+/** Generate + persist the OTA password on first boot; load it otherwise. */
+static void ensureOtaPassword() {
+  if (prefs::getOtaOpen()) return; // explicit opt-out: OTA stays open
+  const String stored = prefs::getOtaPwd();
+  if (stored.length()) {
+    strlcpy(s_ota_pwd, stored.c_str(), sizeof(s_ota_pwd));
+    return;
+  }
+  otaGeneratePassword(s_ota_pwd, sizeof(s_ota_pwd));
+  prefs::setOtaPwd(String(s_ota_pwd));
+  Serial.println("[SYS] OTA password generated (see Settings > OTA UPDATE)");
+}
+
+// ---------------------------------------------------------------------------
 // Battery-backed RTC (v1.6.0): the PCF85063 + CR927 cell keeps wall time while
 // main power is off. Boot: if the chip holds a plausible time, restore it via
 // settimeofday() so schedules/last-fed are correct immediately (even offline).
@@ -550,10 +584,17 @@ static void beginOtaOnce() {
   });
 
   if (OTA_PASSWORD[0] != '\0') {
+    // Build-time override wins (scripted provisioning / CI).
     ArduinoOTA.setPassword(OTA_PASSWORD);
-    Serial.println("[SYS] OTA ready: catfishfeeder.local:3232 (password protected)");
+    Serial.println(
+        "[SYS] OTA ready: catfishfeeder.local:3232 (password protected, build flag)");
+  } else if (prefs::getOtaOpen()) {
+    Serial.println(
+        "[SYS] OTA ready: catfishfeeder.local:3232 (OPEN - opted out in Settings)");
   } else {
-    Serial.println("[SYS] OTA ready: catfishfeeder.local:3232 (LAN, no password)");
+    ArduinoOTA.setPassword(s_ota_pwd);
+    Serial.println(
+        "[SYS] OTA ready: catfishfeeder.local:3232 (password protected, see Settings > OTA UPDATE)");
   }
   ArduinoOTA.begin();
   s_ota_ready = true;
@@ -843,6 +884,17 @@ static void handleUiEvent(const UiEvent &ev) {
       prefs::setBacklightOn(ev.flag);
       Serial.printf("[SYS] backlight preference saved: %s\n",
                     ev.flag ? "on" : "off");
+      break;
+
+    case UI_EVT_OTA_OPEN:
+      // v1.10.1: explicit open-OTA opt-out (Settings > OTA UPDATE).
+      // ArduinoOTA salts the password inside begin(), so this takes effect
+      // on the next boot - the toast says so.
+      prefs::setOtaOpen(ev.flag);
+      Serial.printf("[SYS] OTA open mode %s (applies after reboot)\n",
+                    ev.flag ? "ON" : "OFF");
+      uiToast(ev.flag ? "OTA open - applies after reboot"
+                      : "OTA protected - applies after reboot");
       break;
 
     case UI_EVT_SET_FMT12: {
@@ -1427,6 +1479,7 @@ void setup() {
 
   // --- persistence ---
   prefs::begin();
+  ensureOtaPassword(); // v1.10.1: generate/load the OTA password (NVS-backed)
   feed_scheduler::init();
   feed_state::init(); // v1.9.0: journal / fired-map / counters / hopper
   relay_client::init();

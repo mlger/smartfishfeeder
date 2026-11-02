@@ -201,6 +201,7 @@ lv_obj_t *s_hist_lbl = nullptr;
 
 // Settings: policy card (F3) + food card (D1)
 lv_obj_t *s_sw_vacation = nullptr;
+lv_obj_t *s_sw_ota_open = nullptr; // v1.10.1: Settings OTA open switch
 lv_obj_t *s_sb_gap = nullptr;
 lv_obj_t *s_sb_max = nullptr;
 lv_obj_t *s_sb_ctch = nullptr;
@@ -310,6 +311,7 @@ void rebuildTankChips();
 void rebuildTankRows();
 // v1.9.0
 void vacationSwitchCb(lv_event_t *e);
+void otaOpenSwitchCb(lv_event_t *e); // v1.10.1: Settings OTA open switch
 void skipOnceCb(lv_event_t *e);
 void refillCb(lv_event_t *e);
 void policySaveCb(lv_event_t *e);
@@ -663,6 +665,16 @@ void vacationSwitchCb(lv_event_t *e) {
   ev.flag = on;
   uiEventSend(ev);
   Serial.printf("[UI] vacation -> %s (queued)\n", on ? "ON" : "OFF");
+}
+
+void otaOpenSwitchCb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  UiEvent ev;
+  ev.type = UI_EVT_OTA_OPEN;
+  ev.flag = on;
+  uiEventSend(ev);
+  Serial.printf("[UI] OTA open -> %s (queued)\n", on ? "ON" : "OFF");
 }
 
 void skipOnceCb(lv_event_t *e) {
@@ -1780,6 +1792,49 @@ void buildSettings() {
     lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
   }
+
+  // -- v1.10.1: OTA update card (password-protected by default)
+  lv_obj_t *card_ota = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(card_ota, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card_ota, 8, 0);
+  makeTitle(card_ota, "OTA UPDATE");
+  lv_obj_t *ota_pwd_lbl = lv_label_create(card_ota);
+  {
+    const String pwd = prefs::getOtaPwd();
+    lv_label_set_text_fmt(ota_pwd_lbl, "OTA password:  %s",
+                          (prefs::getOtaOpen() || !pwd.length()) ? "(none)"
+                                                                  : pwd.c_str());
+  }
+  lv_obj_set_style_text_font(ota_pwd_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ota_pwd_lbl, lv_color_hex(C_TEXT), 0);
+
+  lv_obj_t *row_ota = lv_obj_create(card_ota);
+  lv_obj_remove_style_all(row_ota);
+  lv_obj_set_width(row_ota, lv_pct(100));
+  lv_obj_set_height(row_ota, 44);
+  lv_obj_set_flex_flow(row_ota, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row_ota, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row_ota, 12, 0);
+  lv_obj_clear_flag(row_ota, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t *lbl_ota = lv_label_create(row_ota);
+  lv_label_set_text(lbl_ota, "OTA open (no password)");
+  lv_obj_set_style_text_font(lbl_ota, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(lbl_ota, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_flex_grow(lbl_ota, 1);
+  s_sw_ota_open = lv_switch_create(row_ota);
+  lv_obj_set_size(s_sw_ota_open, 72, 36);
+  if (prefs::getOtaOpen()) lv_obj_add_state(s_sw_ota_open, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(s_sw_ota_open, otaOpenSwitchCb, LV_EVENT_VALUE_CHANGED,
+                      nullptr);
+
+  lv_obj_t *hint_ota = lv_label_create(card_ota);
+  lv_label_set_text(
+      hint_ota,
+      "Password protects firmware uploads (Arduino IDE / ota). \"Open\" "
+      "disables it - applies after a reboot.");
+  lv_obj_set_style_text_font(hint_ota, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(hint_ota, lv_color_hex(C_MUTED), 0);
 
   // -- Relay card
   lv_obj_t *card_relay = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);

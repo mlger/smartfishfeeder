@@ -54,6 +54,7 @@ enum UiEventType : uint8_t {
   UI_EVT_GUARD_CFG,     // v1.9.0 (F3): policy saved (a=gap min, b=max/day, c=catchup min, d=low %)
   UI_EVT_WIFI_SCAN,     // v1.10.0: WiFi manager scan requested
   UI_EVT_WIFI_CONNECT,  // v1.10.0: connect to wifiSsid with wifiPass
+  UI_EVT_OTA_OPEN,      // v1.10.1: Settings OTA "open" switch (flag=open)
 };
 
 struct UiEvent {
