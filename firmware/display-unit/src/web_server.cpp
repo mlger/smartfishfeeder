@@ -249,16 +249,49 @@ void updUploadCb() {
       Serial.printf("[WEB] OTA begin failed: %s\n", Update.errorString());
       s_updating = false;
     }
+    // v1.11.0: show the on-panel progress overlay immediately
+    UiEvent ev;
+    ev.type = UI_EVT_OTA_PROGRESS;
+    ev.a = 0;
+    ev.bytes = 0;
+    ui::ui_event_send(ev);
   } else if (up.status == UPLOAD_FILE_WRITE && s_updating) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
       Serial.printf("[WEB] OTA write failed: %s\n", Update.errorString());
       Update.abort();
       s_updating = false;
+      return;
+    }
+    // v1.11.0: live progress on the panel. Throttled (>=200 ms AND a new
+    // percent) — the UI event queue is only 8 slots deep and the same queue
+    // carries feed commands. totalSize can be 0 for chunked uploads; the UI
+    // then shows the byte count instead of a percentage.
+    static uint32_t s_last_ms = 0;
+    static uint8_t s_last_pct = 0xFF;
+    const uint8_t pct =
+        up.totalSize ? (uint8_t)((uint64_t)up.currentSize * 100ULL /
+                                 (uint64_t)up.totalSize)
+                     : 0;
+    if (pct != s_last_pct && (millis() - s_last_ms) > 200) {
+      s_last_pct = pct;
+      s_last_ms = millis();
+      UiEvent ev;
+      ev.type = UI_EVT_OTA_PROGRESS;
+      ev.a = pct;
+      ev.bytes = (uint32_t)up.currentSize;
+      ui::ui_event_send(ev);
     }
   } else if (up.status == UPLOAD_FILE_END && s_updating) {
     if (!Update.end(true)) {
       Serial.printf("[WEB] OTA end failed: %s\n", Update.errorString());
       s_updating = false;
+    } else {
+      // v1.11.0: full bar + "rebooting" (handleUpdatePost restarts next)
+      UiEvent ev;
+      ev.type = UI_EVT_OTA_PROGRESS;
+      ev.a = 100;
+      ev.bytes = (uint32_t)up.totalSize;
+      ui::ui_event_send(ev);
     }
   } else if (up.status == UPLOAD_FILE_ABORTED && s_updating) {
     // v1.8.2: client vanished mid-upload — close the Update session so the
@@ -266,6 +299,12 @@ void updUploadCb() {
     Serial.println("[WEB] OTA upload aborted by client");
     Update.abort();
     s_updating = false;
+    // v1.11.0: hide the panel overlay again
+    UiEvent ev;
+    ev.type = UI_EVT_OTA_PROGRESS;
+    ev.a = 0;
+    ev.flag = true; // abort marker
+    ui::ui_event_send(ev);
   }
 }
 

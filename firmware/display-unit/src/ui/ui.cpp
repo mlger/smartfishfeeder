@@ -22,6 +22,7 @@
 #include <catfish_mech.h>
 #include <catfish_time.h>
 #include "../feed_scheduler.h"
+#include "../feed_state.h"
 #include "../prefs.h"
 
 // ---------------------------------------------------------------------------
@@ -145,6 +146,10 @@ uint8_t s_tank_edit_id = 1; // tank being edited (1-based)
 lv_obj_t *s_toast_box = nullptr;
 lv_obj_t *s_toast_lbl = nullptr;
 lv_timer_t *s_toast_tmr = nullptr;
+// v1.11.0: optional UNDO action button + the payload it re-enqueues
+lv_obj_t *s_toast_btn = nullptr;
+bool s_toast_undo = false;
+UiEvent s_toast_ev = {};
 
 // State
 void (*s_bl_cb)(bool) = nullptr;
@@ -198,6 +203,10 @@ lv_obj_t *s_ed_sec_sb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 // History overlay (C1)
 lv_obj_t *s_hist_overlay = nullptr;
 lv_obj_t *s_hist_lbl = nullptr;
+// v1.11.0: grams-per-day bar chart over the last 7 days
+lv_obj_t *s_hist_chart = nullptr;
+lv_chart_series_t *s_hist_ser = nullptr;
+lv_obj_t *s_hist_days = nullptr;
 
 // Settings: policy card (F3) + food card (D1)
 lv_obj_t *s_sw_vacation = nullptr;
@@ -213,6 +222,32 @@ uint16_t s_food_used[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
 uint16_t s_food_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
 uint16_t s_food_cap[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
 uint8_t s_food_low = 20;
+
+// ---------------------------------------------------------------- v1.11.0
+// Hold-to-confirm FEED NOW (reference hub UI: 800 ms fill + "Keep holding…")
+constexpr uint32_t FEED_HOLD_MS = 800;   // hold duration before the feed fires
+constexpr lv_coord_t FEED_BTN_W = 420;   // FEED NOW button width (buildHome)
+lv_obj_t *s_feed_fill = nullptr;   // progress fill drawn behind the button label
+lv_obj_t *s_feed_lbl = nullptr;    // the button's text label
+lv_timer_t *s_hold_tmr = nullptr;  // 30 ms progress driver (paused when idle)
+uint32_t s_hold_start = 0;
+bool s_hold_active = false;
+// Feed preview line under the button ("15 g • Main • 3 fed today")
+lv_obj_t *s_feed_preview = nullptr;
+char s_preview_cache[56] = "";
+// "Fed recently?" confirm overlay (manual re-feed < 60 min asks first)
+lv_obj_t *s_fc_overlay = nullptr;
+lv_obj_t *s_fc_lbl = nullptr;
+uint16_t s_fc_grams = 0;
+// Home attention banner (vacation / no-time / relay offline / low food)
+lv_obj_t *s_alert_banner = nullptr;
+lv_obj_t *s_alert_lbl = nullptr;
+int s_alert_sev = -1;              // -1 = never rendered, 0 = hidden, 1..4 = shown
+bool s_time_bad = false;           // cached: clock NOT NTP/RTC-synced (red clock)
+// OTA progress overlay (lv_layer_top, non-dismissible)
+lv_obj_t *s_ota_overlay = nullptr;
+lv_obj_t *s_ota_bar = nullptr;
+lv_obj_t *s_ota_lbl = nullptr;
 
 // countdown target day offset (v1.9.0 A1: weekday masks push feeds days out)
 int s_next_days = 0;
@@ -259,7 +294,18 @@ void kbCancelCb(lv_event_t *e);
 void tokenTaFocusCb(lv_event_t *e);
 void showScreen(int idx);
 void navCb(lv_event_t *e);
-void feedBtnCb(lv_event_t *e);
+void feedPressedCb(lv_event_t *e);      // v1.11.0: hold-to-confirm start
+void feedReleasedCb(lv_event_t *e);     // v1.11.0: early release = cancel
+void feedHoldTimerCb(lv_timer_t *t);    // v1.11.0: 30 ms progress driver
+void feedHoldRestore();                 // v1.11.0: reset visuals after a hold
+void feedHoldComplete();                // v1.11.0: hold elapsed -> guard or feed
+void updateFeedPreview();               // v1.11.0: "15 g • Main • 3 fed today"
+void updateAlertBanner();               // v1.11.0: Home attention banner
+void openFeedConfirm(uint16_t grams, uint32_t minsAgo);
+void closeFeedConfirm();
+void feedConfirmYesCb(lv_event_t *e);
+void feedConfirmNoCb(lv_event_t *e);
+void presetDaysCb(lv_event_t *e);       // v1.11.0: All/Weekdays/Weekend chips
 void enableSwitchCb(lv_event_t *e);
 void trashCb(lv_event_t *e);
 void editorSaveCb(lv_event_t *e);
@@ -585,9 +631,108 @@ void navCb(lv_event_t *e) {
   showScreen((int)(intptr_t)lv_event_get_user_data(e));
 }
 
-void feedBtnCb(lv_event_t *e) {
+// ---------------------------------------------------------------------------
+// v1.11.0: hold-to-confirm FEED NOW (pattern from the reference hub UI).
+// A tap (< FEED_HOLD_MS) never dispenses — it toasts "Press and hold".
+// Holding 800 ms runs an amber fill behind the label and then fires the feed
+// through the SAME ui_request_feed() path as before. On completion the
+// "fed recently?" guard may open a confirm overlay instead of feeding.
+// ---------------------------------------------------------------------------
+void feedHoldRestore() {
+  if (s_feed_lbl) lv_label_set_text(s_feed_lbl, LV_SYMBOL_PLAY "  FEED NOW");
+  if (s_feed_fill) lv_obj_add_flag(s_feed_fill, LV_OBJ_FLAG_HIDDEN);
+}
+
+void feedHoldTimerCb(lv_timer_t *t) {
+  (void)t;
+  if (!s_hold_active) return;
+  const uint32_t el = millis() - s_hold_start;
+  const uint32_t p = (el >= FEED_HOLD_MS) ? FEED_HOLD_MS : el;
+  if (s_feed_fill)
+    lv_obj_set_width(s_feed_fill,
+                     (lv_coord_t)((int32_t)FEED_BTN_W * (int32_t)p /
+                                  (int32_t)FEED_HOLD_MS));
+  if (el < FEED_HOLD_MS) return;
+  // hold complete: stop the interaction, restore the visuals, feed (or ask)
+  s_hold_active = false;
+  lv_timer_pause(s_hold_tmr);
+  feedHoldRestore();
+  feedHoldComplete();
+}
+
+void feedPressedCb(lv_event_t *e) {
   (void)e;
-  ui_request_feed(prefs::getDefaultGrams()); // v1.10.0: default portion (g)
+  if (!s_feed_btn || lv_obj_has_state(s_feed_btn, LV_STATE_DISABLED)) return;
+  s_hold_active = true;
+  s_hold_start = millis();
+  if (s_feed_fill) {
+    lv_obj_set_width(s_feed_fill, 0);
+    lv_obj_clear_flag(s_feed_fill, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (s_feed_lbl) lv_label_set_text(s_feed_lbl, "Keep holding...");
+  if (s_hold_tmr) {
+    lv_timer_reset(s_hold_tmr);
+    lv_timer_resume(s_hold_tmr);
+  }
+}
+
+void feedReleasedCb(lv_event_t *e) {
+  (void)e;
+  if (!s_hold_active) return; // timer already completed the feed
+  s_hold_active = false;
+  if (s_hold_tmr) lv_timer_pause(s_hold_tmr);
+  feedHoldRestore();
+  ui_toast("Press and hold to feed");
+}
+
+/** true (+ minutes ago) when a successful feed happened less than an hour ago. */
+static bool fedRecently(uint32_t *minsAgo) {
+  if (!feed_scheduler::timeValid()) return false; // no clock -> no guard
+  const uint32_t last = prefs::getLastFedEpoch();
+  const uint32_t now = (uint32_t)time(nullptr);
+  if (last == 0 || now <= last || (now - last) >= 3600UL) return false;
+  *minsAgo = (now - last) / 60UL;
+  return true;
+}
+
+void feedHoldComplete() {
+  const uint16_t grams = prefs::getDefaultGrams();
+  uint32_t mins = 0;
+  if (fedRecently(&mins)) {
+    openFeedConfirm(grams, mins); // "Fed recently?" guard (reference pattern)
+    return;
+  }
+  ui_request_feed(grams);
+}
+
+// ---- "Fed again?" confirm overlay -----------------------------------------
+void feedConfirmYesCb(lv_event_t *e) {
+  (void)e;
+  const uint16_t g = s_fc_grams;
+  closeFeedConfirm();
+  ui_request_feed(g);
+}
+
+void feedConfirmNoCb(lv_event_t *e) {
+  (void)e;
+  closeFeedConfirm();
+}
+
+void openFeedConfirm(uint16_t grams, uint32_t minsAgo) {
+  if (!s_fc_overlay) {
+    ui_request_feed(grams); // overlay missing: degrade to the old behavior
+    return;
+  }
+  s_fc_grams = grams;
+  lv_label_set_text_fmt(s_fc_lbl,
+                        "The fish were fed %lu min ago. Feed another %u g now?",
+                        (unsigned long)minsAgo, (unsigned)grams);
+  lv_obj_clear_flag(s_fc_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_fc_overlay);
+}
+
+void closeFeedConfirm() {
+  if (s_fc_overlay) lv_obj_add_flag(s_fc_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 void enableSwitchCb(lv_event_t *e) {
@@ -691,6 +836,18 @@ void presetCb(lv_event_t *e) {
   // v1.10.0: S/M/L portion presets in GRAMS (per-tank overrides untouched).
   const uintptr_t g = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
   if (s_sb_sec) spinSetValueQuiet(s_sb_sec, (int32_t)g);
+}
+
+void presetDaysCb(lv_event_t *e) {
+  // v1.11.0: All / Weekdays / Weekend chips — one tap sets the 7 day chips.
+  const uintptr_t mask = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  for (int i = 0; i < 7; i++) {
+    if (!s_ed_day_btn[i]) continue;
+    if (mask & (1u << i))
+      lv_obj_add_state(s_ed_day_btn[i], LV_STATE_CHECKED);
+    else
+      lv_obj_clear_state(s_ed_day_btn[i], LV_STATE_CHECKED);
+  }
 }
 
 void refillCb(lv_event_t *e) {
@@ -883,6 +1040,37 @@ void toastTimerCb(lv_timer_t *t) {
   (void)t;
   if (s_toast_box) lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
   if (s_toast_tmr) lv_timer_pause(s_toast_tmr);
+  s_toast_undo = false;
+}
+
+void toastUndoCb(lv_event_t *e) {
+  (void)e;
+  if (!s_toast_undo) return;
+  const UiEvent ev = s_toast_ev; // payload travels in the event (race-free)
+  s_toast_undo = false;
+  if (s_toast_box) lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
+  if (s_toast_tmr) lv_timer_pause(s_toast_tmr);
+  uiEventSend(ev); // loop() applies the restore and toasts the outcome
+}
+
+/** Shared toast renderer: plain (2.2 s) or with an UNDO button (6 s). */
+void showToast(const String &msg, bool undoable, const UiEvent *ev) {
+  if (!s_toast_box) return;
+  lv_label_set_text(s_toast_lbl, msg.c_str());
+  s_toast_undo = (undoable && ev);
+  if (s_toast_undo) s_toast_ev = *ev;
+  if (s_toast_btn) {
+    if (s_toast_undo)
+      lv_obj_clear_flag(s_toast_btn, LV_OBJ_FLAG_HIDDEN);
+    else
+      lv_obj_add_flag(s_toast_btn, LV_OBJ_FLAG_HIDDEN);
+  }
+  lv_obj_clear_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_toast_box);
+  lv_obj_fade_in(s_toast_box, 200, 0);
+  lv_timer_set_period(s_toast_tmr, s_toast_undo ? 6000 : 2200);
+  lv_timer_reset(s_toast_tmr);
+  lv_timer_resume(s_toast_tmr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,10 +1427,29 @@ void buildHome() {
   lv_obj_set_flex_align(c, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                         LV_FLEX_ALIGN_CENTER);
 
-  // FEED NOW — big amber action button
+  // v1.11.0: attention banner (first flex child; hidden unless an alert is
+  // active: vacation / no time sync / relay offline / low food). Hidden
+  // children are excluded from the flex layout, so Home stays unchanged.
+  s_alert_banner = lv_obj_create(c);
+  lv_obj_remove_style_all(s_alert_banner);
+  lv_obj_set_size(s_alert_banner, lv_pct(100), 30);
+  lv_obj_set_style_bg_color(s_alert_banner, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_alert_banner, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(s_alert_banner, 8, 0);
+  lv_obj_set_style_border_width(s_alert_banner, 1, 0);
+  lv_obj_set_style_border_color(s_alert_banner, lv_color_hex(C_RED), 0);
+  lv_obj_clear_flag(s_alert_banner, LV_OBJ_FLAG_SCROLLABLE);
+  s_alert_lbl = lv_label_create(s_alert_banner);
+  lv_label_set_text(s_alert_lbl, "");
+  lv_obj_set_style_text_font(s_alert_lbl, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(s_alert_lbl, lv_color_hex(C_RED), 0);
+  lv_obj_center(s_alert_lbl);
+  lv_obj_add_flag(s_alert_banner, LV_OBJ_FLAG_HIDDEN);
+
+  // FEED NOW — big amber action button (v1.11.0: hold-to-confirm)
   lv_obj_t *feed = lv_btn_create(c);
   s_feed_btn = feed;
-  lv_obj_set_size(feed, 420, 120);
+  lv_obj_set_size(feed, FEED_BTN_W, 120);
   lv_obj_set_style_radius(feed, 24, 0);
   lv_obj_set_style_bg_color(feed, lv_color_hex(C_AMBER), 0);
   lv_obj_set_style_bg_color(feed, lv_color_hex(C_AMBER_HI), LV_STATE_PRESSED);
@@ -1256,7 +1463,31 @@ void buildHome() {
   lv_obj_set_style_text_color(fl, lv_color_hex(C_INK), 0);
   lv_obj_set_style_text_color(fl, lv_color_hex(C_MUTED), LV_STATE_DISABLED);
   lv_obj_center(fl);
-  lv_obj_add_event_cb(feed, feedBtnCb, LV_EVENT_CLICKED, nullptr);
+  s_feed_lbl = fl;
+  // v1.11.0: hold progress fill drawn BEHIND the label (amber_hi on amber)
+  s_feed_fill = lv_obj_create(feed);
+  lv_obj_remove_style_all(s_feed_fill);
+  lv_obj_set_size(s_feed_fill, 0, 120);
+  lv_obj_align(s_feed_fill, LV_ALIGN_LEFT_MID, 0, 0);
+  lv_obj_set_style_bg_color(s_feed_fill, lv_color_hex(C_AMBER_HI), 0);
+  lv_obj_set_style_bg_opa(s_feed_fill, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(s_feed_fill, 24, 0);
+  lv_obj_add_flag(s_feed_fill, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_background(s_feed_fill);
+  // v1.11.0: tap = hint toast, hold ~800 ms = feed (no CLICKED feed anymore)
+  lv_obj_add_event_cb(feed, feedPressedCb, LV_EVENT_PRESSED, nullptr);
+  lv_obj_add_event_cb(feed, feedReleasedCb, LV_EVENT_RELEASED, nullptr);
+  lv_obj_add_event_cb(feed, feedReleasedCb, LV_EVENT_PRESS_LOST, nullptr);
+
+  s_hold_tmr = lv_timer_create(feedHoldTimerCb, 30, nullptr);
+  lv_timer_pause(s_hold_tmr);
+
+  // v1.11.0: feed preview line ("15 g • Main • 3 fed today")
+  s_feed_preview = lv_label_create(c);
+  lv_label_set_text(s_feed_preview, "");
+  lv_obj_set_style_text_font(s_feed_preview, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(s_feed_preview, lv_color_hex(C_MUTED), 0);
+  updateFeedPreview();
 
   // P5: tank selection chips (populated by ui_tanks_rebuild; hidden at count 1)
   s_tank_chips = lv_obj_create(c);
@@ -1496,6 +1727,21 @@ void buildSchedule() {
   lv_label_set_text(ld, "DAYS");
   lv_obj_set_style_text_font(ld, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_color(ld, lv_color_hex(C_MUTED), 0);
+  // v1.11.0: preset chips — one tap fills the day chips (All / Weekdays / Weekend)
+  lv_obj_t *day_presets = lv_obj_create(days_wrap);
+  lv_obj_remove_style_all(day_presets);
+  lv_obj_set_size(day_presets, lv_pct(100), 40);
+  lv_obj_set_flex_flow(day_presets, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(day_presets, 8, 0);
+  lv_obj_clear_flag(day_presets, LV_OBJ_FLAG_SCROLLABLE);
+  static const char *DAY_PRESET_NAMES[3] = {"All", "Weekdays", "Weekend"};
+  static const uint8_t DAY_PRESET_MASKS[3] = {0x7F, 0x1F, 0x60};
+  for (int i = 0; i < 3; i++) {
+    lv_obj_t *p = makeBtn(day_presets, DAY_PRESET_NAMES[i], C_BG_DARK, C_MUTED,
+                          C_CARD_HI, 110, 40);
+    lv_obj_add_event_cb(p, presetDaysCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)DAY_PRESET_MASKS[i]);
+  }
   s_ed_days_row = lv_obj_create(days_wrap);
   lv_obj_remove_style_all(s_ed_days_row);
   lv_obj_set_size(s_ed_days_row, lv_pct(100), 48);
@@ -1590,12 +1836,45 @@ void buildSchedule() {
   lv_obj_align(hcard, LV_ALIGN_TOP_MID, 0, 12);
   lv_obj_set_flex_flow(hcard, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_row(hcard, 8, 0);
+  // v1.11.0: chart + 24 lines overflow the card — scroll vertically
+  lv_obj_add_flag(hcard, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(hcard, LV_DIR_VER);
 
   lv_obj_t *htitle = lv_label_create(hcard);
   lv_label_set_text(htitle, "FEED HISTORY (latest 24)");
   lv_obj_set_style_text_font(htitle, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(htitle, lv_color_hex(C_AMBER), 0);
   lv_obj_set_style_text_letter_space(htitle, 2, 0);
+
+  // v1.11.0: grams-per-day bar chart over the last 7 days (updated in ui_set_history)
+  s_hist_chart = lv_chart_create(hcard);
+  lv_chart_set_type(s_hist_chart, LV_CHART_TYPE_BAR);
+  lv_chart_set_point_count(s_hist_chart, 7);
+  lv_chart_set_div_line_count(s_hist_chart, 0, 0);
+  lv_obj_set_size(s_hist_chart, lv_pct(100), 96);
+  lv_obj_set_style_bg_color(s_hist_chart, lv_color_hex(C_BG_DARK), 0);
+  lv_obj_set_style_bg_opa(s_hist_chart, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(s_hist_chart, lv_color_hex(C_CARD_HI), 0);
+  lv_obj_set_style_border_width(s_hist_chart, 1, 0);
+  lv_obj_set_style_radius(s_hist_chart, 8, 0);
+  lv_obj_set_style_pad_ver(s_hist_chart, 4, 0);
+  s_hist_ser = lv_chart_add_series(s_hist_chart, lv_color_hex(C_AMBER),
+                                   LV_CHART_AXIS_PRIMARY_Y);
+  lv_chart_set_range(s_hist_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+
+  s_hist_days = lv_obj_create(hcard);
+  lv_obj_remove_style_all(s_hist_days);
+  lv_obj_set_size(s_hist_days, lv_pct(100), 16);
+  lv_obj_set_flex_flow(s_hist_days, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(s_hist_days, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(s_hist_days, LV_OBJ_FLAG_SCROLLABLE);
+  for (int i = 0; i < 7; i++) {
+    lv_obj_t *d = lv_label_create(s_hist_days);
+    lv_label_set_text(d, "-");
+    lv_obj_set_style_text_font(d, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(d, lv_color_hex(C_MUTED), 0);
+  }
 
   s_hist_lbl = lv_label_create(hcard);
   lv_label_set_text(s_hist_lbl, "No feed events yet.");
@@ -2079,6 +2358,11 @@ void toastTimerInit() {
   lv_obj_set_style_radius(s_toast_box, 12, 0);
   lv_obj_set_style_pad_hor(s_toast_box, 24, 0);
   lv_obj_set_style_pad_ver(s_toast_box, 14, 0);
+  // v1.11.0: flex row so the optional UNDO button sits beside the text
+  lv_obj_set_flex_flow(s_toast_box, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(s_toast_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(s_toast_box, 14, 0);
   lv_obj_clear_flag(s_toast_box, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
@@ -2088,6 +2372,11 @@ void toastTimerInit() {
   lv_label_set_text(s_toast_lbl, "");
   lv_obj_set_style_text_font(s_toast_lbl, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(s_toast_lbl, lv_color_hex(C_TEXT), 0);
+
+  s_toast_btn = makeBtn(s_toast_box, "UNDO", C_AMBER, C_INK, C_AMBER_HI, 88,
+                        40);
+  lv_obj_add_event_cb(s_toast_btn, toastUndoCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_flag(s_toast_btn, LV_OBJ_FLAG_HIDDEN);
 
   s_toast_tmr = lv_timer_create(toastTimerCb, 2200, nullptr);
   lv_timer_pause(s_toast_tmr);
@@ -2918,6 +3207,170 @@ void refreshFoodRows() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v1.11.0: Home feed preview + attention banner (both driven from ui_tick)
+// ---------------------------------------------------------------------------
+void updateFeedPreview() {
+  if (!s_feed_preview) return;
+  const char *tank = (s_sel_tank == 0xFE)
+                         ? "All tanks"
+                         : s_tank_names[s_sel_tank];
+  char buf[56];
+  snprintf(buf, sizeof(buf), "%u g  \xE2\x80\xA2  %s  \xE2\x80\xA2  %u fed today",
+           (unsigned)catfishClampGrams(prefs::getDefaultGrams()), tank,
+           (unsigned)feed_state::feedsOkToday());
+  if (strcmp(buf, s_preview_cache) == 0) return; // 1 Hz tick: repaint on change
+  strlcpy(s_preview_cache, buf, sizeof(s_preview_cache));
+  lv_label_set_text(s_feed_preview, buf);
+}
+
+void updateAlertBanner() {
+  if (!s_alert_banner) return;
+
+  // priority: vacation > no time sync > relay offline > low food > none
+  bool timeOk = false;
+  {
+    const time_t now = time(nullptr);
+    struct tm lt;
+    timeOk = localtime_r(&now, &lt) && lt.tm_year >= (2025 - 1900);
+  }
+  const char *txt = "";
+  uint32_t col = C_RED;
+  int sev = 0;
+  if (s_vacation) {
+    sev = 4;
+    txt = "VACATION \xE2\x80\xA2 SCHEDULES PAUSED";
+  } else if (!timeOk) {
+    sev = 3;
+    txt = "NO TIME SYNC \xE2\x80\xA2 SCHEDULES PAUSED";
+  } else if (s_relay_ip_cache[0] && !s_relay_online && !s_relay_feeding) {
+    sev = 2;
+    txt = "RELAY OFFLINE \xE2\x80\xA2 CHECK POWER / WIFI";
+  } else {
+    for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+      if (s_food_pct[i] != 255 && s_food_pct[i] < s_food_low) {
+        sev = 1;
+        col = C_AMBER;
+        txt = "LOW FOOD \xE2\x80\xA2 REFILL THE HOPPER";
+        break;
+      }
+    }
+  }
+
+  if (sev == s_alert_sev) return; // nothing changed since the last tick
+  s_alert_sev = sev;
+
+  if (sev == 0) {
+    lv_obj_add_flag(s_alert_banner, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_label_set_text(s_alert_lbl, txt);
+  lv_obj_set_style_text_color(s_alert_lbl, lv_color_hex(col), 0);
+  lv_obj_set_style_border_color(s_alert_banner, lv_color_hex(col), 0);
+  lv_obj_clear_flag(s_alert_banner, LV_OBJ_FLAG_HIDDEN);
+  // the banner replaces the floating vacation badge (they would overlap)
+  if (s_lbl_vacation) lv_obj_add_flag(s_lbl_vacation, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// v1.11.0: builders for the feed-confirm and OTA-progress overlays
+// ---------------------------------------------------------------------------
+void buildFeedConfirm() {
+  s_fc_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_fc_overlay);
+  lv_obj_set_size(s_fc_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_fc_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_fc_overlay, LV_OPA_70, 0);
+  lv_obj_add_flag(s_fc_overlay, LV_OBJ_FLAG_CLICKABLE); // swallow clicks behind
+  lv_obj_add_flag(s_fc_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_fc_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *card = makeCard(s_fc_overlay, 640, 260);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(card, 14, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, "FEED AGAIN?");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  s_fc_lbl = lv_label_create(card);
+  lv_label_set_text(s_fc_lbl, "");
+  lv_obj_set_style_text_font(s_fc_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_fc_lbl, lv_color_hex(C_TEXT), 0);
+  lv_obj_set_width(s_fc_lbl, lv_pct(100));
+  lv_label_set_long_mode(s_fc_lbl, LV_LABEL_LONG_WRAP);
+
+  lv_obj_t *btns = lv_obj_create(card);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_width(btns, lv_pct(100));
+  lv_obj_set_height(btns, 64);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(btns, 12, 0);
+  lv_obj_clear_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *no = makeBtn(btns, LV_SYMBOL_CLOSE "  Cancel", C_CARD, C_MUTED,
+                         C_CARD_HI, 100, 64);
+  lv_obj_set_flex_grow(no, 1);
+  lv_obj_add_event_cb(no, feedConfirmNoCb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *yes = makeBtn(btns, LV_SYMBOL_PLAY "  Feed again", C_AMBER, C_INK,
+                          C_AMBER_HI, 100, 64);
+  lv_obj_set_flex_grow(yes, 1);
+  lv_obj_add_event_cb(yes, feedConfirmYesCb, LV_EVENT_CLICKED, nullptr);
+}
+
+void buildOtaOverlay() {
+  s_ota_overlay = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_ota_overlay);
+  lv_obj_set_size(s_ota_overlay, lv_pct(100), lv_pct(100));
+  lv_obj_set_style_bg_color(s_ota_overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_ota_overlay, LV_OPA_90, 0);
+  lv_obj_add_flag(s_ota_overlay, LV_OBJ_FLAG_CLICKABLE); // swallow clicks
+  lv_obj_add_flag(s_ota_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_ota_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *col = lv_obj_create(s_ota_overlay);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_size(col, 560, LV_SIZE_CONTENT);
+  lv_obj_align(col, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(col, 14, 0);
+  lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *title = lv_label_create(col);
+  lv_label_set_text(title, "FIRMWARE UPDATE");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);
+  lv_obj_set_style_text_letter_space(title, 2, 0);
+
+  s_ota_bar = lv_bar_create(col);
+  lv_obj_set_size(s_ota_bar, 560, 22);
+  lv_bar_set_range(s_ota_bar, 0, 100);
+  lv_bar_set_value(s_ota_bar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(s_ota_bar, lv_color_hex(C_CARD), 0);
+  lv_obj_set_style_bg_opa(s_ota_bar, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(s_ota_bar, 8, 0);
+  lv_obj_set_style_bg_color(s_ota_bar, lv_color_hex(C_AMBER), LV_PART_INDICATOR);
+  lv_obj_set_style_radius(s_ota_bar, 8, LV_PART_INDICATOR);
+
+  s_ota_lbl = lv_label_create(col);
+  lv_label_set_text(s_ota_lbl, "Starting...");
+  lv_obj_set_style_text_font(s_ota_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(s_ota_lbl, lv_color_hex(C_TEXT), 0);
+
+  lv_obj_t *note = lv_label_create(col);
+  lv_label_set_text(note,
+                    "Do not power off \xE2\x80\xA2 the device reboots when done");
+  lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_color(note, lv_color_hex(C_MUTED), 0);
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -3005,6 +3458,8 @@ void ui_init() {
   buildMqttOverlay();
   buildMechOverlay();
   buildTankOverlay();
+  buildFeedConfirm(); // v1.11.0: "fed recently?" guard overlay
+  buildOtaOverlay();  // v1.11.0: firmware-upload progress overlay
 
   // default tank state until main() calls ui_tanks_rebuild() with prefs data
   String defNames[CATFISH_MAX_TANKS] = {"Main", "Tank 2", "Tank 3", "Tank 4"};
@@ -3037,14 +3492,31 @@ void ui_tick() {
     Serial.println("[UI] backlight wake (touch)");
   }
 
-  // clock (all status bars) — 12/24h per the user preference (v1.6.0)
+  // clock (all status bars) — 12/24h per the user preference (v1.6.0).
+  // v1.11.0: an unsynced clock renders red "NO TIME" (schedules can't fire).
   const time_t now = time(nullptr);
   struct tm lt;
   char hhmm[12];
-  if (localtime_r(&now, &lt) && lt.tm_year >= (2025 - 1900))
+  const bool time_ok = localtime_r(&now, &lt) && lt.tm_year >= (2025 - 1900);
+  if (time_ok) {
     catfishFormatHm(hhmm, sizeof(hhmm), lt.tm_hour, lt.tm_min, s_hour12);
-  else
-    snprintf(hhmm, sizeof(hhmm), "--:--");
+    if (s_time_bad) { // recovered: recolor once
+      s_time_bad = false;
+      for (int i = 0; i < 3; i++) {
+        if (s_clock_lbl[i])
+          lv_obj_set_style_text_color(s_clock_lbl[i], lv_color_hex(C_TEXT), 0);
+      }
+    }
+  } else {
+    snprintf(hhmm, sizeof(hhmm), "NO TIME");
+    if (!s_time_bad) { // degraded: recolor once
+      s_time_bad = true;
+      for (int i = 0; i < 3; i++) {
+        if (s_clock_lbl[i])
+          lv_obj_set_style_text_color(s_clock_lbl[i], lv_color_hex(C_RED), 0);
+      }
+    }
+  }
 
   if (strcmp(hhmm, s_clock_cache) != 0) {
     strlcpy(s_clock_cache, hhmm, sizeof(s_clock_cache));
@@ -3055,6 +3527,10 @@ void ui_tick() {
 
   // next-feed countdown
   updateNextFeedUi();
+
+  // v1.11.0: feed preview line + Home attention banner
+  updateFeedPreview();
+  updateAlertBanner();
 
   // relay dot pulse while relay not confirmed online and not feeding
   if (s_relay_dot) {
@@ -3151,14 +3627,32 @@ void ui_set_last_feed(const String &text) {
   if (s_last_value) lv_label_set_text(s_last_value, text.c_str());
 }
 
-void ui_toast(const String &msg) {
-  if (!s_toast_box) return;
-  lv_label_set_text(s_toast_lbl, msg.c_str());
-  lv_obj_clear_flag(s_toast_box, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_move_foreground(s_toast_box);
-  lv_obj_fade_in(s_toast_box, 200, 0);
-  lv_timer_reset(s_toast_tmr);
-  lv_timer_resume(s_toast_tmr);
+void ui_toast(const String &msg) { showToast(msg, false, nullptr); }
+
+void ui_toast_action(const String &msg, const UiEvent &ev) {
+  showToast(msg, true, &ev);
+}
+
+void ui_ota_progress(uint8_t pct, bool abort, uint32_t bytes) {
+  if (!s_ota_overlay) return;
+  if (abort) {
+    lv_obj_add_flag(s_ota_overlay, LV_OBJ_FLAG_HIDDEN);
+    ui_toast("Firmware upload failed");
+    return;
+  }
+  if (pct > 100) pct = 100;
+  lv_bar_set_value(s_ota_bar, pct, LV_ANIM_OFF);
+  if (pct >= 100)
+    lv_label_set_text(s_ota_lbl, "100% - rebooting...");
+  else if (pct > 0)
+    lv_label_set_text_fmt(s_ota_lbl, "%u%%", (unsigned)pct);
+  else if (bytes > 0)
+    lv_label_set_text_fmt(s_ota_lbl, "%lu KB",
+                          (unsigned long)(bytes / 1024UL));
+  else
+    lv_label_set_text(s_ota_lbl, "Starting...");
+  lv_obj_clear_flag(s_ota_overlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_ota_overlay);
 }
 
 void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on) {
@@ -3264,6 +3758,8 @@ void ui_set_mqtt_broker(const String &text) {
 
 void ui_set_portion(uint16_t grams) { // v1.10.0 (was ui_set_pulse, seconds)
   spinSetValueQuiet(s_sb_pulse, (int32_t)catfishClampGrams(grams));
+  s_preview_cache[0] = '\0'; // v1.11.0: force the feed preview to repaint
+  updateFeedPreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -3588,58 +4084,118 @@ void ui_set_food(uint8_t count, const uint8_t pct[CATFISH_MAX_TANKS],
 
 void ui_set_history(const String &json) {
   if (!s_hist_lbl) return;
-  if (json.length() < 3) {
-    lv_label_set_text(s_hist_lbl, "No feed events yet.");
-    return;
+
+  // v1.11.0: day buckets for the 7-day chart (index 0 = 6 days ago, 6 = today)
+  uint32_t dayKey[7] = {0, 0, 0, 0, 0, 0, 0};
+  uint32_t dayTot[7] = {0, 0, 0, 0, 0, 0, 0};
+  char dayLbl[7][8];
+  bool haveDays = false;
+  const time_t nowT = time(nullptr);
+  struct tm nw;
+  if (localtime_r(&nowT, &nw)) {
+    haveDays = true;
+    static const char *WD[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    for (int k = 0; k < 7; k++) {
+      struct tm dd = nw;
+      dd.tm_mday -= (6 - k);
+      const time_t tt = mktime(&dd);
+      struct tm lo;
+      if (localtime_r(&tt, &lo)) {
+        dayKey[k] = ((uint32_t)lo.tm_year * 1000UL) + (uint32_t)lo.tm_yday;
+        snprintf(dayLbl[k], sizeof(dayLbl[k]), "%s",
+                 (k == 6) ? "Today" : WD[lo.tm_wday]);
+      } else {
+        snprintf(dayLbl[k], sizeof(dayLbl[k]), "-");
+      }
+    }
   }
+
+  bool empty = (json.length() < 3);
   JsonDocument doc;
-  if (deserializeJson(doc, json) != DeserializationError::Ok ||
-      !doc.is<JsonArray>()) {
-    lv_label_set_text(s_hist_lbl, "No feed events yet.");
-    return;
-  }
+  if (!empty &&
+      (deserializeJson(doc, json) != DeserializationError::Ok ||
+       !doc.is<JsonArray>()))
+    empty = true;
+
   String out;
   int n = 0;
-  for (JsonObject o : doc.as<JsonArray>()) {
-    const uint32_t e = (uint32_t)(o["e"] | 0);
-    const uint8_t m = (uint8_t)(o["m"] | 1);
-    const uint16_t g = (uint16_t)(o["g"] | 0); // v1.10.0: grams (legacy "s")
-    const bool ok = ((o["ok"] | 0) != 0);
-    const uint8_t f = (uint8_t)(o["f"] | 0);
-    const time_t t = (time_t)e;
-    struct tm lt;
-    char when[24] = "--/-- --:--";
-    if (e != 0 && localtime_r(&t, &lt)) {
-      snprintf(when, sizeof(when), "%02d-%02d %02d:%02d", lt.tm_mon + 1,
-               lt.tm_mday, lt.tm_hour, lt.tm_min);
+  if (!empty) {
+    for (JsonObject o : doc.as<JsonArray>()) {
+      const uint32_t e = (uint32_t)(o["e"] | 0);
+      const uint8_t m = (uint8_t)(o["m"] | 1);
+      const uint16_t g = (uint16_t)(o["g"] | 0); // v1.10.0: grams (legacy "s")
+      const bool ok = ((o["ok"] | 0) != 0);
+      const uint8_t f = (uint8_t)(o["f"] | 0);
+      // chart bucket: every OK entry (the text list stays capped at 24)
+      if (ok && e != 0 && haveDays) {
+        const time_t t = (time_t)e;
+        struct tm el;
+        if (localtime_r(&t, &el)) {
+          const uint32_t key =
+              ((uint32_t)el.tm_year * 1000UL) + (uint32_t)el.tm_yday;
+          for (int k = 0; k < 7; k++) {
+            if (dayKey[k] == key) {
+              dayTot[k] += g;
+              break;
+            }
+          }
+        }
+      }
+      if (n >= 24) continue; // chart keeps going, the text list is capped
+      const time_t t = (time_t)e;
+      struct tm lt;
+      char when[24] = "--/-- --:--";
+      if (e != 0 && localtime_r(&t, &lt)) {
+        snprintf(when, sizeof(when), "%02d-%02d %02d:%02d", lt.tm_mon + 1,
+                 lt.tm_mday, lt.tm_hour, lt.tm_min);
+      }
+      char tanks[20] = {0};
+      int ti = 0;
+      for (uint8_t b = 0; b < CATFISH_MAX_TANKS; b++) {
+        if (m & (1u << b))
+          ti += snprintf(tanks + ti, sizeof(tanks) - ti, "%s%u", ti ? "+" : "",
+                         (unsigned)(b + 1));
+      }
+      const char *flag = "";
+      switch (f) {
+        case 1: flag = " manual"; break;
+        case 2: flag = " catch-up"; break;
+        case 3: flag = " retry"; break;
+        case 4: flag = " VERIFY"; break;
+        case 5: flag = " blocked"; break;
+        case 6: flag = " skipped"; break;
+        default: break;
+      }
+      char line[64];
+      if (ok)
+        snprintf(line, sizeof(line), "%s  OK   T%s  %ug%s\n", when,
+                 tanks[0] ? tanks : "1", (unsigned)g, flag);
+      else
+        snprintf(line, sizeof(line), "%s  FAIL T%s  %ug%s\n", when,
+                 tanks[0] ? tanks : "1", (unsigned)g, flag);
+      out += line;
+      n++;
     }
-    char tanks[20] = {0};
-    int ti = 0;
-    for (uint8_t b = 0; b < CATFISH_MAX_TANKS; b++) {
-      if (m & (1u << b))
-        ti += snprintf(tanks + ti, sizeof(tanks) - ti, "%s%u", ti ? "+" : "",
-                       (unsigned)(b + 1));
-    }
-    const char *flag = "";
-    switch (f) {
-      case 1: flag = " manual"; break;
-      case 2: flag = " catch-up"; break;
-      case 3: flag = " retry"; break;
-      case 4: flag = " VERIFY"; break;
-      case 5: flag = " blocked"; break;
-      case 6: flag = " skipped"; break;
-      default: break;
-    }
-    char line[64];
-    if (ok)
-      snprintf(line, sizeof(line), "%s  OK   T%s  %ug%s\n", when,
-               tanks[0] ? tanks : "1", (unsigned)g, flag);
-    else
-      snprintf(line, sizeof(line), "%s  FAIL T%s  %ug%s\n", when,
-               tanks[0] ? tanks : "1", (unsigned)g, flag);
-    out += line;
-    if (++n >= 24) break;
   }
+
+  // v1.11.0: refresh the chart + day labels from the buckets
+  if (s_hist_chart && s_hist_ser) {
+    uint32_t mx = 1;
+    for (int k = 0; k < 7; k++)
+      if (dayTot[k] > mx) mx = dayTot[k];
+    lv_chart_set_range(s_hist_chart, LV_CHART_AXIS_PRIMARY_Y, 0, (int32_t)mx);
+    for (int k = 0; k < 7; k++)
+      lv_chart_set_value_by_id(s_hist_chart, s_hist_ser, (uint16_t)k,
+                               (int32_t)dayTot[k]);
+    lv_chart_refresh(s_hist_chart);
+  }
+  if (s_hist_days) {
+    for (int k = 0; k < 7; k++) {
+      lv_obj_t *d = lv_obj_get_child(s_hist_days, k);
+      if (d) lv_label_set_text(d, haveDays ? dayLbl[k] : "-");
+    }
+  }
+
   lv_label_set_text(s_hist_lbl, out.length() ? out.c_str() : "No feed events yet.");
 }
 

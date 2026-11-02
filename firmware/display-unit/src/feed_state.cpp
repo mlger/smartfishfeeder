@@ -16,7 +16,9 @@
 namespace {
 
 constexpr int RETRY_SLOTS = 2;
-constexpr int HIST_MAX = 24;
+// v1.11.0: 24 -> 72 entries so the on-device 7-day chart keeps a full week of
+// coverage even with heavy manual feeding (12 bytes/entry = 864 B RAM).
+constexpr int HIST_MAX = 72;
 // Backoff between retry attempts, seconds. attempts counts feed attempts made
 // for the slot (1 = just the initial scheduled try failed).
 constexpr uint32_t RETRY_BACKOFF_S[] = {30, 300, 900};

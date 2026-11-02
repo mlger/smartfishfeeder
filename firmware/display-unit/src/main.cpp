@@ -451,7 +451,9 @@ static void webPublishSnapshot() {
     feed_state::historyClearDirty();
     s_hist_pushed = true;
     lvgl_port_lock(-1);
-    ui_set_history(hj);
+    // v1.11.0: the on-device 7-day chart wants the full ring (72), while the
+    // web snapshot keeps its stable 24-entry contract.
+    ui_set_history(feed_state::historyJson(72));
     lvgl_port_unlock();
   }
   web_server::publishSnapshot(s);
@@ -930,16 +932,77 @@ static void handleUiEvent(const UiEvent &ev) {
       break;
     }
 
-    case UI_EVT_SCHED_REMOVE:
+    case UI_EVT_SCHED_REMOVE: {
       // v1.10.0: identity is HH:MM (ev.a = h, ev.b = m) — duplicates are
       // rejected on add, so the pair is unique.
+      // v1.11.0: snapshot the entry first; after the removal the toast offers
+      // a 6 s UNDO that re-enqueues the full entry via UI_EVT_SCHED_RESTORE.
+      const int n = feed_scheduler::getCount();
+      const FeedTime *all = feed_scheduler::getAll();
+      FeedTime snap{};
+      bool found = false;
+      for (int i = 0; i < n; i++) {
+        if (all[i].hour == ev.a && all[i].minute == ev.b) {
+          snap = all[i];
+          found = true;
+          break;
+        }
+      }
       if (feed_scheduler::removeByIdentity(ev.a, ev.b)) {
         feed_state::pruneFired(feed_scheduler::getAll(),
                                feed_scheduler::getCount());
         afterScheduleChange(true);
+        if (found) {
+          UiEvent uv;
+          uv.type = UI_EVT_SCHED_RESTORE;
+          uv.a = snap.hour;
+          uv.b = snap.minute;
+          uv.grams = snap.grams;
+          uv.tankMask = snap.tanks;
+          uv.days = snap.days;
+          for (int k = 0; k < 4; k++) uv.gramTank[k] = snap.gramTank[k];
+          lvgl_port_lock(-1);
+          ui_toast_action(String("Removed ") + fmtHhmm(ev.a, ev.b), uv);
+          lvgl_port_unlock();
+        }
       } else {
         Serial.println("[FEED] schedule remove: entry not found");
       }
+      break;
+    }
+
+    case UI_EVT_SCHED_RESTORE: {
+      // v1.11.0: undo payload of a trash tap (see UI_EVT_SCHED_REMOVE).
+      FeedTime t{};
+      t.hour = ev.a;
+      t.minute = ev.b;
+      t.enabled = true;
+      t.grams = ev.grams;
+      t.tanks = ev.tankMask;
+      t.days = ev.days;
+      for (int k = 0; k < 4; k++) t.gramTank[k] = ev.gramTank[k];
+      if (feed_scheduler::add(t)) {
+        feed_scheduler::flushIfDirty();
+        lvgl_port_lock(-1);
+        ui_schedule_refresh();
+        ui_editor_close();
+        ui_toast(String("Restored ") + fmtHhmm(ev.a, ev.b));
+        lvgl_port_unlock();
+        refreshNextFeedUi();
+        Serial.printf("[FEED] schedule restore %02u:%02u (undo)\n",
+                      (unsigned)ev.a, (unsigned)ev.b);
+      } else {
+        uiToast(String("Cannot restore: ") + fmtHhmm(ev.a, ev.b) +
+                " already scheduled");
+      }
+      break;
+    }
+
+    case UI_EVT_OTA_PROGRESS:
+      // v1.11.0: firmware-upload progress (web_server OTA multipart callback).
+      lvgl_port_lock(-1);
+      ui_ota_progress(ev.a, ev.flag, ev.bytes);
+      lvgl_port_unlock();
       break;
 
     case UI_EVT_SCHED_PERSIST:

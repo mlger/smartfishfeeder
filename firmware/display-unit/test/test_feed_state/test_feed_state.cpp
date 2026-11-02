@@ -557,27 +557,29 @@ void test_hopper_low_ignores_unconfigured_tanks(void) {
 // ---------------------------------------------------------------------------
 // C1: history ring
 // ---------------------------------------------------------------------------
-void test_history_ring_caps_at_24_newest_first(void) {
-  for (int i = 0; i < 30; i++) {
+void test_history_ring_caps_at_72_newest_first(void) {
+  // v1.11.0: ring grew 24 -> 72 so the on-device 7-day chart keeps a full
+  // week of coverage; the cap semantics are unchanged (newest-first).
+  for (int i = 0; i < 80; i++) {
     g_now = makeLocalTime(2025, 6, 16, 12, 0, i); // distinct epochs
     feed_state::recordHistory((uint8_t)(0x01 << (i % 4)), (uint8_t)(i + 1),
                               (uint16_t)(i + 1), (i % 2) == 1,
                               feed_state::HIST_MANUAL);
   }
-  TEST_ASSERT_EQUAL_INT(24, feed_state::historyCount());
+  TEST_ASSERT_EQUAL_INT(72, feed_state::historyCount());
 
   const feed_state::HistEntry *h = feed_state::historyAll();
-  TEST_ASSERT_EQUAL_UINT32((uint32_t)makeLocalTime(2025, 6, 16, 12, 0, 29),
+  TEST_ASSERT_EQUAL_UINT32((uint32_t)makeLocalTime(2025, 6, 16, 12, 0, 79),
                            h[0].epoch); // index 0 = newest
-  TEST_ASSERT_EQUAL_UINT8(30, h[0].seconds);
-  TEST_ASSERT_EQUAL_UINT16(30, h[0].grams);
+  TEST_ASSERT_EQUAL_UINT8(80, h[0].seconds);
+  TEST_ASSERT_EQUAL_UINT16(80, h[0].grams);
   TEST_ASSERT_TRUE(h[0].ok);
   TEST_ASSERT_EQUAL_UINT8(feed_state::HIST_MANUAL, h[0].flag);
-  // 6 oldest entries (i = 0..5) fell off; index 23 = event i = 6
-  TEST_ASSERT_EQUAL_UINT8(7, h[23].seconds);
-  TEST_ASSERT_EQUAL_UINT16(7, h[23].grams);
-  TEST_ASSERT_EQUAL_UINT8(0x04, h[23].tankMask);
-  TEST_ASSERT_FALSE(h[23].ok);
+  // 8 oldest entries (i = 0..7) fell off; index 71 = event i = 8
+  TEST_ASSERT_EQUAL_UINT8(9, h[71].seconds);
+  TEST_ASSERT_EQUAL_UINT16(9, h[71].grams);
+  TEST_ASSERT_EQUAL_UINT8(0x01, h[71].tankMask); // 0x01 << (8 % 4)
+  TEST_ASSERT_FALSE(h[71].ok);
 }
 
 void test_history_dirty_flag_lifecycle(void) {
@@ -651,7 +653,7 @@ int main(void) {
   RUN_TEST(test_hopper_usage_accumulates_and_refills);
   RUN_TEST(test_hopper_level_pct_and_low_alert);
   RUN_TEST(test_hopper_low_ignores_unconfigured_tanks);
-  RUN_TEST(test_history_ring_caps_at_24_newest_first);
+  RUN_TEST(test_history_ring_caps_at_72_newest_first);
   RUN_TEST(test_history_dirty_flag_lifecycle);
   RUN_TEST(test_history_json_roundtrip_via_arduinojson);
   return UNITY_END();

@@ -55,6 +55,9 @@ enum UiEventType : uint8_t {
   UI_EVT_WIFI_SCAN,     // v1.10.0: WiFi manager scan requested
   UI_EVT_WIFI_CONNECT,  // v1.10.0: connect to wifiSsid with wifiPass
   UI_EVT_OTA_OPEN,      // v1.10.1: Settings OTA "open" switch (flag=open)
+  UI_EVT_SCHED_RESTORE, // v1.11.0: undo a removal (full entry carried in the fields)
+  UI_EVT_OTA_PROGRESS,  // v1.11.0: firmware upload progress (a=pct 0..100,
+                        //           bytes=bytes written, flag=true = aborted)
 };
 
 struct UiEvent {
@@ -66,6 +69,7 @@ struct UiEvent {
   bool flag = false;
   uint8_t feedSrc = 0;  // v1.9.0 (F3): FEED source: 0 touch/node, 1 web, 2 MQTT
   uint16_t grams = 0;   // v1.10.0: FEED/SCHED_ADD/SET_PORTION portion (g)
+  uint32_t bytes = 0;   // v1.11.0: OTA_PROGRESS bytes written so far
   char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
   uint8_t tankMask = 0; // FEED/SCHED_ADD: target tanks (bit i = tank i+1); 0 = tank 1
   // v1.9.0 (A1/A2): SCHED_ADD weekday mask (bit0=Mon..bit6=Sun; 0 = daily)
@@ -191,6 +195,22 @@ void ui_set_last_feed(const String &text);
 
 /** Transient toast message (auto-hides after ~2.2 s). */
 void ui_toast(const String &msg);
+
+/**
+ * v1.11.0: toast with an UNDO action button (auto-hides after ~6 s). Tapping
+ * UNDO re-enqueues @p ev through the normal event queue — the caller keeps no
+ * state, the payload travels inside the event.
+ */
+void ui_toast_action(const String &msg, const UiEvent &ev);
+
+/**
+ * v1.11.0: firmware-upload progress for the on-panel OTA overlay. pct 0..100
+ * (0 = "starting" — bytes are shown until a percentage is known), 100 =
+ * "rebooting". abort=true hides the overlay and toasts the failure.
+ * Thread-safe by contract: producers enqueue UI_EVT_OTA_PROGRESS from any
+ * task; loop() calls this under the LVGL lock.
+ */
+void ui_ota_progress(uint8_t pct, bool abort, uint32_t bytes);
 
 /** Register the backlight on/off handler (no PWM on this board) + initial state. */
 void ui_set_backlight_cb(void (*cb)(bool on), bool initial_on);

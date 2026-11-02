@@ -180,7 +180,8 @@ One display unit can drive up to **4 relay units** (one per tank). The relay fir
 - **Configuration**: Settings → TANKS. The count spinbox (1-4) controls how many tanks exist; each tank gets a display name and an optional per-tank **token override** (empty = inherit the shared pairing token).
 - **Binding**: every tank keeps its own last-known relay IP (persisted to NVS). *Scan for relays* sends one UDP broadcast round and binds every tank without a live IP to a relay not already claimed by another tank. Per-tank discovery (first feed/probe after an IP loss) reuses the same rule, so two tanks never auto-bind to the same relay.
 - **Schedules**: each entry carries a target-tank bitmask (default: every configured tank for new entries; pre-v1.5.0 entries load as tank 1). The editor shows tank checkboxes when 2+ tanks are configured.
-- **Feeding**: FEED NOW targets the selected tank chip (Home screen) or "All"; the worker feeds each target tank sequentially and toasts partial failures per tank.
+- **Feeding**: FEED NOW targets the selected tank chip (Home screen) or "All"; the worker feeds each target tank sequentially and toasts partial failures per tank. Since v1.11.0 the button uses **hold-to-confirm** (~800 ms with a progress fill; a quick tap only shows a hint toast), and a feed less than an hour after the last successful one asks "Feed again?" first.
+- **v1.11.0 on-panel feedback**: a feed-preview line under the button (grams • selected tank • fed today), a Home attention banner (vacation / no time sync / relay offline / low food), a red **NO TIME** clock when the RTC/NTP time is not synced, schedule-trash **undo** (6 s toast), editor day presets (All / Weekdays / Weekend), a 7-day grams bar chart in the history overlay, and a live firmware-upload progress overlay during OTA.
 - **Sensors**: Home Assistant gains a feed button + online sensor per tank; the web dashboard shows per-tank chips and status.
 - **Single-tank setups are unchanged**: with the count at 1 there are no chips, no checkboxes, and behavior is byte-for-byte the pre-v1.5.0 flow (the legacy `relayIp` NVS key is migrated to tank 1 on first boot).
 
@@ -394,9 +395,11 @@ format ("feed for N seconds") and `CATFISH_PROTOCOL_VERSION 1` are untouched.
 
 **Insights & level**
 
-- **On-device history (C1)** — Schedule > HISTORY shows the newest 24 events
-  (OK/FAIL, tanks, seconds, manual/catch-up/retry/verify/blocked/skipped).
-  RAM ring, works without an SD card (the SD CSV remains the durable copy).
+- **On-device history (C1)** — Schedule > HISTORY shows a **7-day grams-fed
+  bar chart** plus the newest 24 events (OK/FAIL, tanks, grams,
+  manual/catch-up/retry/verify/blocked/skipped). RAM ring holds 72 entries
+  since v1.11.0 (was 24); works without an SD card (the SD CSV remains the
+  durable copy).
 - **`GET /api/history` + `GET /api/stats` (C2)** — the dashboard gains a
   history panel, "Today: N fed / M failed" and per-tank food bars.
 - **Daily counters (C3)** — feeds/fails today + lifetime totals in NVS
