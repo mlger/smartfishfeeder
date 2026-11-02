@@ -33,6 +33,7 @@ struct Snapshot {
   bool feeding = false;     // any configured tank feeding
   char relayIp[16] = {0};
   char nextFeed[12] = {0}; // "HH:MM", "none", or "" while clock unsynced
+  uint8_t nextDays = 0;    // v1.11.1: 0 = today, 1..7 = days ahead (weekday masks)
   uint32_t lastFedEpoch = 0;
   uint8_t pulse = 0;
   uint16_t defGrams = 0; // v1.10.0: default portion (g)

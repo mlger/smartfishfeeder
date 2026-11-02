@@ -55,7 +55,22 @@ dialog input{width:100%;margin:8px 0 14px}
 .prog{height:8px;background:var(--bar);border-radius:8px;overflow:hidden;margin-top:10px;display:none}
 .prog>i{display:block;height:100%;background:var(--amber);width:0}
 .mut{color:var(--mut);font-size:12px}
-.vac{background:rgba(217,100,89,.14);border:1px solid var(--red);color:var(--red);border-radius:10px;padding:10px 14px;text-align:center;font-weight:700;font-size:13px;letter-spacing:1px;margin-bottom:12px}
+.alert{border-radius:10px;padding:10px 14px;text-align:center;font-weight:700;font-size:13px;letter-spacing:1px;margin-bottom:12px}
+.alert.red{background:rgba(217,100,89,.14);border:1px solid var(--red);color:var(--red)}
+.alert.amb{background:rgba(242,163,60,.12);border:1px solid var(--amber);color:var(--amber)}
+.nums{font-variant-numeric:tabular-nums}
+.ddots{display:inline-flex;gap:3px;flex:none}
+.ddots i{width:6px;height:6px;border-radius:50%;background:var(--hi)}
+.ddots i.on{background:var(--amber)}
+.toast.act{pointer-events:auto}
+.toast button{margin-left:10px;padding:4px 10px;font-size:12px;border-radius:8px;background:var(--amber);color:#121E1C}
+#feedBtn{position:relative;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+#feedLbl{position:relative;z-index:1}
+#feedFill{display:block;position:absolute;inset:0;width:0;background:rgba(18,30,28,.30);pointer-events:none}
+.cbars{display:flex;align-items:flex-end;gap:6px;height:64px;margin:8px 0 4px}
+.cbars .cb{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:3px}
+.cbars .cb i{display:block;width:100%;max-width:28px;background:var(--amber);border-radius:3px 3px 0 0;min-height:2px}
+.cbars .cb u{text-decoration:none;font-size:9px;color:var(--mut)}
 .tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:8px;letter-spacing:1px}
 .tok{background:rgba(70,208,126,.15);color:var(--grn)}
 .tfail{background:rgba(217,100,89,.18);color:var(--red)}
@@ -83,11 +98,12 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   </div>
 </header>
 
-<div class="vac" id="vacBanner" style="display:none">VACATION &mdash; schedules paused</div>
+<div class="alert" id="alertBanner" style="display:none"></div>
 
 <div class="card">
   <h2>NEXT FEEDING</h2>
-  <div class="big" id="nextTime">--:--</div>
+  <div class="big nums" id="nextTime">--:--</div>
+  <div class="sub nums" id="cdLine" style="color:var(--amber)"></div>
   <div class="sub" id="lastTime">Last fed: never</div>
   <div class="sub" id="todayLine" style="display:none"></div>
   <div class="sub" id="feeding" style="color:var(--amber);display:none">Feeding now...</div>
@@ -102,7 +118,8 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
       <button id="pMinus">&minus;</button><span id="pVal">15 g</span><button id="pPlus">+</button>
     </div>
   </div>
-  <button class="primary" id="feedBtn">FEED NOW</button>
+  <button class="primary" id="feedBtn"><span id="feedLbl">FEED NOW</span><span id="feedFill" aria-hidden="true"></span></button>
+  <div class="sub" id="feedPreview" style="text-align:center;margin-top:8px"></div>
 </div>
 
 <div class="card">
@@ -133,6 +150,8 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
     <span class="mut" id="histCaret">&#9656;</span>
   </div>
   <div id="histBody" style="display:none;margin-top:8px">
+    <div class="cbars nums" id="histChart"></div>
+    <div class="mut" id="histCap" style="margin-bottom:6px"></div>
     <ul id="histList"></ul>
     <div class="mut" id="histMsg" style="display:none"></div>
   </div>
@@ -160,6 +179,13 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   <div class="mut" style="margin-bottom:8px">Same token as Settings &rarr; Relay Unit on the device (default <b>catfish</b>).</div>
   <input type="password" id="tokInput" placeholder="pairing token">
   <button class="primary" id="tokSave">Save</button>
+</dialog>
+
+<dialog id="refedDlg">
+  <h3>Fed recently</h3>
+  <p class="mut" id="refedTxt" style="margin-bottom:14px"></p>
+  <button class="primary" id="refedYes">Feed anyway</button>
+  <button class="mini" id="refedNo" style="width:100%;margin-top:8px">Cancel</button>
 </dialog>
 
 <dialog id="edDlg">
@@ -191,8 +217,22 @@ let lastHour12=null;
 let tanksProj=null; // v1.9.0: identity projection so foodPct/gps churn doesn't rebuild the editors
 let addDayChips=null, addStIns=[]; // v1.9.0: add-form weekday mask + per-tank seconds inputs
 let histOpen=false, edIdx=-1, edDayChips=null, edStIns=[]; // v1.9.0: history panel + entry editor
+let lastFedEpoch=0, feedsOk=-1; // v1.11.1: fed-recently guard + feed preview
+let nextHM=null, nextDays=0;    // v1.11.1: live countdown target (nextDays: 0=today)
+let connBad=false, lastOkMs=0;  // v1.11.1: connection-staleness banner
 
-function toast(m,ms=2200){const t=$("toast");t.textContent=m;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms)}
+function toast(m,ms=2200){const t=$("toast");t.classList.remove("act");t.textContent=m;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),ms)}
+/* v1.11.1: toast with an UNDO action (6 s) — restores a deleted schedule entry */
+let undoState=null;
+function toastUndo(m,u){undoState=u;const t=$("toast");t.textContent="";t.append(m+"  ");
+  const b=document.createElement("button");b.textContent="UNDO";
+  b.onclick=()=>{if(undoState){schedule.splice(Math.max(0,Math.min(undoState.idx,schedule.length)),0,undoState.entry);undoState=null;dirty=true;$("saveBtn").disabled=false;renderSched()}t.classList.remove("show");t.classList.remove("act")};
+  t.appendChild(b);
+  t.classList.add("act");t.classList.add("show");clearTimeout(t._h);
+  t._h=setTimeout(()=>{t.classList.remove("show");t.classList.remove("act");undoState=null},6000)}
+/* v1.11.1: API error code -> readable text + CODE[] chip (reference hub pattern) */
+const REJECT={auth:"bad pairing token",bad_json:"malformed data",bad_size:"payload too large",busy:"device busy, retry",duplicate:"time already scheduled",full:"schedule full (max 8)",bad_grams:"portion must be 1-500 g",bad_tanks:"bad tank selection",bad_seconds:"seconds must be 1-30"};
+function rejectText(c){return c?"Rejected: "+(REJECT[c]||c)+" \u00B7 CODE["+c+"]":"Rejected"}
 // 24h "07:30" or 12h "7:30 AM" per the device preference (machine values stay 24h)
 function fmtHm(h,m){if(!hour12)return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");let h12=h%12;if(h12===0)h12=12;return h12+":"+String(m).padStart(2,"0")+" "+(h<12?"AM":"PM")}
 function iso(s){if(!s)return"never";const d=new Date(s*1000);const now=new Date();
@@ -214,6 +254,11 @@ function daysLabel(d){ // bit0=Mon..bit6=Sun; absent/0x7F = daily, 0 clamps to d
   return parts.join(", ")||"Daily";
 }
 function stLabel(e){const p=[];(e.gt||[]).forEach((v,k)=>{if(v>0)p.push("T"+(k+1)+":"+v+"g")});return p.length?" \u00B7 "+p.join("+"):""}
+function addPresets(box,st){ // v1.11.1: All / Weekdays / Weekend one-tap fills
+  [["All",0x7F],["Weekdays",0x1F],["Weekend",0x60]].forEach(p=>{
+    const b=document.createElement("button");b.className="mini ghost";b.style.padding="4px 8px";b.style.fontSize="11px";b.textContent=p[0];
+    b.onclick=()=>{st.set(p[1])};box.appendChild(b)});
+}
 function secLabel(e){
   let txt=e.g+" g";const tag=tanks.length>1?maskTag(e.t||1):"";
   if(tag)txt+=" \u00B7 "+tag;
@@ -319,14 +364,26 @@ function renderFood(tl){ // v1.9.0: hopper level per tank; foodPct 255/absent = 
 }
 async function refresh(){
   if(document.hidden)return;
+  let s=null; // v1.11.1: declared outside try so the success-path alert can use it
   try{
-    const s=await api("/api/status");
+    s=await api("/api/status");
     hour12=!!s.hour12;
-    $("nextTime").textContent=s.nextFeed==="none"?"none scheduled":(s.nextFeed&&s.nextFeed.includes(":")?fmtHm(parseInt(s.nextFeed.split(":")[0],10),parseInt(s.nextFeed.split(":")[1],10)):(s.nextFeed||"waiting for time sync"));
+    nextHM=null;nextDays=s.nextDays|0; // v1.11.1: nextDays absent on older firmware -> 0
+    if(s.nextFeed==="none")$("nextTime").textContent="none scheduled";
+    else if(s.nextFeed&&s.nextFeed.includes(":")){
+      const p=s.nextFeed.split(":");nextHM=[parseInt(p[0],10),parseInt(p[1],10)];
+      let t=fmtHm(nextHM[0],nextHM[1]);
+      if(nextDays>0){const d=new Date();d.setDate(d.getDate()+nextDays);t=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()]+' '+t}
+      $("nextTime").textContent=t;
+    }else $("nextTime").textContent=s.nextFeed||"waiting for time sync";
+    renderCd();
+    lastFedEpoch=s.lastFedEpoch||0;
     $("lastTime").textContent="Last fed: "+(s.lastFeedIso&&s.lastFeedIso!=="unknown"?iso(s.lastFedEpoch):"never");
     $("feeding").style.display=s.feeding?"block":"none";
     $("feedBtn").disabled=feedBusy||s.feeding;
-    $("feedBtn").textContent=s.feeding?"FEEDING...":"FEED NOW";
+    $("feedLbl").textContent=s.feeding?"FEEDING...":"FEED NOW";
+    if(typeof s.feedsOkToday==="number")feedsOk=s.feedsOkToday;
+    renderPreview();
     $("dotWifi").classList.toggle("on",!!s.wifiUp);
     $("dotRelay").classList.toggle("on",!!s.relayOnline);
     $("dotMqtt").classList.toggle("on",s.mqttState===2);
@@ -335,8 +392,7 @@ async function refresh(){
     const tl=(s.tanks||[]).map(t=>t.name+" "+(t.online?"\u25CF":"\u25CB")+(t.feeding?" (feeding)":""));
     $("relayLine").textContent="Tanks: "+(tl.length?tl.join("  \u00B7  "):(s.relayOnline?"online at "+s.relayIp:"offline"));
     $("mqttLine").textContent="MQTT: "+(s.mqtt||"n/a");
-    // v1.9.0: vacation badge + today counters (fields absent on v1.8.4 -> hidden)
-    $("vacBanner").style.display=s.vacation?"block":"none";
+    // v1.9.0: priority alert banner + today counters (fields absent on v1.8.4 -> hidden)
     const today=$("todayLine");
     if(typeof s.feedsOkToday==="number"||typeof s.feedsFailToday==="number"){
       today.style.display="block";
@@ -348,22 +404,100 @@ async function refresh(){
     else renderTanks();
     if(hour12!==lastHour12){lastHour12=hour12;renderSched()} // relabel once per format change
     if(!dirty&&!pulseDirty){pulse=s.defGrams||15;renderPulse()} // v1.10.0: default portion in grams
-  }catch(e){}
+  }catch(e){connBad=true;renderAlert();return}
+  connBad=false;lastOkMs=Date.now();renderAlert(s);
 }
 setInterval(refresh,3000);
 
-/* ---------- feed ---------- */
-function renderPulse(){$("pVal").textContent=pulse+" g"}
+/* ---------- v1.11.1: priority alert banner ----------
+ * connection lost > vacation > no time sync > tank offline > low food.
+ * Mirrors the on-panel Home attention banner (v1.11.0). */
+function renderAlert(s){
+  const b=$("alertBanner");
+  let msg="",cls="";
+  if(connBad){msg="CONNECTION LOST \u2014 retrying\u2026";cls="red"}
+  else if(s){
+    if(s.vacation){msg="VACATION \u2014 schedules paused";cls="red"}
+    else if(s.clockValid===false){msg="NO TIME SYNC \u2014 schedules unreliable";cls="amb"}
+    else if(!s.relayOnline){msg="TANK OFFLINE \u2014 check the relay unit";cls="red"}
+    else{
+      const low=(s.tanks||[]).find(t=>typeof t.foodPct==="number"&&t.foodPct!==255&&t.foodPct<=15);
+      if(low){msg="LOW FOOD \u2014 "+(low.name||( "Tank "+low.id))+" at "+Math.max(0,low.foodPct)+"%";cls="amb"}
+    }
+  }
+  if(msg){b.textContent=msg;b.className="alert "+cls;b.style.display="block"}
+  else b.style.display="none";
+}
+
+/* ---------- v1.11.1: live next-feed countdown ----------
+ * Ticks locally every second between /api/status polls; nextDays (weekday
+ * masks can push the next feed days out) comes from /api/status v1.11.1+.
+ * Falls back to the today/tomorrow assumption on older firmware. */
+function renderCd(){
+  const el=$("cdLine");
+  if(!nextHM){el.textContent="";return}
+  const now=new Date();
+  const tgt=new Date(now);tgt.setHours(nextHM[0],nextHM[1],0,0);tgt.setDate(tgt.getDate()+nextDays);
+  let d=Math.floor((tgt-now)/1000);if(d<0)d=0;
+  if(d>=86400){const dd=Math.floor(d/86400),h=Math.floor(d%86400/3600);el.textContent="in "+dd+" d "+h+" h"}
+  else{const h=Math.floor(d/3600),m=Math.floor(d%3600/60),sec=d%60;
+    el.textContent="in "+h+":"+String(m).padStart(2,"0")+":"+String(sec).padStart(2,"0")}
+}
+setInterval(()=>{ // 1 Hz: countdown + connection staleness sweep (3 missed polls)
+  if(document.hidden)return;
+  if(!connBad&&lastOkMs&&Date.now()-lastOkMs>12000){connBad=true;renderAlert()}
+  renderCd();
+},1000);
+
+/* ---------- feed (v1.11.1: preview, hold-to-confirm, fed-recently guard) ---------- */
+function renderPulse(){$("pVal").textContent=pulse+" g";renderPreview()}
+function renderPreview(){
+  const el=$("feedPreview");if(!el)return;
+  const t=(selTank==="all")?null:tanks[selTank];
+  const gps=(t&&t.gps>0)?t.gps:((tanks[0]&&tanks[0].gps>0)?tanks[0].gps:0);
+  const parts=[pulse+" g"];
+  const name=(selTank==="all")?"All tanks":(t?t.name:"");
+  if(name)parts.push(name);
+  if(gps>0)parts.push("\u2248"+Math.max(1,Math.round(pulse/gps))+" s");
+  if(feedsOk>=0)parts.push(feedsOk+" fed today");
+  el.textContent=parts.join(" \u00B7 ");
+}
 $("pMinus").onclick=()=>{if(pulse>1){pulse--;pulseDirty=true;renderPulse()}};
 $("pPlus").onclick=()=>{if(pulse<500){pulse++;pulseDirty=true;renderPulse()}};
-$("feedBtn").onclick=async()=>{
-  feedBusy=true;$("feedBtn").disabled=true;$("feedBtn").textContent="FEEDING...";
+async function tryFeed(){
+  feedBusy=true;$("feedBtn").disabled=true;$("feedLbl").textContent="FEEDING...";
   try{const body={grams:pulse};if(tanks.length)body.tanks=maskOf(selTank,tanks.length); // v1.10.0: grams payload
     const r=await mut("/api/feed","POST",body);
-    if(r.ok)toast("Feeding fish...");else toast(r.error||"Failed",3000)}
+    if(r.ok)toast("Feeding fish...");else toast(rejectText(r.error),3000)}
   catch(e){toast(e.message,3000)}
   pulseDirty=false;feedBusy=false;setTimeout(refresh,800);
-};
+}
+/* Hold-to-confirm: ~0.8 s fill (reference hub pattern) — a quick tap only
+   hints. On completion a manual re-feed <60 min first asks "Fed recently?" */
+const HOLD_MS=800;let holdT=null,holdDone=false;
+function holdReset(){clearInterval(holdT);holdT=null;$("feedFill").style.width="0";
+  if(!feedBusy)$("feedLbl").textContent="FEED NOW";holdDone=false}
+function fedMinsAgo(){return lastFedEpoch?Math.max(0,Math.round((Date.now()/1000-lastFedEpoch)/60)):0}
+$("feedBtn").addEventListener("pointerdown",()=>{
+  if($("feedBtn").disabled||holdT)return;
+  holdDone=false;$("feedLbl").textContent="Keep holding\u2026";
+  const t0=Date.now();
+  holdT=setInterval(()=>{
+    const p=Math.min(1,(Date.now()-t0)/HOLD_MS);
+    $("feedFill").style.width=Math.round(p*100)+"%";
+    if(p>=1){holdDone=true;holdReset();
+      if($("feedBtn").disabled)return; // refresh() disabled us mid-hold
+      const m=fedMinsAgo();
+      if(m>0&&m<60){$("refedTxt").textContent="Fish were fed "+(m<1?"under a minute":m+" min")+" ago. Feed again?";$("refedDlg").showModal()}
+      else tryFeed()}
+  },30)});
+const holdCancel=()=>{if(holdT&&!holdDone){holdReset();toast("Press and hold to feed")}else holdReset()};
+$("feedBtn").addEventListener("pointerup",holdCancel);
+$("feedBtn").addEventListener("pointerleave",holdCancel);
+$("feedBtn").addEventListener("pointercancel",holdCancel);
+$("feedBtn").addEventListener("contextmenu",e=>e.preventDefault());
+$("refedYes").onclick=()=>{$("refedDlg").close();tryFeed()};
+$("refedNo").onclick=()=>$("refedDlg").close();
 
 /* ---------- schedule ---------- */
 function renderSched(){
@@ -381,8 +515,14 @@ function renderSched(){
     s.textContent=secLabel(e);s.style.cursor="pointer";s.title="Tap to edit";
     s.onclick=()=>openEdit(i);
     const del=document.createElement("button");del.className="mini";del.textContent="\u2715";
-    del.onclick=()=>{schedule.splice(i,1);dirty=true;$("saveBtn").disabled=false;renderSched()};
-    li.append(sw,t,s,del);ul.appendChild(li);
+    del.onclick=()=>{const [removed]=schedule.splice(i,1);dirty=true;$("saveBtn").disabled=false;renderSched();
+      toastUndo("Removed "+fmtHm(removed.h,removed.m),{idx:i,entry:removed})};
+    if((e.d&0x7F)!==0x7F){ // v1.11.1: Mo..Su dot matrix (hidden when daily)
+      const dots=document.createElement("span");dots.className="ddots";
+      for(let k=0;k<7;k++){const dt=document.createElement("i");if(e.d>>k&1)dt.className="on";dots.appendChild(dt)}
+      li.append(sw,t,s,dots,del);
+    }else li.append(sw,t,s,del);
+    ul.appendChild(li);
   });
   if(!schedule.length)ul.innerHTML='<li class="mut">No feedings scheduled</li>';
 }
@@ -428,6 +568,7 @@ function openEdit(i){
   $("edTime").value=String(e.h).padStart(2,"0")+":"+String(e.m).padStart(2,"0");
   $("edSec").value=e.g;
   edDayChips=makeDayChips($("edDays"),e.d);
+  addPresets($("edDays"),edDayChips); // v1.11.1: one-tap fills
   if(tanks.length>1){$("edStWrap").style.display="block";edStIns=makeStInputs($("edSt"),e.gt)}
   else{$("edStWrap").style.display="none";edStIns=[]}
   $("edDlg").showModal();
@@ -459,6 +600,28 @@ function histRow(ev){
   if(f){const fs=document.createElement("span");fs.className="mut";fs.textContent=f;li.appendChild(fs)}
   return li;
 }
+/* v1.11.1: 7-day grams-per-day mini chart — client-side aggregation from
+   the stable 24-entry /api/history contract (newest first). */
+function renderChart(rows){
+  const box=$("histChart"),cap=$("histCap");
+  if(!rows.length){box.innerHTML="";cap.textContent="";return}
+  const days=[];const now=new Date();
+  for(let i=6;i>=0;i--){const d=new Date(now);d.setDate(d.getDate()-i);d.setHours(0,0,0,0);days.push({t:d.getTime(),g:0,n:0})}
+  rows.forEach(ev=>{
+    const d=new Date((ev.e||0)*1000);d.setHours(0,0,0,0);
+    const k=Math.round((d.getTime()-days[0].t)/864e5);
+    if(k>=0&&k<7){days[k].g+=(ev.g||((ev.s||0)*5)||0);days[k].n++}
+  });
+  const max=Math.max(1,...days.map(x=>x.g));
+  box.innerHTML="";
+  days.forEach(x=>{
+    const c=document.createElement("div");c.className="cb";
+    const bar=document.createElement("i");bar.style.height=Math.round(x.g/max*100)+"%";bar.title=x.n+" feeds \u00B7 "+x.g+" g";
+    const lb=document.createElement("u");lb.textContent="SMTWTFS"[new Date(x.t).getDay()];
+    c.append(bar,lb);box.appendChild(c);
+  });
+  cap.textContent="grams fed per day \u00B7 last "+rows.length+" events";
+}
 async function loadHist(){
   const ul=$("histList"),msg=$("histMsg");
   msg.style.display="none";ul.innerHTML='<li class="mut">Loading\u2026</li>';
@@ -469,6 +632,7 @@ async function loadHist(){
     const rows=j.slice(0,24); // firmware returns newest first
     if(!rows.length){msg.textContent="No feed events yet";msg.style.display="block";return}
     rows.forEach(ev=>ul.appendChild(histRow(ev)));
+    renderChart(rows);
   }catch(e){
     ul.innerHTML="";
     msg.textContent="History unavailable (needs firmware v1.9.0+)";msg.style.display="block";
@@ -492,14 +656,30 @@ $("updFile").onchange=async()=>{
   const f=$("updFile").files[0];if(!f)return;
   if(!confirm("Install "+f.name+" ("+(f.size/1024).toFixed(0)+" KB)? The device reboots afterwards."))return;
   const fd=new FormData();fd.append("file",f,f.name);
-  $("prog").style.display="block";
+  const prog=$("prog"),fill=prog.firstElementChild;prog.style.display="block";
   try{
-    const r=await fetch("/api/update",{method:"POST",body:fd,headers:{"X-Catfish-Token":token}});
-    const p=r.ok?100:0;$("prog").firstElementChild.style.width=p+"%";
-    if(r.ok){toast("Update OK - device reboots");setTimeout(()=>location.reload(),8000)}
-    else if(r.status===403){$("tokDlg").showModal()}else toast("Update failed",3000);
-  }catch(e){toast("Upload aborted: "+e.message,3000)}
-  $("prog").style.display="none";$("updFile").value="";
+    /* v1.11.1: XHR upload progress (real bytes -> %) + reboot wait:
+       poll /api/version until the device answers again, then reload. */
+    await new Promise((res,rej)=>{
+      const x=new XMLHttpRequest();
+      x.open("POST","/api/update");x.setRequestHeader("X-Catfish-Token",token);
+      x.upload.onprogress=e=>{if(e.lengthComputable)fill.style.width=Math.round(e.loaded/e.total*95)+"%"};
+      x.onload=()=>{if(x.status===200)res();else rej(new Error("HTTP "+x.status))};
+      x.onerror=()=>rej(new Error("network"));
+      x.send(fd);
+    });
+    fill.style.width="100%";
+    toast("Update OK \u2014 waiting for reboot\u2026",12000);
+    for(let i=0;i<120;i++){ // up to ~60 s: gone (rebooting) -> back (updated)
+      await new Promise(r=>setTimeout(r,500));
+      try{await fetch("/api/version");break}catch(e){}
+    }
+    location.reload();return;
+  }catch(e){
+    if(e.message==="HTTP 403")$("tokDlg").showModal();
+    else toast("Update failed: "+e.message,3000);
+  }
+  prog.style.display="none";$("updFile").value="";
 };
 
 /* ---------- token ---------- */
@@ -508,6 +688,8 @@ $("tokSave").onclick=()=>{token=$("tokInput").value.trim();localStorage.catfishT
 if(!token){$("tokInput").value="catfish"}
 
 addDayChips=makeDayChips($("addDays"),0x7F); // v1.9.0: new entries default to daily
+addPresets($("addDays"),addDayChips); // v1.11.1: one-tap fills
+renderPreview(); // v1.11.1: fill the feed line before the first poll lands
 refresh();loadSched();
 </script>
 </body>

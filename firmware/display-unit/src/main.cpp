@@ -404,7 +404,18 @@ static void webPublishSnapshot() {
     s.relayOnline = s_tank_online[i];
     strlcpy(s.relayIp, relay_client::ip(i + 1).c_str(), sizeof(s.relayIp));
   }
-  const String nf = nextFeedHhmm();
+  // v1.11.1: HH:MM + days-ahead (weekday masks can push the next feed days
+  // out; the dashboard countdown needs the offset, the panel UI already had it).
+  String nf = "";
+  if (feed_scheduler::timeValid()) {
+    const feed_scheduler::NextFeed n = feed_scheduler::nextOccurrence();
+    if (n.valid) {
+      nf = fmtHhmm(n.hour, n.minute);
+      s.nextDays = n.daysAhead;
+    } else {
+      nf = "none";
+    }
+  }
   strlcpy(s.nextFeed, nf.c_str(), sizeof(s.nextFeed));
   s.lastFedEpoch = prefs::getLastFedEpoch();
   s.pulse = prefs::getDefaultPulse();

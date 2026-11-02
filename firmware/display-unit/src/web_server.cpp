@@ -82,6 +82,7 @@ void handleStatus() {
   doc["relayIp"] = s_snap.relayIp;
   doc["feeding"] = s_snap.feeding;
   doc["nextFeed"] = s_snap.nextFeed;
+  doc["nextDays"] = s_snap.nextDays; // v1.11.1: dashboard live countdown (0 = today)
   doc["lastFedEpoch"] = s_snap.lastFedEpoch;
   doc["lastFeedIso"] = mqtt_payloads::epochToIso8601(s_snap.lastFedEpoch);
   doc["pulse"] = s_snap.pulse;
