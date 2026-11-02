@@ -86,15 +86,19 @@ truncate -s "$FLASH_SIZE" "$IMG"
 echo "[qemu-run] booting $IMG with $QEMU (up to ${RUN_SECONDS}s) ..."
 rm -f "$LOG"
 set +e
-timeout --signal=INT --kill-after=5 "$RUN_SECONDS" \
+timeout --signal=INT --kill-after=15 "$RUN_SECONDS" \
   env ${LDP_QEMU:+LD_LIBRARY_PATH="$LDP_QEMU"} "$QEMU" -machine esp32s3 \
           -drive file="$IMG",if=mtd,format=raw \
           -display none -monitor none \
           -serial file:"$LOG"
 RC=$?
 set -e
-# 124 = time limit reached — the normal end of a healthy run
-if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ]; then
+# 124 = time limit reached — the normal end of a healthy run.
+# 137 = the same, but QEMU needed the SIGKILL fallback: on GitHub runners it
+# can be slow to handle the INT (observed: full SMOKE PASS + alive 60s in the
+# log, then a 137). The verdict greps below remain the real safety net — a
+# mid-run crash leaves no SMOKE PASS marker and/or crash markers in $LOG.
+if [ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && [ "$RC" -ne 137 ]; then
   echo "[qemu-run] QEMU exited with code $RC (see $LOG)" >&2
   tail -40 "$LOG" || true
   exit 1
