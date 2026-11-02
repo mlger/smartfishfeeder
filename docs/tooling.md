@@ -6,7 +6,10 @@
 
 ## `.mcp.json` (repo root, project-scoped Claude Code servers)
 
-Currently registers one server:
+Currently registers six servers (all remote streamable-HTTP; all endpoints
+probed live on 2026-11): context7, lvgl-docs, espressif-documentation,
+esp-component-registry, espressif-engineering, esp-pilot. See the sections
+below for per-server notes.
 
 ```json
 {
@@ -14,6 +17,26 @@ Currently registers one server:
     "context7": {
       "type": "http",
       "url": "https://mcp.context7.com/mcp"
+    },
+    "lvgl-docs": {
+      "type": "http",
+      "url": "https://lvgl.mcp.kapa.ai/"
+    },
+    "espressif-documentation": {
+      "type": "http",
+      "url": "https://mcp.espressif.com/docs"
+    },
+    "esp-component-registry": {
+      "type": "http",
+      "url": "https://components.espressif.com/mcp"
+    },
+    "espressif-engineering": {
+      "type": "http",
+      "url": "https://ts-mcp.espressif.com/mcp"
+    },
+    "esp-pilot": {
+      "type": "http",
+      "url": "https://mcp.esp-pilot.espressif.com/mcp"
     }
   }
 }
@@ -63,6 +86,83 @@ SDK/library only — it does NOT register the plugin hooks/worker.)
 After install you get MCP search tools: `search`, `timeline`,
 `get_observations` (3-layer workflow: index → timeline → full details).
 Settings live in `~/.claude-mem/settings.json` (user-local, never committed).
+
+### lvgl-docs (LVGL documentation, kapa.ai) — AUTH MAY BE REQUIRED
+
+- Endpoint: `https://lvgl.mcp.kapa.ai/` (the MCP handler is at the root path;
+  `/mcp` returns 404. POST-only — bare GET returns 405.)
+- Probed 2026-11: an MCP `initialize` POST returns `401 {"error":
+  "invalid_token", "error_description": "Authentication required"}`. The
+  endpoint exists but this kapa instance currently gates access behind a
+  token. If Claude Code reports 401, obtain a kapa access token from the
+  LVGL docs AI / kapa dashboard and add it as a local-only header override
+  (`Authorization: Bearer <key>` in `~/.claude.json`, never committed).
+- Useful for: LVGL v8 widget/screen API questions (this repo is LVGL 8.4),
+  e.g. `lv_obj_*, lv_textarea, lv_spinbox` behaviors covered in `ui/ui.cpp`.
+
+### espressif-documentation (semantic search over Espressif docs)
+
+- Endpoint: `https://mcp.espressif.com/docs` — official config from the
+  Espressif MCP catalog (<https://mcp.espressif.com/>), no auth in their
+  published `mcp.json` snippets.
+- Single tool `search_espressif_sources(query, language)` (en/中文) over
+  ESP-IDF / ESP-AT / Arduino-ESP32 docs; returns fragments + source URLs.
+- Rate limits (per catalog): 40 req/hour, 200 req/day per user — interactive
+  use only, not CI.
+- Note: a minimal hand-rolled probe may get `401 invalid_token` from the
+  gateway even though the official no-auth config is published; real MCP
+  clients negotiate per the spec and should connect. If it still 401s, the
+  service may require a (free) access token — check the catalog page.
+
+### esp-component-registry (search ESP-IDF components & examples)
+
+- Endpoint: `https://components.espressif.com/mcp` (verified live: MCP
+  `initialize` handshake returns 200, no auth).
+- Search components/examples by keyword, target (ESP32-S3 etc.), IDF
+  version, metadata, version history. Handy before vendoring another
+  Waveshare/GT911/PCF85063 driver into `lib/` — prefer a registry component
+  over a fresh vendored copy.
+
+### espressif-engineering (guided Espressif troubleshooting "Skills")
+
+- Endpoint: `https://ts-mcp.espressif.com/mcp` (per the Espressif MCP
+  catalog; GET returns 405 — POST-only).
+- Applies structured Espressif workflows: environment setup, solution
+  selection, Wi-Fi troubleshooting, schematic/PCB review — relevant to the
+  RGB-timing and WiFi-power-save quirks documented in `docs/hardware.md`.
+- Same gateway note as espressif-documentation regarding probe 401s.
+
+### esp-pilot (ESP-Pilot MCP)
+
+- Endpoint: `https://mcp.esp-pilot.espressif.com/mcp` (verified live: MCP
+  `initialize` handshake returns 200, no auth; serverInfo
+  `esp-pilot-mcp`).
+
+### Reference documentation (plain links, not MCP servers)
+
+- QEMU (ESP32-S3 emulation, used by the `qemu-smoke` CI job):
+  <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/tools/qemu.html>
+- Board docs — Waveshare ESP32-S3-Touch-LCD-4.3B wiki:
+  <https://docs.waveshare.com/ESP32-S3-Touch-LCD-4.3B>
+  (the repo's verified pinout lives in `docs/notes/hardware-4.3b.md`).
+
+### ponytail (lazy-senior-dev skill) — project skill + Claude Code plugin
+
+- Upstream: <https://github.com/DietrichGebert/ponytail>
+- Installed in-repo as a project skill at `.claude/skills/ponytail/SKILL.md`
+  (auto-discovered by skill-capable hosts; triggers on "ponytail",
+  "simplest solution", "yagni", over-engineering complaints; levels
+  lite/full/ultra). MIT licensed, one prompt, no config file required.
+- Full install inside Claude Code (adds `/ponytail-review`,
+  `/ponytail-audit`, `/ponytail-debt` and the cost band):
+
+  ```
+  /plugin marketplace add DietrichGebert/ponytail
+  /plugin install ponytail@ponytail
+  ```
+
+  Only install from `DietrichGebert/ponytail` on GitHub or
+  `@dietrichgebert/ponytail` on npm (per upstream security note).
 
 ## Devcontainer (`.devcontainer/devcontainer.json`)
 
