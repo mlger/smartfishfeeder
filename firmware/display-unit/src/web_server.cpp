@@ -11,6 +11,8 @@
  *   POST /api/feed        token; {"seconds":1-30,"tanks":1-15} optional; 202
  *   GET  /api/history     feed-event ring JSON (open)          [v1.9.0]
  *   GET  /api/stats       counters + food + policy summary     [v1.9.0]
+ *   POST /api/vacation    token; {"on":bool} or toggle -> UI_EVT_VACATION [v1.11.2]
+ *   POST /api/restart     token; flush + reboot (UI_EVT_REBOOT) [v1.11.2]
  *   POST /api/update      token; multipart firmware upload -> Update.h
  */
 #include "web_server.h"
@@ -93,6 +95,7 @@ void handleStatus() {
   doc["vacation"] = s_snap.vacation;  // v1.9.0 (A5)
   doc["feedsOkToday"] = s_snap.feedsOkToday;     // v1.9.0 (C3)
   doc["feedsFailToday"] = s_snap.feedsFailToday; // v1.9.0 (C3)
+  doc["totalFeeds"] = s_snap.totalFeeds;         // v1.11.2: dashboard lifetime counter
   doc["hour12"] = s_snap.hour12; // v1.6.0: format "nextFeed"/last-feed for display
   doc["version"] = s_snap.version;
   doc["mqtt"] = s_snap.mqtt;
@@ -234,6 +237,40 @@ void handleStats() {
   s_srv.send(200, "application/json", out);
 }
 
+// v1.11.2: vacation toggle from the dashboard — same single-writer path as
+// the panel switch (UI_EVT_VACATION -> loop() applies prefs + MQTT retained).
+void handleVacation() {
+  if (!authOk()) return sendErr(403, "auth");
+  bool on;
+  const String body = s_srv.arg("plain");
+  if (body.length()) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body) != DeserializationError::Ok ||
+        doc["on"].isNull())
+      return sendErr(400, "bad_json");
+    on = doc["on"].as<bool>();
+  } else {
+    on = !s_snap.vacation; // no body = toggle (curl-friendly)
+  }
+  UiEvent ev;
+  ev.type = UI_EVT_VACATION;
+  ev.flag = on;
+  if (!ui::ui_event_send(ev)) return sendErr(503, "busy");
+  s_srv.send(202, "application/json",
+             String("{\"ok\":true,\"vacation\":") + (on ? "true" : "false") +
+             "}");
+}
+
+// v1.11.2: graceful restart — enqueued so loop() flushes the schedule
+// (feed_scheduler::flushIfDirty) before ESP.restart(), same as the panel.
+void handleRestart() {
+  if (!authOk()) return sendErr(403, "auth");
+  UiEvent ev;
+  ev.type = UI_EVT_REBOOT;
+  if (!ui::ui_event_send(ev)) return sendErr(503, "busy");
+  s_srv.send(202, "application/json", "{\"ok\":true,\"rebooting\":true}");
+}
+
 // ------------------------------------------------------------ firmware OTA
 void updUploadCb() {
   HTTPUpload &up = s_srv.upload();
@@ -335,6 +372,8 @@ void webTask(void * /*param*/) {
   s_srv.on("/api/feed", HTTP_POST, handleFeed);
   s_srv.on("/api/history", HTTP_GET, handleHistory); // v1.9.0 (C1)
   s_srv.on("/api/stats", HTTP_GET, handleStats);     // v1.9.0 (C2/C3)
+  s_srv.on("/api/vacation", HTTP_POST, handleVacation); // v1.11.2
+  s_srv.on("/api/restart", HTTP_POST, handleRestart);   // v1.11.2
   s_srv.on("/api/update", HTTP_POST, handleUpdatePost, updUploadCb);
   s_srv.onNotFound([] { sendErr(404, "not_found"); });
 

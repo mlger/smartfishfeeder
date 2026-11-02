@@ -5,9 +5,10 @@
  * Runs a WebServer (port 80) on a dedicated FreeRTOS task ("web-task", core 0,
  * prio 1). The task NEVER touches LVGL, the scheduler, or prefs setters:
  *   - reads come from a plain-field Snapshot cache that loop() refreshes 1 Hz,
- *   - mutations (feed, schedule replace) are enqueued: feed via the shared
- *     UiEvent queue (same single-writer path as touch input), schedule via a
- *     small pointer queue drained by loop() (authoritative replaceAll there).
+ *   - mutations (feed, vacation, restart, schedule replace) are enqueued: feed
+ *     via the shared UiEvent queue (same single-writer path as touch input),
+ *     schedule via a small pointer queue drained by loop() (authoritative
+ *     replaceAll there).
  *
  * Auth: mutating endpoints require the pairing token in the X-Catfish-Token
  * header (same token the relay unit checks). GET endpoints are open — the

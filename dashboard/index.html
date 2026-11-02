@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- v1.11.2: color-scheme makes native time/number pickers render dark -->
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#10201F">
 <title>Catfish Feeder</title>
 <style>
 :root{--bg:#10201F;--bar:#0B1615;--card:#1A2E2C;--hi:#243F3B;--amber:#F2A33C;--amber-p:#D98F2B;--txt:#F2F7F6;--mut:#8FA9A4;--grn:#46D07E;--red:#D96459}
@@ -118,12 +121,16 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
       <button id="pMinus">&minus;</button><span id="pVal">15 g</span><button id="pPlus">+</button>
     </div>
   </div>
-  <button class="primary" id="feedBtn"><span id="feedLbl">FEED NOW</span><span id="feedFill" aria-hidden="true"></span></button>
+  <button class="primary" id="feedBtn" title="Press and hold to feed" aria-label="Feed now - press and hold"><span id="feedLbl">FEED NOW</span><span id="feedFill" aria-hidden="true"></span></button>
   <div class="sub" id="feedPreview" style="text-align:center;margin-top:8px"></div>
 </div>
 
 <div class="card">
   <h2>SCHEDULE</h2>
+  <div class="row" style="margin-bottom:10px">
+    <div class="grow mut">Vacation &mdash; pauses schedules</div>
+    <label class="switch"><input type="checkbox" id="vacSw" aria-label="Vacation mode"><span class="slider"></span></label>
+  </div>
   <ul id="schedList"></ul>
   <div class="addrow">
     <input type="time" id="addTime">
@@ -141,6 +148,11 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
     <div id="addSt" class="chips"></div>
   </div>
   <div class="mut" style="margin-top:8px">Toggle to pause &middot; tap an entry to edit days / per-tank grams &middot; Save sends the whole schedule</div>
+  <div class="row" style="margin-top:10px;gap:8px">
+    <button class="mini ghost" id="expBtn" title="Download the schedule as JSON">Export backup</button>
+    <button class="mini ghost" id="impBtn" title="Load a schedule backup, then tap Save">Import backup</button>
+    <input type="file" id="impFile" accept=".json,application/json" style="display:none">
+  </div>
 </div>
 
 <div class="card">
@@ -159,15 +171,17 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
 
 <div class="card">
   <h2>SYSTEM</h2>
-  <div class="row" style="margin-bottom:10px">
+  <div class="row" style="margin-bottom:10px;flex-wrap:wrap">
     <div class="grow mut" id="fwLine">Firmware</div>
     <button class="mini ghost" id="updBtn">Update firmware</button>
+    <button class="mini" id="rebootBtn">Restart</button>
   </div>
   <input type="file" id="updFile" accept=".bin" style="display:none">
   <div class="prog" id="prog"><i></i></div>
   <div class="mut" id="wifiLine" style="margin-top:8px"></div>
   <div class="mut" id="relayLine"></div>
   <div class="mut" id="mqttLine"></div>
+  <div class="mut" id="clockLine"></div>
   <div id="foodBox" style="display:none"></div>
 </div>
 
@@ -186,6 +200,13 @@ footer{text-align:center;color:var(--mut);font-size:12px;margin-top:20px}
   <p class="mut" id="refedTxt" style="margin-bottom:14px"></p>
   <button class="primary" id="refedYes">Feed anyway</button>
   <button class="mini" id="refedNo" style="width:100%;margin-top:8px">Cancel</button>
+</dialog>
+
+<dialog id="cDlg">
+  <h3 id="cTitle"></h3>
+  <p class="mut" id="cTxt" style="margin-bottom:14px"></p>
+  <button class="primary" id="cYes"></button>
+  <button class="mini" id="cNo" style="width:100%;margin-top:8px">Cancel</button>
 </dialog>
 
 <dialog id="edDlg">
@@ -233,6 +254,11 @@ function toastUndo(m,u){undoState=u;const t=$("toast");t.textContent="";t.append
 /* v1.11.1: API error code -> readable text + CODE[] chip (reference hub pattern) */
 const REJECT={auth:"bad pairing token",bad_json:"malformed data",bad_size:"payload too large",busy:"device busy, retry",duplicate:"time already scheduled",full:"schedule full (max 8)",bad_grams:"portion must be 1-500 g",bad_tanks:"bad tank selection",bad_seconds:"seconds must be 1-30"};
 function rejectText(c){return c?"Rejected: "+(REJECT[c]||c)+" \u00B7 CODE["+c+"]":"Rejected"}
+/* v1.11.2: one generic styled confirm dialog (vacation + restart) */
+let cYesCb=null;
+function askConfirm(title,txt,yes,cb){$("cTitle").textContent=title;$("cTxt").textContent=txt;$("cYes").textContent=yes;cYesCb=cb;$("cDlg").showModal()}
+$("cYes").onclick=()=>{$("cDlg").close();if(cYesCb){const f=cYesCb;cYesCb=null;f()}};
+$("cNo").onclick=()=>$("cDlg").close();
 // 24h "07:30" or 12h "7:30 AM" per the device preference (machine values stay 24h)
 function fmtHm(h,m){if(!hour12)return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0");let h12=h%12;if(h12===0)h12=12;return h12+":"+String(m).padStart(2,"0")+" "+(h<12?"AM":"PM")}
 function iso(s){if(!s)return"never";const d=new Date(s*1000);const now=new Date();
@@ -315,6 +341,7 @@ function renderTanks(){
     const b=document.createElement("button");b.className="mini";
     b.style.border="2px solid "+(selTank===i?"var(--amber)":"var(--hi)");
     b.textContent=(t.online?"\u25CF ":"\u25CB ")+t.name;
+    b.title=t.online?(t.ip||"online"):"offline"; // v1.11.2: tank IP on hover
     b.onclick=()=>{selTank=i;renderTanks()};
     box.appendChild(b);
   });
@@ -392,6 +419,8 @@ async function refresh(){
     const tl=(s.tanks||[]).map(t=>t.name+" "+(t.online?"\u25CF":"\u25CB")+(t.feeding?" (feeding)":""));
     $("relayLine").textContent="Tanks: "+(tl.length?tl.join("  \u00B7  "):(s.relayOnline?"online at "+s.relayIp:"offline"));
     $("mqttLine").textContent="MQTT: "+(s.mqtt||"n/a");
+    // v1.11.2: clock source + lifetime counter (totalFeeds needs v1.11.2+)
+    $("clockLine").textContent="Clock: "+(s.clockSrc==="ntp"?"NTP sync":s.clockSrc==="rtc"?"battery RTC":"not synced")+(typeof s.totalFeeds==="number"?"  \u00B7  Lifetime: "+s.totalFeeds+(s.totalFeeds===1?" feed":" feeds"):"");
     // v1.9.0: priority alert banner + today counters (fields absent on v1.8.4 -> hidden)
     const today=$("todayLine");
     if(typeof s.feedsOkToday==="number"||typeof s.feedsFailToday==="number"){
@@ -406,6 +435,7 @@ async function refresh(){
     if(!dirty&&!pulseDirty){pulse=s.defGrams||15;renderPulse()} // v1.10.0: default portion in grams
   }catch(e){connBad=true;renderAlert();return}
   connBad=false;lastOkMs=Date.now();renderAlert(s);
+  $("vacSw").checked=!!s.vacation; // v1.11.2: mirror the device-side switch
 }
 setInterval(refresh,3000);
 
@@ -478,7 +508,7 @@ const HOLD_MS=800;let holdT=null,holdDone=false;
 function holdReset(){clearInterval(holdT);holdT=null;$("feedFill").style.width="0";
   if(!feedBusy)$("feedLbl").textContent="FEED NOW";holdDone=false}
 function fedMinsAgo(){return lastFedEpoch?Math.max(0,Math.round((Date.now()/1000-lastFedEpoch)/60)):0}
-$("feedBtn").addEventListener("pointerdown",()=>{
+function holdStart(){
   if($("feedBtn").disabled||holdT)return;
   holdDone=false;$("feedLbl").textContent="Keep holding\u2026";
   const t0=Date.now();
@@ -490,11 +520,19 @@ $("feedBtn").addEventListener("pointerdown",()=>{
       const m=fedMinsAgo();
       if(m>0&&m<60){$("refedTxt").textContent="Fish were fed "+(m<1?"under a minute":m+" min")+" ago. Feed again?";$("refedDlg").showModal()}
       else tryFeed()}
-  },30)});
+  },30)}
+$("feedBtn").addEventListener("pointerdown",holdStart);
 const holdCancel=()=>{if(holdT&&!holdDone){holdReset();toast("Press and hold to feed")}else holdReset()};
 $("feedBtn").addEventListener("pointerup",holdCancel);
 $("feedBtn").addEventListener("pointerleave",holdCancel);
 $("feedBtn").addEventListener("pointercancel",holdCancel);
+/* v1.11.2: keyboard parity for the hold-to-confirm (Enter/Space) — the
+   pointer-only refactor had locked keyboard users out of feeding entirely */
+$("feedBtn").addEventListener("keydown",e=>{
+  if((e.key===" "||e.key==="Enter")&&!e.repeat){e.preventDefault();holdStart()}});
+$("feedBtn").addEventListener("keyup",e=>{
+  if(e.key===" "||e.key==="Enter"){e.preventDefault();holdCancel()}});
+$("feedBtn").addEventListener("blur",holdCancel);
 $("feedBtn").addEventListener("contextmenu",e=>e.preventDefault());
 $("refedYes").onclick=()=>{$("refedDlg").close();tryFeed()};
 $("refedNo").onclick=()=>$("refedDlg").close();
@@ -559,6 +597,53 @@ $("saveBtn").onclick=async()=>{
       setTimeout(loadSched,2500)}
     else toast(r.error||"Rejected",3000)}
   catch(e){toast(e.message,3000)}
+};
+
+/* ---------- v1.11.2: vacation (POST /api/vacation -> UI_EVT_VACATION) ----------
+   Same single-writer path as the panel switch: loop() applies prefs + the
+   retained MQTT "paused" flag. Turning ON asks first; turning off is safe. */
+$("vacSw").onchange=()=>{
+  const on=$("vacSw").checked;
+  $("vacSw").checked=!on; // hold until confirmed / the next poll reports it
+  const apply=async v=>{
+    try{const r=await mut("/api/vacation","POST",{on:v});
+      if(r.ok)toast(v?"Vacation on \u2014 schedules paused":"Vacation off \u2014 schedules resumed",3000);
+      else toast(rejectText(r.error),3000)}
+    catch(e){toast(e.message,3000)}
+    setTimeout(refresh,700);
+  };
+  if(on)askConfirm("Start vacation?","Scheduled, catch-up and remote feeds pause. Manual feeds on the device still work.","Pause schedules",()=>apply(true));
+  else apply(false);
+};
+
+/* ---------- v1.11.2: schedule backup (client-side export/import) ----------
+   Same shape the PUT /api/schedule contract accepts; import only stages the
+   list — Save still sends it through the device's authoritative validation. */
+$("expBtn").onclick=()=>{
+  const blob=new Blob([JSON.stringify(schedule.map(e=>({h:e.h,m:e.m,e:e.e,g:e.g,t:e.t,d:e.d,gt:e.gt})),null,1)],{type:"application/json"});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="catfish-schedule.json";a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+};
+$("impBtn").onclick=()=>$("impFile").click();
+$("impFile").onchange=async()=>{
+  const f=$("impFile").files[0];$("impFile").value="";if(!f)return;
+  let j=null;try{j=JSON.parse(await f.text())}catch(e){return toast("Not a valid JSON backup",3000)}
+  if(!Array.isArray(j))return toast("Not a schedule backup",3000);
+  if(j.length>8)return toast("Backup has "+j.length+" entries (max 8)",3000);
+  const clean=[];
+  for(const e of j){
+    if(!e||typeof e!=="object")continue;
+    const h=+e.h,m=+e.m;
+    if(!(h>=0&&h<=23)||!(m>=0&&m<=59))continue; // NaN-safe bounds
+    clean.push({h:Math.round(h),m:Math.round(m),e:e.e!==false,
+      g:Math.max(1,Math.min(500,Math.round(+e.g)||15)),
+      t:Math.max(1,Math.min(15,Math.round(+e.t)||1)),
+      d:(typeof e.d==="number"&&e.d>0&&e.d<128)?e.d:0x7F,
+      gt:[0,1,2,3].map(k=>Array.isArray(e.gt)?Math.max(0,Math.min(500,Math.round(+e.gt[k])||0)):0)});
+  }
+  if(!clean.length)return toast("No valid entries in backup",3000);
+  schedule=clean;dirty=true;$("saveBtn").disabled=false;renderSched();
+  toast("Imported "+clean.length+" \u2014 tap Save to apply",3500);
 };
 
 /* ---------- entry editor (v1.9.0) ---------- */
@@ -651,6 +736,17 @@ $("histRef").onclick=e=>{
 };
 
 /* ---------- firmware ---------- */
+/* v1.11.2: graceful restart — UI_EVT_REBOOT lets loop() flush the schedule
+   first; then poll /api/version until the server answers again. */
+$("rebootBtn").onclick=()=>askConfirm("Restart device?","The display unit reboots (~10 s). Schedules are saved first.","Restart",async()=>{
+  try{const r=await mut("/api/restart","POST",{});
+    if(r.ok){toast("Rebooting\u2026",10000);
+      await new Promise(z=>setTimeout(z,4000)); // let the restart actually happen
+      for(let i=0;i<60;i++){await new Promise(z=>setTimeout(z,500));try{await fetch("/api/version");break}catch(e){}}
+      location.reload()}
+    else toast(rejectText(r.error),3000)}
+  catch(e){toast(e.message,3000)}
+});
 $("updBtn").onclick=()=>$("updFile").click();
 $("updFile").onchange=async()=>{
   const f=$("updFile").files[0];if(!f)return;
