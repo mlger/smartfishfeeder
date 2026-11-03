@@ -217,6 +217,13 @@ lv_obj_t *s_sb_ctch = nullptr;
 lv_obj_t *s_sb_low = nullptr;
 lv_obj_t *s_food_rows = nullptr;
 int s_food_rows_count = -1; // rebuilt when the tank count changes
+// v1.11.2 FIX: per-row widget pointers. The previous user_data chain was
+// never read back correctly (refreshFoodRows fetched the ROW object and
+// treated it as the lv_bar, writing lv_bar_t fields past the row's
+// allocation — heap corruption that crashed lv_obj_clean later).
+static lv_obj_t *s_food_row_bar[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_food_row_pct[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_food_row_used[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 uint8_t s_food_pct[CATFISH_MAX_TANKS] = {255, 255, 255, 255};
 uint16_t s_food_used[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
 uint16_t s_food_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
@@ -3082,6 +3089,11 @@ void rebuildFoodRows() {
   if (!s_food_rows) return;
   lv_obj_clean(s_food_rows);
   s_food_rows_count = s_tank_count;
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    s_food_row_bar[i] = nullptr;
+    s_food_row_pct[i] = nullptr;
+    s_food_row_used[i] = nullptr;
+  }
   for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
     lv_obj_t *row = lv_obj_create(s_food_rows);
     lv_obj_remove_style_all(row);
@@ -3122,9 +3134,12 @@ void rebuildFoodRows() {
     lv_obj_add_event_cb(ref, refillCb, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)(i + 1));
 
-    // stash per-row widget refs (data pointers via lv_obj_set_user_data)
-    lv_obj_set_user_data(bar, pct);
-    lv_obj_set_user_data(pct, used);
+    // v1.11.2 FIX: stash the row's widgets in typed arrays (the old
+    // lv_obj_set_user_data chain stored them on the bar/pct but refresh
+    // looked them up on the ROW — a type confusion that corrupted the heap)
+    s_food_row_bar[i] = bar;
+    s_food_row_pct[i] = pct;
+    s_food_row_used[i] = used;
   }
   refreshFoodRows();
 }
@@ -3133,11 +3148,14 @@ void refreshFoodRows() {
   if (!s_food_rows || lv_obj_get_child_cnt(s_food_rows) == 0) return;
   bool anyKnown = false;
   for (uint8_t i = 0; i < s_food_rows_count && i < CATFISH_MAX_TANKS; i++) {
-    const int idx = i;
-    lv_obj_t *bar = lv_obj_get_child(s_food_rows, idx);
-    if (!bar) continue;
-    lv_obj_t *pct = (lv_obj_t *)lv_obj_get_user_data(bar);
-    lv_obj_t *used = pct ? (lv_obj_t *)lv_obj_get_user_data(pct) : nullptr;
+    // v1.11.2 FIX: use the stashed widget pointers. The old lookup fetched
+    // the ROW (child of s_food_rows) and passed it to lv_bar_set_value(),
+    // writing lv_bar_t fields past the row's own allocation and corrupting
+    // whatever pool block sat next to it.
+    lv_obj_t *bar = s_food_row_bar[i];
+    lv_obj_t *pct = s_food_row_pct[i];
+    lv_obj_t *used = s_food_row_used[i];
+    if (!bar && !pct && !used) continue;
     const uint8_t p = s_food_pct[i];
     char buf[40];
     if (p == 255) {
