@@ -1625,6 +1625,15 @@ void setup() {
   lvgl_port_unlock();
 
 #if !CATFISH_QEMU
+  // v1.11.3: hand the LVGL task one refresh cycle before starting the
+  // blocking init work below. The splash must be flushed by the LVGL task:
+  // the port's VSYNC callback only notifies that task, so a synchronous
+  // lv_refr_now() in THIS task (setup) deadlocked the first flush — every
+  // v1.10.0+ boot froze on the splash with a silent serial log. After this
+  // delay the splash is on the panel and the spinner even animates while
+  // rtcBootInit/sd_log/net_rf24 run.
+  vTaskDelay(pdMS_TO_TICKS(150));
+
   // --- battery-backed RTC (v1.8.1: after the panel stack owns the bus) ---
   // Probing earlier would fail (no legacy driver installed yet). The restore
   // lands well before loop()'s first tick, so the app screens (built below)

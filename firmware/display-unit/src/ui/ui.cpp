@@ -3446,10 +3446,14 @@ void ui_boot_splash(const char *version) {
   lv_obj_set_style_arc_color(sp, lv_color_hex(C_AMBER), LV_PART_INDICATOR);
 
   lv_scr_load(s_boot_scr);
-  // Force one full refresh right now: the panel leaves the white no-signal
-  // state within milliseconds, long before the app screens exist.
-  lv_refr_now(nullptr);
-  Serial.println("[UI] boot splash shown");
+  // v1.11.3: do NOT call lv_refr_now() here. This runs in the setup task, but
+  // the port's VSYNC callback only notifies the LVGL task — a synchronous
+  // flush from this context waits on a task notification that can never be
+  // delivered, deadlocking setup on the very first frame (frozen splash,
+  // silent serial) on every v1.10.0+ hardware boot. The main() side yields
+  // to the LVGL task right after this call, which flushes the splash from
+  // the correct context instead. QEMU is unaffected (no display registered).
+  Serial.println("[UI] boot splash loaded");
 }
 
 void ui_boot_splash_done() {
