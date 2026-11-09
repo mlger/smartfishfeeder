@@ -126,6 +126,16 @@ bool remove(int index);
  *  @return false when not found. */
 bool removeByIdentity(uint8_t hour, uint8_t minute);
 
+/**
+ * v1.11.5 (tap-to-edit): replace the entry identified by its OLD HH:MM with
+ * @p nt. All-or-nothing: when the new HH:MM collides with a DIFFERENT entry
+ * (or the identity is missing) nothing changes and false is returned. The
+ * enabled flag is carried over from the original entry — the editor does not
+ * touch the list switch. Fire tracking resets when the time changes so the
+ * moved entry can still fire today. Marks persistence dirty.
+ */
+bool updateByIdentity(uint8_t oldHour, uint8_t oldMinute, const FeedTime &nt);
+
 /** Enable/disable an entry. Marks persistence dirty. */
 bool setEnabled(int index, bool enabled);
 

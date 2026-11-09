@@ -58,6 +58,8 @@ enum UiEventType : uint8_t {
   UI_EVT_SCHED_RESTORE, // v1.11.0: undo a removal (full entry carried in the fields)
   UI_EVT_OTA_PROGRESS,  // v1.11.0: firmware upload progress (a=pct 0..100,
                         //           bytes=bytes written, flag=true = aborted)
+  UI_EVT_SCHED_UPDATE,  // v1.11.5: tap-to-edit Save (a=new h, b=new m,
+                        //           c=orig h, d=orig m — identity-safe)
 };
 
 struct UiEvent {

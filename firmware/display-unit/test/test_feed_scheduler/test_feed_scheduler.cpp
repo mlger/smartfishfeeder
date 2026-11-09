@@ -231,6 +231,118 @@ void test_set_enabled_by_identity_survives_index_shift(void) {
   TEST_ASSERT_FALSE(feed_scheduler::setEnabledByIdentity(9, 9, true));
 }
 
+// v1.11.5 (tap-to-edit): updateByIdentity() — the UI's EDIT path.
+// Replaces an entry by its OLD HH:MM; keeps the enabled flag; all-or-nothing.
+void test_update_by_identity_changes_time_and_fields(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"g":15},{"h":17,"m":30,"e":false,"g":20}])");
+
+  FeedTime nt{};
+  nt.hour = 9;
+  nt.minute = 15;
+  nt.grams = 25;
+  nt.tanks = 0x03;
+  nt.days = 0x1F; // weekdays
+  nt.enabled = true; // the API ignores this — enabled is carried over
+  TEST_ASSERT_TRUE(feed_scheduler::updateByIdentity(7, 30, nt));
+
+  TEST_ASSERT_EQUAL_INT(2, feed_scheduler::getCount());
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(9, out.hour);
+  TEST_ASSERT_EQUAL_UINT8(15, out.minute);
+  TEST_ASSERT_EQUAL_UINT16(25, out.grams);
+  TEST_ASSERT_EQUAL_UINT8(0x03, out.tanks);
+  TEST_ASSERT_EQUAL_UINT8(0x1F, out.days);
+  TEST_ASSERT_TRUE(out.enabled); // carried from the original entry
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(1, out));
+  TEST_ASSERT_EQUAL_UINT8(17, out.hour); // neighbor untouched
+  TEST_ASSERT_FALSE(out.enabled);
+}
+
+void test_update_rejects_duplicate_of_other_entry(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"g":15},{"h":17,"m":30,"e":true,"g":20}])");
+
+  FeedTime nt{};
+  nt.hour = 17; // collides with the OTHER entry
+  nt.minute = 30;
+  nt.grams = 10;
+  TEST_ASSERT_FALSE(feed_scheduler::updateByIdentity(7, 30, nt));
+
+  // all-or-nothing: the 07:30 entry is untouched after the rejection
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(7, out.hour);
+  TEST_ASSERT_EQUAL_UINT8(30, out.minute);
+  TEST_ASSERT_EQUAL_UINT16(15, out.grams);
+  TEST_ASSERT_EQUAL_INT(2, feed_scheduler::getCount());
+}
+
+void test_update_allows_keeping_same_time(void) {
+  // editing grams/days only must NOT self-collide on HH:MM
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"g":15}])");
+  FeedTime nt{};
+  nt.hour = 7;
+  nt.minute = 30;
+  nt.grams = 40;
+  nt.tanks = 1;
+  TEST_ASSERT_TRUE(feed_scheduler::updateByIdentity(7, 30, nt));
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(7, out.hour);
+  TEST_ASSERT_EQUAL_UINT16(40, out.grams);
+}
+
+void test_update_missing_identity_fails(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"g":15}])");
+  FeedTime nt{};
+  nt.hour = 8;
+  nt.minute = 0;
+  TEST_ASSERT_FALSE(feed_scheduler::updateByIdentity(23, 59, nt));
+  TEST_ASSERT_EQUAL_INT(1, feed_scheduler::getCount());
+}
+
+void test_update_marks_dirty_and_persists(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"g":15}])");
+  feed_scheduler::flushIfDirty(); // clear the load-time state
+
+  FeedTime nt{};
+  nt.hour = 6;
+  nt.minute = 45;
+  nt.grams = 30;
+  TEST_ASSERT_FALSE(feed_scheduler::flushIfDirty()); // clean before the edit
+  TEST_ASSERT_TRUE(feed_scheduler::updateByIdentity(7, 30, nt));
+  TEST_ASSERT_TRUE(feed_scheduler::flushIfDirty()); // dirty -> writes
+  TEST_ASSERT_NOT_NULL(strstr(prefs::g_sched.c_str(), "\"h\":6"));
+
+  // reload the exact blob and verify the update round-trips
+  const std::string blob = prefs::g_sched;
+  loadSchedule(blob.c_str());
+  FeedTime out{};
+  TEST_ASSERT_TRUE(feed_scheduler::getEntry(0, out));
+  TEST_ASSERT_EQUAL_UINT8(6, out.hour);
+  TEST_ASSERT_EQUAL_UINT8(45, out.minute);
+  TEST_ASSERT_EQUAL_UINT16(30, out.grams);
+}
+
+// A moved entry must be able to fire TODAY at its new time (fire tracking
+// resets on a time change; covered here via tick() at the new HH:MM).
+void test_update_resets_fire_tracking_on_time_change(void) {
+  loadSchedule(R"([{"h":7,"m":30,"e":true,"g":15}])");
+  g_now = makeLocalTime(2025, 6, 15, 12, 0, 0);
+
+  FeedTime nt{};
+  nt.hour = 12;
+  nt.minute = 0; // move onto the CURRENT minute
+  nt.grams = 15;
+  TEST_ASSERT_TRUE(feed_scheduler::updateByIdentity(7, 30, nt));
+  FeedTime due = feed_scheduler::tick();
+  TEST_ASSERT_TRUE(due.enabled); // fires immediately at the new slot
+  TEST_ASSERT_EQUAL_UINT8(12, due.hour);
+
+  // ...and does not re-fire within the same calendar minute
+  TEST_ASSERT_FALSE(feed_scheduler::tick().enabled);
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: dirty flag + JSON round-trip
 // ---------------------------------------------------------------------------
@@ -719,6 +831,12 @@ int main(void) {
   RUN_TEST(test_next_occurrence_during_firing_minute_shows_tomorrow);
   RUN_TEST(test_remove_by_identity);
   RUN_TEST(test_set_enabled_by_identity_survives_index_shift);
+  RUN_TEST(test_update_by_identity_changes_time_and_fields);
+  RUN_TEST(test_update_rejects_duplicate_of_other_entry);
+  RUN_TEST(test_update_allows_keeping_same_time);
+  RUN_TEST(test_update_missing_identity_fails);
+  RUN_TEST(test_update_marks_dirty_and_persists);
+  RUN_TEST(test_update_resets_fire_tracking_on_time_change);
   RUN_TEST(test_persistence_flush_and_roundtrip);
   RUN_TEST(test_toggle_marks_dirty_and_stops_firing);
   RUN_TEST(test_replace_all_swaps_everything);

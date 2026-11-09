@@ -189,6 +189,35 @@ bool remove(int index) {
   return true;
 }
 
+bool updateByIdentity(uint8_t oldHour, uint8_t oldMinute, const FeedTime &nt) {
+  int idx = -1;
+  for (int i = 0; i < s_count; i++) {
+    if (s_entries[i].hour == oldHour && s_entries[i].minute == oldMinute) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0) return false;
+
+  FeedTime t = nt;
+  clampEntry(t);
+  // The new HH:MM must not collide with any OTHER entry (keeping the same
+  // time is fine — that is the "edit grams/days only" path).
+  for (int i = 0; i < s_count; i++) {
+    if (i == idx) continue;
+    if (s_entries[i].hour == t.hour && s_entries[i].minute == t.minute) return false;
+  }
+  // The list switch owns enable/disable; an edit never flips it.
+  t.enabled = s_entries[idx].enabled;
+  // Moved time -> forget the old fire stamp so the entry can still fire at
+  // its new HH:MM today (0xFFFF = "never fired" marker used by init/add).
+  if (s_entries[idx].hour != t.hour || s_entries[idx].minute != t.minute)
+    s_last_fired[idx] = 0xFFFF;
+  s_entries[idx] = t;
+  s_dirty = true;
+  return true;
+}
+
 bool removeByIdentity(uint8_t hour, uint8_t minute) {
   for (int i = 0; i < s_count; i++) {
     if (s_entries[i].hour == hour && s_entries[i].minute == minute) {

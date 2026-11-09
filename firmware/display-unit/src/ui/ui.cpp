@@ -199,6 +199,12 @@ lv_obj_t *s_ed_day_btn[7] = {nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr};
 lv_obj_t *s_ed_secs_row = nullptr; // per-tank overrides (multi-tank only)
 lv_obj_t *s_ed_sec_sb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+// v1.11.5: tap-to-edit — editor mode + title label handle (text swaps between
+// NEW FEEDING TIME / EDIT FEEDING TIME) + the entry being edited (identity).
+lv_obj_t *s_ed_title = nullptr;
+bool s_edit_mode = false;
+uint8_t s_edit_oh = 0;
+uint8_t s_edit_om = 0;
 
 // History overlay (C1)
 lv_obj_t *s_hist_overlay = nullptr;
@@ -326,8 +332,10 @@ void toastTimerCb(lv_timer_t *t);
 void spinMinusCb(lv_event_t *e);
 void spinPlusCb(lv_event_t *e);
 void openEditor();
+void openEditorForEntry(uint8_t hour, uint8_t minute); // v1.11.5 tap-to-edit
 void closeEditor();
 void addBtnCb(lv_event_t *e);
+void editEntryCb(lv_event_t *e); // v1.11.5: tap a schedule card -> edit it
 void updateNextFeedUi();
 void buildTokenOverlay();
 void openTokenOverlay();
@@ -781,6 +789,14 @@ void addBtnCb(lv_event_t *e) {
   openEditor();
 }
 
+// v1.11.5 (tap-to-edit): a schedule card was tapped. Resolve the entry from
+// the UI snapshot (s_rb — the same data the list was rendered from; scheduler
+// internals are loop()-only) and open the editor prefilled in edit mode.
+void editEntryCb(lv_event_t *e) {
+  const uintptr_t packed = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  openEditorForEntry((uint8_t)((packed >> 8) & 0xFF), (uint8_t)(packed & 0xFF));
+}
+
 // ---------------------------------------------------------------------------
 // v1.9.0 feeding-feature callbacks (all enqueue; loop() applies + persists)
 // ---------------------------------------------------------------------------
@@ -890,9 +906,13 @@ void histCloseCb(lv_event_t *e) {
 void editorSaveCb(lv_event_t *e) {
   (void)e;
   UiEvent ev;
-  ev.type = UI_EVT_SCHED_ADD;
+  // v1.11.5: EDIT mode updates the original entry (identity-safe via the
+  // old HH:MM in c/d); NEW mode appends (UI_EVT_SCHED_ADD, a/b only).
+  ev.type = s_edit_mode ? UI_EVT_SCHED_UPDATE : UI_EVT_SCHED_ADD;
   ev.a = (uint8_t)lv_roller_get_selected(s_r_hour);
   ev.b = (uint8_t)lv_roller_get_selected(s_r_min);
+  ev.c = s_edit_oh; // original identity (edit mode only; 0:0 in NEW mode)
+  ev.d = s_edit_om;
   ev.grams = (uint16_t)lv_spinbox_get_value(s_sb_sec); // v1.10.0: grams
   // P5: pack target tanks from the editor checkboxes (missing checkboxes =
   // single-tank setup = tank 1). Default: every checkbox unchecked row would
@@ -1175,6 +1195,10 @@ struct TankRbReq {
 static TankRbReq s_rb;
 
 void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n);
+// v1.11.5 tap-to-edit: shared NEW/EDIT editor open path (declared here because
+// the signatures carry SchedSnapEntry, defined just above).
+void openEditorForEntry(uint8_t hour, uint8_t minute);
+void openEditorInternal(const SchedSnapEntry *en);
 
 static void fillSchedSnap() {
   s_rb.schedN = 0;
@@ -1243,7 +1267,10 @@ void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n) {
 
   if (n == 0) {
     lv_obj_t *empty = lv_label_create(s_sched_list);
-    lv_label_set_text(empty, "No feeding times yet. Tap ADD FEEDING TIME below.");
+    lv_label_set_text(
+        empty,
+        "No feeding times yet. Tap ADD FEEDING TIME below.\n"
+        "(Entries can be edited later by tapping them.)");
     lv_obj_set_style_text_color(empty, lv_color_hex(C_MUTED), 0);
     lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
     return;
@@ -1256,6 +1283,8 @@ void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n) {
     lv_obj_set_size(card, lv_pct(100), 76);
     lv_obj_set_style_radius(card, 12, 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(C_CARD_HI),
+                              LV_STATE_PRESSED); // v1.11.5 tap-to-edit affordance
     lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_pad_ver(card, 6, 0);
@@ -1264,6 +1293,14 @@ void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n) {
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
+    // v1.11.5: tap the card (anywhere outside the switch / skip / trash
+    // controls, which swallow their own taps — no event bubbling in v8) to
+    // edit the entry. Identity (h<<8|m) travels in user_data, immune to
+    // index shifts like trashCb / enableSwitchCb. Drag-scrolling the list
+    // suppresses CLICKED, so scrolling never opens the editor.
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(card, editEntryCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)((en.hour << 8) | en.minute));
 
     char buf[96];
     char hm[12];
@@ -1348,22 +1385,53 @@ void rebuildScheduleList(const SchedSnapEntry *entries, uint8_t n) {
   }
 }
 
-void openEditor() {
-  if (!s_editor) return;
-  lv_roller_set_selected(s_r_hour, 7, LV_ANIM_OFF);
-  lv_roller_set_selected(s_r_min, 30, LV_ANIM_OFF);
-  spinSetValueQuiet(s_sb_sec, prefs::getDefaultGrams()); // v1.10.0: grams
+void openEditor() { openEditorInternal(nullptr); }
 
-  // v1.9.0 (A1): all day chips checked = daily (the default). CHECKABLE
-  // chips restyle themselves via the LV_STATE_CHECKED style selectors.
-  for (int i = 0; i < 7; i++) {
-    if (s_ed_day_btn[i]) {
-      lv_obj_add_state(s_ed_day_btn[i], LV_STATE_CHECKED);
+/** v1.11.5 (tap-to-edit): open the editor prefilled from the list snapshot.
+ *  Falls back to the plain new-entry editor when the identity is stale (the
+ *  entry was removed by the dashboard while the list was on screen). */
+void openEditorForEntry(uint8_t hour, uint8_t minute) {
+  for (uint8_t i = 0; i < s_rb.schedN; i++) {
+    const SchedSnapEntry &en = s_rb.sched[i];
+    if (en.hour == hour && en.minute == minute) {
+      openEditorInternal(&en);
+      return;
     }
   }
-  // v1.9.0 (A2): clear the per-tank pulse overrides
+  openEditorInternal(nullptr);
+}
+
+/** Shared editor open path. @p en == nullptr => NEW mode (defaults). */
+void openEditorInternal(const SchedSnapEntry *en) {
+  if (!s_editor) return;
+  s_edit_mode = (en != nullptr);
+  s_edit_oh = en ? en->hour : 0;
+  s_edit_om = en ? en->minute : 0;
+  if (s_ed_title)
+    lv_label_set_text(s_ed_title, s_edit_mode ? "EDIT FEEDING TIME"
+                                              : "NEW FEEDING TIME");
+
+  // Rollers + grams: the entry's values when editing, defaults when new.
+  lv_roller_set_selected(s_r_hour, en ? en->hour : 7, LV_ANIM_OFF);
+  lv_roller_set_selected(s_r_min, en ? en->minute : 30, LV_ANIM_OFF);
+  spinSetValueQuiet(s_sb_sec,
+                    en ? en->grams : prefs::getDefaultGrams()); // v1.10.0: grams
+
+  // v1.9.0 (A1): day chips — entry's mask when editing, daily when new.
+  // CHECKABLE chips restyle themselves via the LV_STATE_CHECKED selectors.
+  for (int i = 0; i < 7; i++) {
+    if (s_ed_day_btn[i]) {
+      const bool on = en ? ((en->days & (uint8_t)(1u << i)) != 0) : true;
+      if (on)
+        lv_obj_add_state(s_ed_day_btn[i], LV_STATE_CHECKED);
+      else
+        lv_obj_clear_state(s_ed_day_btn[i], LV_STATE_CHECKED);
+    }
+  }
+  // v1.9.0 (A2): per-tank gram overrides (0 = inherit the shared grams)
   for (int i = 0; i < CATFISH_MAX_TANKS; i++) {
-    if (s_ed_sec_sb[i]) spinSetValueQuiet(s_ed_sec_sb[i], 0);
+    if (s_ed_sec_sb[i])
+      spinSetValueQuiet(s_ed_sec_sb[i], en ? en->gramTank[i] : 0);
   }
   // v1.9.0 (A2): show the per-tank row only in multi-tank setups
   if (s_ed_secs_row) {
@@ -1373,8 +1441,9 @@ void openEditor() {
       lv_obj_add_flag(s_ed_secs_row, LV_OBJ_FLAG_HIDDEN);
   }
 
-  // P5: rebuild the tank checkbox column for the current count (all checked
-  // = "feed every configured tank"; hidden entirely for a single tank).
+  // P5: rebuild the tank checkbox column for the current count. Editing
+  // checks exactly the entry's tank mask; new entries check every tank
+  // (= "feed every configured tank"). Hidden entirely for a single tank.
   if (s_ed_tank_row) {
     lv_obj_clean(s_ed_tank_row);
     for (int i = 0; i < CATFISH_MAX_TANKS; i++) s_ed_tank_cb[i] = nullptr;
@@ -1386,7 +1455,8 @@ void openEditor() {
       for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
         lv_obj_t *cb = lv_checkbox_create(s_ed_tank_row);
         lv_checkbox_set_text(cb, s_tank_names[i]);
-        lv_obj_add_state(cb, LV_STATE_CHECKED);
+        const bool on = en ? ((en->tanks & (uint8_t)(1u << i)) != 0) : true;
+        if (on) lv_obj_add_state(cb, LV_STATE_CHECKED);
         lv_obj_set_style_text_font(cb, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(cb, lv_color_hex(C_TEXT), 0);
         s_ed_tank_cb[i] = cb;
@@ -1624,8 +1694,15 @@ void buildSchedule() {
                            C_TEXT, C_CARD_HI, lv_pct(34), 64);
   lv_obj_add_event_cb(hist, histBtnCb, LV_EVENT_CLICKED, nullptr);
 
+  // v1.11.5 FIX (overlap): the two buttons were lv_pct(34) + lv_pct(66) =
+  // 100% of the row PLUS the 12px flex column gap — the ADD button overflowed
+  // the content area by 12px and its right edge collided with the screen
+  // bezel ("ADD FEEDING TIME right side is overlapping"). The add button is
+  // now content-sized + flex-grow: it fills exactly the remaining width
+  // (100% - 34% - gap) with no overflow, at any padding.
   lv_obj_t *add = makeBtn(btnrow, LV_SYMBOL_PLUS "  ADD FEEDING TIME", C_CARD,
-                          C_AMBER, C_CARD_HI, lv_pct(66), 64);
+                          C_AMBER, C_CARD_HI, 0, 64);
+  lv_obj_set_flex_grow(add, 1);
   lv_obj_set_style_border_color(add, lv_color_hex(C_AMBER), 0);
   lv_obj_set_style_border_width(add, 2, 0);
   lv_obj_add_event_cb(add, addBtnCb, LV_EVENT_CLICKED, nullptr);
@@ -1652,6 +1729,7 @@ void buildSchedule() {
   lv_obj_set_scroll_dir(card, LV_DIR_VER);
 
   lv_obj_t *title = lv_label_create(card);
+  s_ed_title = title; // v1.11.5: text swaps NEW/EDIT FEEDING TIME at open
   lv_label_set_text(title, "NEW FEEDING TIME");
   lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(title, lv_color_hex(C_AMBER), 0);

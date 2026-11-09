@@ -701,11 +701,11 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
 }
 
 /** Apply a schedule change: persist + rebuild list + refresh next-feed. */
-static void afterScheduleChange(bool removed) {
+static void afterScheduleChange(const char *verb) {
   feed_scheduler::flushIfDirty();
   lvgl_port_lock(-1);
   ui_schedule_refresh();
-  ui_toast(removed ? "Feeding time removed" : "Feeding time added");
+  ui_toast(String("Feeding time ") + verb);
   ui_editor_close(); // no-op unless the editor overlay is open
   lvgl_port_unlock();
   refreshNextFeedUi();
@@ -936,10 +936,35 @@ static void handleUiEvent(const UiEvent &ev) {
       t.days = ev.days; // v1.9.0 (A1): weekday mask (0 = clamp to daily)
       for (int k = 0; k < 4; k++) t.gramTank[k] = ev.gramTank[k]; // A2 (grams)
       if (feed_scheduler::add(t)) {
-        afterScheduleChange(false);
+        afterScheduleChange("added");
       } else {
         uiToast(full ? "Schedule full (max 8)" : "Time already scheduled");
         Serial.println("[FEED] schedule add rejected");
+      }
+      break;
+    }
+
+    case UI_EVT_SCHED_UPDATE: {
+      // v1.11.5 (tap-to-edit): a/b = new HH:MM, c/d = original identity.
+      // updateByIdentity is all-or-nothing (duplicate HH:MM vs OTHER entries
+      // is rejected with the schedule untouched) and keeps the enabled flag.
+      FeedTime t{};
+      t.hour = ev.a;
+      t.minute = ev.b;
+      t.grams = ev.grams;
+      t.tanks = ev.tankMask;
+      t.days = ev.days;
+      for (int k = 0; k < 4; k++) t.gramTank[k] = ev.gramTank[k];
+      if (feed_scheduler::updateByIdentity(ev.c, ev.d, t)) {
+        // A moved identity invalidates its fired-map stamp (catch-up scan).
+        feed_state::pruneFired(feed_scheduler::getAll(),
+                               feed_scheduler::getCount());
+        afterScheduleChange("updated");
+      } else {
+        uiToast("Time already scheduled"); // takes the LVGL lock itself
+        Serial.printf("[FEED] schedule update %02u:%02u -> %02u:%02u rejected\n",
+                      (unsigned)ev.c, (unsigned)ev.d, (unsigned)ev.a,
+                      (unsigned)ev.b);
       }
       break;
     }
@@ -963,7 +988,7 @@ static void handleUiEvent(const UiEvent &ev) {
       if (feed_scheduler::removeByIdentity(ev.a, ev.b)) {
         feed_state::pruneFired(feed_scheduler::getAll(),
                                feed_scheduler::getCount());
-        afterScheduleChange(true);
+        afterScheduleChange("removed");
         if (found) {
           UiEvent uv;
           uv.type = UI_EVT_SCHED_RESTORE;
@@ -1527,9 +1552,36 @@ static void qemuSmokePump() {
       break;
     case 8:
       qemuSmokeLog("VACATION cleared", !prefs::getVacation());
-      Serial.println("[QEMU] SMOKE PASS");
+      {
+        UiEvent ev{}; // v1.11.5 tap-to-edit: move 08:00 -> 09:15, 15 g -> 25 g
+        ev.type = UI_EVT_SCHED_UPDATE;
+        ev.a = 9;
+        ev.b = 15;
+        ev.c = 8; // original identity (the entry added in step 1)
+        ev.d = 0;
+        ev.grams = 25;
+        ev.tankMask = 1;
+        qemuSmokeSend(ev);
+      }
       s_step = 9;
       break;
+    case 9: {
+      // 09:15 @ 25 g must exist, 08:00 must be gone; total stays at 3.
+      bool moved = false;
+      bool oldGone = true;
+      const int n = feed_scheduler::getCount();
+      const FeedTime *all = feed_scheduler::getAll();
+      for (int i = 0; i < n; i++) {
+        if (all[i].hour == 9 && all[i].minute == 15 && all[i].grams == 25)
+          moved = true;
+        if (all[i].hour == 8 && all[i].minute == 0) oldGone = false;
+      }
+      qemuSmokeLog("SCHED_UPDATE rewrote 08:00 -> 09:15 (25 g)",
+                   moved && oldGone && n == 3);
+      Serial.println("[QEMU] SMOKE PASS");
+      s_step = 10;
+      break;
+    }
     default: {
       // Steady-state heartbeat: keep running (dim timers, LVGL rebuilds,
       // 1 Hz housekeeping) so late crashes still fail the run.
