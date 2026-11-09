@@ -243,6 +243,7 @@ jobs:
       contents: read
       pages: write
       id-token: write
+      actions: write # delete this run's stale github-pages artifacts (re-run safety)
     concurrency:
       group: pages
       cancel-in-progress: false
@@ -492,6 +493,23 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v6
+
+      - name: Remove stale Pages artifacts (re-run idempotency)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Re-running a failed deploy leaves the previous attempt's
+          # "github-pages" artifact behind (upload-pages-artifact has no
+          # overwrite), and deploy-pages then aborts with "Multiple artifacts
+          # named github-pages were unexpectedly found". Delete same-name
+          # artifacts from THIS run before uploading a fresh one so a
+          # re-run-failed-jobs retry is always deployable.
+          ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "github-pages") | .id' 2>/dev/null || true)
+          for id in $ids; do
+            echo "deleting stale github-pages artifact $id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" || true
+          done
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
