@@ -27,6 +27,7 @@
 #include "lvgl_v8_port.h"
 #include "esp_display_panel.hpp"
 
+#include "diag.h"
 #include "feed_scheduler.h"
 #include "feed_state.h"
 #include "net_wifi.h"
@@ -1550,6 +1551,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[SYS] Catfish Feeder display unit booting (v" CATFISH_APP_VERSION ")");
+  diag::heapReport("boot");
 
   // --- persistence ---
   prefs::begin();
@@ -1674,6 +1676,7 @@ void setup() {
   ui_boot_splash_done(); // v1.10.1: real UI is loaded — free the splash
   lvgl_port_unlock();
   refreshNextFeedUi();
+  diag::heapReport("after-ui");
 
   // --- background tasks ---
   if (!net_worker::begin()) {
@@ -1694,6 +1697,7 @@ void setup() {
   s_t_30s = millis();
   s_t_60s = millis() - 45000UL;
 
+  diag::heapReport("setup-complete");
   Serial.println("[SYS] setup complete");
 }
 

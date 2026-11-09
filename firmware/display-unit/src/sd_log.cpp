@@ -95,7 +95,22 @@ static bool mountAttempt(uint32_t hz) {
   SPI.begin(SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, -1);
   const bool ok = SD.begin(SD_PIN_DUMMY_CS, SPI, hz);
   csDeselect();
-  if (!ok) {
+  // v1.11.4: SD.begin() alone can be fooled. The TF slot shares the SPI bus
+  // with other devices and its real CS is on the expander — with a dead or
+  // absent card, MISO floats and a mount can "succeed" against garbage bus
+  // responses (observed: begin() true, then "0 MB total" and every fopen
+  // failing). A real mount always reports a nonzero card type and capacity.
+  // Rejecting the phantom mount matters twice over: logFeed() silently drops
+  // rows for a card that "exists", and s_state = Mounted would permanently
+  // block the 10 s remount() recheck that recovers a hot-inserted card.
+  bool healthy = ok;
+  if (healthy) {
+    csSelect();
+    healthy = (SD.cardType() != CARD_NONE) && (SD.totalBytes() > 0);
+    csDeselect();
+  }
+  if (!healthy) {
+    if (ok) SD.end(); // release the phantom mount's VFS/FATFS buffers
     spi_bus_guard::give();
     return false;
   }

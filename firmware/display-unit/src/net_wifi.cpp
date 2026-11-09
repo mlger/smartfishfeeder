@@ -9,6 +9,8 @@
 #include <WiFiManager.h>
 #include <time.h>
 
+#include "diag.h"
+
 #define WIFI_AP_NAME       "CatfishFeeder-Setup"
 #define WIFI_HOSTNAME      "catfishfeeder"
 #define WIFI_MONITOR_MS    5000
@@ -80,6 +82,9 @@ void wifiTask(void * /*param*/) {
 
   Serial.printf("[NET] autoConnect (AP '%s', portal %d s)...\n",
                 WIFI_AP_NAME, WIFI_PORTAL_TIMEOUT_S);
+  // v1.11.4: this is where esp_wifi_init() used to fail with ESP_ERR_NO_MEM —
+  // the last heap snapshot before the WiFi driver claims its task/buffers.
+  diag::heapReport("pre-wifi-init");
   if (wm.autoConnect(WIFI_AP_NAME)) {
     applyConnectedState();
     publish();

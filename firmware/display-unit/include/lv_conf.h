@@ -46,7 +46,15 @@
  *=========================*/
 
 /*1: use custom malloc/free, 0: use the built-in `lv_mem_alloc()` and `lv_mem_free()`*/
-#define LV_MEM_CUSTOM 0
+/* v1.11.4: widget pool moved to PSRAM via catfish_lv_mem.h. The built-in
+   pool was a 160 KB static array in internal DRAM; with ~239 KB static +
+   ~58 KB of task stacks the internal heap bottomed out below esp_wifi_init()'s
+   ~60 KB requirement — esp_wifi_init() failed with ESP_ERR_NO_MEM and the
+   WiFi setup portal never appeared (WiFi task/event task couldn't even be
+   created). Widget metadata is cache-friendly enough in PSRAM; the render
+   path (direct-mode buffers) was already PSRAM. Pool SIZE history kept below
+   for reference: */
+#define LV_MEM_CUSTOM 1
 #if LV_MEM_CUSTOM == 0
     /*Size of the memory available for `lv_mem_alloc()` in bytes (>= 2kB)*/
     /* v1.8.2: 64K ran tight for the multi-tank UI (~250 objects + overlays +
@@ -67,10 +75,13 @@
     #endif
 
 #else       /*LV_MEM_CUSTOM*/
-    #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>   /*Header for the dynamic memory function*/
-    #define LV_MEM_CUSTOM_ALLOC   malloc
-    #define LV_MEM_CUSTOM_FREE    free
-    #define LV_MEM_CUSTOM_REALLOC realloc
+    /* v1.11.4: PSRAM pool with internal fallback (see catfish_lv_mem.h). The
+       fallback keeps the QEMU smoke build (no PSRAM emulation in the emulator)
+       and PSRAM-less boards working. */
+    #define LV_MEM_CUSTOM_INCLUDE "catfish_lv_mem.h"
+    #define LV_MEM_CUSTOM_ALLOC   catfish_lv_mem_alloc
+    #define LV_MEM_CUSTOM_FREE    catfish_lv_mem_free
+    #define LV_MEM_CUSTOM_REALLOC catfish_lv_mem_realloc
 #endif     /*LV_MEM_CUSTOM*/
 
 /*Number of the intermediate memory buffer used during rendering and other internal processing mechanisms.
