@@ -206,8 +206,21 @@ bool s_edit_mode = false;
 uint8_t s_edit_oh = 0;
 uint8_t s_edit_om = 0;
 
-// History overlay (C1)
-lv_obj_t *s_hist_overlay = nullptr;
+// v1.11.6: schedule page tabs (FEEDS / HISTORY / HOPPER / CALIB) — one page
+// container per tab inside the schedule content column; HIDDEN except active.
+static lv_obj_t *s_tab_btns[4] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_tab_pages[4] = {nullptr, nullptr, nullptr, nullptr};
+static uint8_t s_tab_active = 0;
+
+// v1.11.6: CALIB tab rows (per-tank food-rate calibration test)
+static lv_obj_t *s_calib_rows = nullptr;
+static lv_obj_t *s_calib_name_lbl[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_calib_rate_lbl[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_calib_meas_sb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static uint8_t s_calib_test_s[CATFISH_MAX_TANKS] = {2, 2, 2, 2}; // last test seconds per tank
+
+// History (C1) — v1.11.6: widgets moved from the tap-in overlay into the
+// schedule page's HISTORY tab (always built, shown/hidden by the tab bar).
 lv_obj_t *s_hist_lbl = nullptr;
 // v1.11.0: grams-per-day bar chart over the last 7 days
 lv_obj_t *s_hist_chart = nullptr;
@@ -376,8 +389,12 @@ void otaOpenSwitchCb(lv_event_t *e); // v1.10.1: Settings OTA open switch
 void skipOnceCb(lv_event_t *e);
 void refillCb(lv_event_t *e);
 void policySaveCb(lv_event_t *e);
-void histBtnCb(lv_event_t *e);
-void histCloseCb(lv_event_t *e);
+void schedTabShow(uint8_t idx);
+void schedTabCb(lv_event_t *e);
+void calibTestCb(lv_event_t *e);
+void calibSetCb(lv_event_t *e);
+void rebuildCalibRows();
+void refreshCalibRows();
 void rebuildFoodRows();
 void refreshFoodRows();
 const char *fmtDaysMask(uint8_t days, char *buf, size_t cap);
@@ -891,16 +908,64 @@ void policySaveCb(lv_event_t *e) {
   uiEventSend(ev); // loop() persists + refreshes the food card
 }
 
-void histBtnCb(lv_event_t *e) {
-  (void)e;
-  if (!s_hist_overlay) return;
-  lv_obj_clear_flag(s_hist_overlay, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_move_foreground(s_hist_overlay);
+// ---------------------------------------------------------------------------
+// v1.11.6: schedule page tab bar (FEEDS / HISTORY / HOPPER / CALIB)
+// ---------------------------------------------------------------------------
+void schedTabShow(uint8_t idx) {
+  if (idx > 3) idx = 0;
+  s_tab_active = idx;
+  for (uint8_t i = 0; i < 4; i++) {
+    if (s_tab_pages[i]) {
+      if (i == idx) lv_obj_clear_flag(s_tab_pages[i], LV_OBJ_FLAG_HIDDEN);
+      else lv_obj_add_flag(s_tab_pages[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_tab_btns[i]) {
+      lv_obj_set_style_bg_color(s_tab_btns[i],
+                                lv_color_hex(i == idx ? C_AMBER : C_CARD), 0);
+      lv_obj_set_style_text_color(s_tab_btns[i],
+                                  lv_color_hex(i == idx ? C_INK : C_TEXT), 0);
+    }
+  }
 }
 
-void histCloseCb(lv_event_t *e) {
-  (void)e;
-  if (s_hist_overlay) lv_obj_add_flag(s_hist_overlay, LV_OBJ_FLAG_HIDDEN);
+void schedTabCb(lv_event_t *e) {
+  const uintptr_t idx = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  schedTabShow((uint8_t)idx);
+}
+
+// v1.11.6: CALIB tab test dispense — runs the relay for EXACT wire seconds
+// (no grams->seconds rounding through the tank rate). user_data packs
+// (tank << 8) | seconds.
+void calibTestCb(lv_event_t *e) {
+  const uintptr_t pack = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  const uint8_t tank = (uint8_t)(pack >> 8);
+  const uint8_t sec = (uint8_t)(pack & 0xFF);
+  if (tank < 1 || tank > CATFISH_MAX_TANKS || sec < 1) return;
+  s_calib_test_s[tank - 1] = sec; // remembered for the SET step
+  UiEvent ev;
+  ev.type = UI_EVT_CALIB_TEST;
+  ev.a = tank;
+  ev.b = sec;
+  uiEventSend(ev); // loop() routes it through the normal feed path
+}
+
+// v1.11.6: CALIB tab SET — the weighed grams from the test run become the
+// tank's food rate: gps = round(measured / testSeconds). Persistence runs in
+// loop() (UI_EVT_CALIB_SET) so NVS writes stay off the LVGL task.
+void calibSetCb(lv_event_t *e) {
+  const uintptr_t idx = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
+  if (idx >= CATFISH_MAX_TANKS || !s_calib_meas_sb[idx]) return;
+  const uint16_t measured = (uint16_t)lv_spinbox_get_value(s_calib_meas_sb[idx]);
+  if (measured == 0) {
+    ui_toast("Weigh the output first");
+    return;
+  }
+  UiEvent ev;
+  ev.type = UI_EVT_CALIB_SET;
+  ev.a = (uint8_t)(idx + 1);
+  ev.b = s_calib_test_s[idx] ? s_calib_test_s[idx] : 2;
+  ev.grams = measured;
+  uiEventSend(ev);
 }
 
 void editorSaveCb(lv_event_t *e) {
@@ -1228,6 +1293,7 @@ static void tanksRebuildExec(void *) {
   rebuildTankChips();
   rebuildTankRows();
   rebuildFoodRows();  // v1.10.0: FOOD card rows follow the tank count too
+  rebuildCalibRows(); // v1.11.6: CALIB tab rows follow count + names
   rebuildScheduleList(s_rb.sched, s_rb.schedN);
   s_spin_prog = false;
   s_rb.pending = false;
@@ -1673,39 +1739,77 @@ void buildSchedule() {
   addNavBar(s_scr[1], 1);
   lv_obj_t *c = addContent(s_scr[1]);
 
-  // scrollable list of feed-time cards (grows to fill remaining height)
-  s_sched_list = lv_obj_create(c);
-  lv_obj_remove_style_all(s_sched_list);
-  lv_obj_set_flex_grow(s_sched_list, 1);
-  lv_obj_set_width(s_sched_list, lv_pct(100));
-  lv_obj_set_flex_flow(s_sched_list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(s_sched_list, 12, 0);
+  // v1.11.6: the schedule page is now 4 tabs — FEEDS / HISTORY / HOPPER /
+  // CALIB. HISTORY left its tap-in overlay (one less tap, always fresh),
+  // the Settings FOOD LEVEL card moved into HOPPER, and CALIB hosts the new
+  // per-tank food-rate calibration test.
+  lv_obj_t *tabs = lv_obj_create(c);
+  lv_obj_remove_style_all(tabs);
+  lv_obj_set_width(tabs, lv_pct(100));
+  lv_obj_set_height(tabs, 48);
+  lv_obj_set_flex_flow(tabs, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_column(tabs, 8, 0);
+  lv_obj_clear_flag(tabs, LV_OBJ_FLAG_SCROLLABLE);
+  static const char *TAB_NAMES[4] = {"FEEDS", "HISTORY", "HOPPER", "CALIB"};
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t *b = makeBtn(tabs, TAB_NAMES[i], C_CARD, C_TEXT, C_CARD_HI, 0, 48);
+    lv_obj_set_flex_grow(b, 1);
+    lv_obj_add_event_cb(b, schedTabCb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+    s_tab_btns[i] = b;
+  }
 
-  // v1.9.0 (C1) + ADD: button row (pinned below the list)
-  lv_obj_t *btnrow = lv_obj_create(c);
-  lv_obj_remove_style_all(btnrow);
-  lv_obj_set_width(btnrow, lv_pct(100));
-  lv_obj_set_height(btnrow, 64);
-  lv_obj_set_flex_flow(btnrow, LV_FLEX_FLOW_ROW);
-  lv_obj_set_style_pad_column(btnrow, 12, 0);
-  lv_obj_clear_flag(btnrow, LV_OBJ_FLAG_SCROLLABLE);
+  // page holder fills the remaining column height; the 4 pages stack inside
+  lv_obj_t *holder = lv_obj_create(c);
+  lv_obj_remove_style_all(holder);
+  lv_obj_set_width(holder, lv_pct(100));
+  lv_obj_set_flex_grow(holder, 1);
+  lv_obj_clear_flag(holder, LV_OBJ_FLAG_SCROLLABLE);
+  for (int i = 0; i < 4; i++) {
+    lv_obj_t *p = lv_obj_create(holder);
+    lv_obj_remove_style_all(p);
+    lv_obj_set_size(p, lv_pct(100), lv_pct(100));
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_tab_pages[i] = p;
+  }
 
-  lv_obj_t *hist = makeBtn(btnrow, LV_SYMBOL_LIST "  HISTORY", C_CARD,
-                           C_TEXT, C_CARD_HI, lv_pct(34), 64);
-  lv_obj_add_event_cb(hist, histBtnCb, LV_EVENT_CLICKED, nullptr);
+  // ---- tab 0: FEEDS — schedule cards + ADD FEEDING TIME ----
+  {
+    lv_obj_t *p = s_tab_pages[0];
+    lv_obj_set_flex_flow(p, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(p, 12, 0);
 
-  // v1.11.5 FIX (overlap): the two buttons were lv_pct(34) + lv_pct(66) =
-  // 100% of the row PLUS the 12px flex column gap — the ADD button overflowed
-  // the content area by 12px and its right edge collided with the screen
-  // bezel ("ADD FEEDING TIME right side is overlapping"). The add button is
-  // now content-sized + flex-grow: it fills exactly the remaining width
-  // (100% - 34% - gap) with no overflow, at any padding.
-  lv_obj_t *add = makeBtn(btnrow, LV_SYMBOL_PLUS "  ADD FEEDING TIME", C_CARD,
-                          C_AMBER, C_CARD_HI, 0, 64);
-  lv_obj_set_flex_grow(add, 1);
-  lv_obj_set_style_border_color(add, lv_color_hex(C_AMBER), 0);
-  lv_obj_set_style_border_width(add, 2, 0);
-  lv_obj_add_event_cb(add, addBtnCb, LV_EVENT_CLICKED, nullptr);
+    // scrollable list of feed-time cards (grows to fill remaining height)
+    s_sched_list = lv_obj_create(p);
+    lv_obj_remove_style_all(s_sched_list);
+    lv_obj_set_flex_grow(s_sched_list, 1);
+    lv_obj_set_width(s_sched_list, lv_pct(100));
+    lv_obj_set_flex_flow(s_sched_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_sched_list, 12, 0);
+
+    // ADD: button row (pinned below the list; HISTORY became a tab in v1.11.6)
+    lv_obj_t *btnrow = lv_obj_create(p);
+    lv_obj_remove_style_all(btnrow);
+    lv_obj_set_width(btnrow, lv_pct(100));
+    lv_obj_set_height(btnrow, 64);
+    lv_obj_set_flex_flow(btnrow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btnrow, 12, 0);
+    lv_obj_clear_flag(btnrow, LV_OBJ_FLAG_SCROLLABLE);
+
+    // v1.11.5 FIX (overlap): the two buttons were lv_pct(34) + lv_pct(66) =
+    // 100% of the row PLUS the 12px flex column gap — the ADD button overflowed
+    // the content area by 12px and its right edge collided with the screen
+    // bezel ("ADD FEEDING TIME right side is overlapping"). The add button is
+    // now content-sized + flex-grow: it fills exactly the remaining width
+    // (100% - 34% - gap) with no overflow, at any padding. v1.11.6: with the
+    // HISTORY button gone it simply fills the whole row.
+    lv_obj_t *add = makeBtn(btnrow, LV_SYMBOL_PLUS "  ADD FEEDING TIME", C_CARD,
+                            C_AMBER, C_CARD_HI, 0, 64);
+    lv_obj_set_flex_grow(add, 1);
+    lv_obj_set_style_border_color(add, lv_color_hex(C_AMBER), 0);
+    lv_obj_set_style_border_width(add, 2, 0);
+    lv_obj_add_event_cb(add, addBtnCb, LV_EVENT_CLICKED, nullptr);
+  }
 
   // init-time direct render (LVGL task, no indev traffic yet)
   fillSchedSnap();
@@ -1907,70 +2011,119 @@ void buildSchedule() {
   lv_obj_set_flex_grow(cancel, 1);
   lv_obj_add_event_cb(cancel, editorCancelCb, LV_EVENT_CLICKED, nullptr);
 
-  // --- v1.9.0 (C1): history overlay (hidden; content pushed via ui_set_history)
-  s_hist_overlay = lv_obj_create(s_scr[1]);
-  lv_obj_remove_style_all(s_hist_overlay);
-  lv_obj_set_size(s_hist_overlay, lv_pct(100), 360);
-  lv_obj_align(s_hist_overlay, LV_ALIGN_TOP_MID, 0, 48);
-  lv_obj_set_style_bg_color(s_hist_overlay, lv_color_hex(C_BG), 0);
-  lv_obj_set_style_bg_opa(s_hist_overlay, LV_OPA_90, 0);
-  lv_obj_add_flag(s_hist_overlay, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(s_hist_overlay, LV_OBJ_FLAG_HIDDEN);
+  // ---- tab 1: HISTORY — chart + list (was the v1.9.0 tap-in overlay) ----
+  {
+    lv_obj_t *p = s_tab_pages[1];
+    lv_obj_t *hcard = makeCard(p, lv_pct(100), lv_pct(100));
+    lv_obj_set_flex_flow(hcard, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(hcard, 8, 0);
+    // chart + 24 lines overflow the card — scroll vertically
+    lv_obj_add_flag(hcard, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(hcard, LV_DIR_VER);
 
-  lv_obj_t *hcard = makeCard(s_hist_overlay, 736, 336);
-  lv_obj_align(hcard, LV_ALIGN_TOP_MID, 0, 12);
-  lv_obj_set_flex_flow(hcard, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(hcard, 8, 0);
-  // v1.11.0: chart + 24 lines overflow the card — scroll vertically
-  lv_obj_add_flag(hcard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scroll_dir(hcard, LV_DIR_VER);
+    lv_obj_t *htitle = lv_label_create(hcard);
+    lv_label_set_text(htitle, "FEED HISTORY (latest 24)");
+    lv_obj_set_style_text_font(htitle, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(htitle, lv_color_hex(C_AMBER), 0);
+    lv_obj_set_style_text_letter_space(htitle, 2, 0);
 
-  lv_obj_t *htitle = lv_label_create(hcard);
-  lv_label_set_text(htitle, "FEED HISTORY (latest 24)");
-  lv_obj_set_style_text_font(htitle, &lv_font_montserrat_16, 0);
-  lv_obj_set_style_text_color(htitle, lv_color_hex(C_AMBER), 0);
-  lv_obj_set_style_text_letter_space(htitle, 2, 0);
+    // v1.11.0: grams-per-day bar chart over the last 7 days (updated in ui_set_history)
+    s_hist_chart = lv_chart_create(hcard);
+    lv_chart_set_type(s_hist_chart, LV_CHART_TYPE_BAR);
+    lv_chart_set_point_count(s_hist_chart, 7);
+    lv_chart_set_div_line_count(s_hist_chart, 0, 0);
+    lv_obj_set_size(s_hist_chart, lv_pct(100), 96);
+    lv_obj_set_style_bg_color(s_hist_chart, lv_color_hex(C_BG_DARK), 0);
+    lv_obj_set_style_bg_opa(s_hist_chart, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_hist_chart, lv_color_hex(C_CARD_HI), 0);
+    lv_obj_set_style_border_width(s_hist_chart, 1, 0);
+    lv_obj_set_style_radius(s_hist_chart, 8, 0);
+    lv_obj_set_style_pad_ver(s_hist_chart, 4, 0);
+    s_hist_ser = lv_chart_add_series(s_hist_chart, lv_color_hex(C_AMBER),
+                                     LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_range(s_hist_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
 
-  // v1.11.0: grams-per-day bar chart over the last 7 days (updated in ui_set_history)
-  s_hist_chart = lv_chart_create(hcard);
-  lv_chart_set_type(s_hist_chart, LV_CHART_TYPE_BAR);
-  lv_chart_set_point_count(s_hist_chart, 7);
-  lv_chart_set_div_line_count(s_hist_chart, 0, 0);
-  lv_obj_set_size(s_hist_chart, lv_pct(100), 96);
-  lv_obj_set_style_bg_color(s_hist_chart, lv_color_hex(C_BG_DARK), 0);
-  lv_obj_set_style_bg_opa(s_hist_chart, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_color(s_hist_chart, lv_color_hex(C_CARD_HI), 0);
-  lv_obj_set_style_border_width(s_hist_chart, 1, 0);
-  lv_obj_set_style_radius(s_hist_chart, 8, 0);
-  lv_obj_set_style_pad_ver(s_hist_chart, 4, 0);
-  s_hist_ser = lv_chart_add_series(s_hist_chart, lv_color_hex(C_AMBER),
-                                   LV_CHART_AXIS_PRIMARY_Y);
-  lv_chart_set_range(s_hist_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    s_hist_days = lv_obj_create(hcard);
+    lv_obj_remove_style_all(s_hist_days);
+    lv_obj_set_size(s_hist_days, lv_pct(100), 16);
+    lv_obj_set_flex_flow(s_hist_days, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_hist_days, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(s_hist_days, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < 7; i++) {
+      lv_obj_t *d = lv_label_create(s_hist_days);
+      lv_label_set_text(d, "-");
+      lv_obj_set_style_text_font(d, &lv_font_montserrat_10, 0);
+      lv_obj_set_style_text_color(d, lv_color_hex(C_MUTED), 0);
+    }
 
-  s_hist_days = lv_obj_create(hcard);
-  lv_obj_remove_style_all(s_hist_days);
-  lv_obj_set_size(s_hist_days, lv_pct(100), 16);
-  lv_obj_set_flex_flow(s_hist_days, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(s_hist_days, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_clear_flag(s_hist_days, LV_OBJ_FLAG_SCROLLABLE);
-  for (int i = 0; i < 7; i++) {
-    lv_obj_t *d = lv_label_create(s_hist_days);
-    lv_label_set_text(d, "-");
-    lv_obj_set_style_text_font(d, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(d, lv_color_hex(C_MUTED), 0);
+    s_hist_lbl = lv_label_create(hcard);
+    lv_label_set_text(s_hist_lbl, "No feed events yet.");
+    lv_obj_set_style_text_font(s_hist_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_hist_lbl, lv_color_hex(C_TEXT), 0);
+    lv_label_set_long_mode(s_hist_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_hist_lbl, lv_pct(100));
   }
 
-  s_hist_lbl = lv_label_create(hcard);
-  lv_label_set_text(s_hist_lbl, "No feed events yet.");
-  lv_obj_set_style_text_font(s_hist_lbl, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(s_hist_lbl, lv_color_hex(C_TEXT), 0);
-  lv_label_set_long_mode(s_hist_lbl, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(s_hist_lbl, lv_pct(100));
+  // ---- tab 2: HOPPER — per-tank food level (moved from Settings FOOD LEVEL) ----
+  {
+    lv_obj_t *p = s_tab_pages[2];
+    lv_obj_t *card = makeCard(p, lv_pct(100), lv_pct(100));
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 8, 0);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    makeTitle(card, "HOPPER");
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(
+        hint,
+        "Estimated from applied feed pulses. Set \"Hopper size\" + "
+        "\"Food rate\" per tank in Settings > TANKS edit, or calibrate "
+        "in the CALIB tab.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
+    s_food_rows = lv_obj_create(card);
+    lv_obj_remove_style_all(s_food_rows);
+    lv_obj_set_width(s_food_rows, lv_pct(100));
+    lv_obj_set_height(s_food_rows, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_food_rows, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_food_rows, 6, 0);
+    lv_obj_t *refill_all =
+        makeBtn(card, LV_SYMBOL_REFRESH "  Refill all", C_CARD, C_AMBER,
+                C_CARD_HI, lv_pct(100), 60);
+    lv_obj_add_event_cb(refill_all, refillCb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)0xFF);
+  }
 
-  lv_obj_t *hclose = makeBtn(hcard, LV_SYMBOL_CLOSE "  Close", C_CARD, C_MUTED,
-                             C_CARD_HI, lv_pct(100), 60);
-  lv_obj_add_event_cb(hclose, histCloseCb, LV_EVENT_CLICKED, nullptr);
+  // ---- tab 3: CALIB — per-tank food-rate calibration test (v1.11.6) ----
+  {
+    lv_obj_t *p = s_tab_pages[3];
+    lv_obj_t *card = makeCard(p, lv_pct(100), lv_pct(100));
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 8, 0);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    makeTitle(card, "CALIBRATION");
+    lv_obj_t *hint = lv_label_create(card);
+    lv_label_set_text(
+        hint,
+        "TEST runs this tank's feeder for the exact time (place a bowl "
+        "under it). Weigh the output, type the grams, then OK - the food "
+        "rate (g/s) is saved and used for every portion on this tank.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, lv_pct(100));
+    s_calib_rows = lv_obj_create(card);
+    lv_obj_remove_style_all(s_calib_rows);
+    lv_obj_set_width(s_calib_rows, lv_pct(100));
+    lv_obj_set_height(s_calib_rows, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_calib_rows, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_calib_rows, 8, 0);
+    rebuildCalibRows();
+  }
+
+  schedTabShow(0); // FEEDS active on entry
 }
 
 void buildSettings() {
@@ -2075,28 +2228,8 @@ void buildSettings() {
   lv_obj_set_style_border_width(pol_save, 2, 0);
   lv_obj_add_event_cb(pol_save, policySaveCb, LV_EVENT_CLICKED, nullptr);
 
-  // -- v1.9.0 (D1): Food level card (per-tank estimator + refill)
-  lv_obj_t *card_food = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
-  lv_obj_set_flex_flow(card_food, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(card_food, 8, 0);
-  makeTitle(card_food, "FOOD LEVEL");
-  lv_obj_t *hint_food = lv_label_create(card_food);
-  lv_label_set_text(
-      hint_food,
-      "Estimated from fed seconds. Set \"Hopper size\" per tank (Settings > TANKS edit).");
-  lv_obj_set_style_text_font(hint_food, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_color(hint_food, lv_color_hex(C_MUTED), 0);
-  s_food_rows = lv_obj_create(card_food);
-  lv_obj_remove_style_all(s_food_rows);
-  lv_obj_set_width(s_food_rows, lv_pct(100));
-  lv_obj_set_height(s_food_rows, LV_SIZE_CONTENT);
-  lv_obj_set_flex_flow(s_food_rows, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(s_food_rows, 6, 0);
-  lv_obj_t *refill_all =
-      makeBtn(card_food, LV_SYMBOL_REFRESH "  Refill all", C_CARD, C_AMBER,
-              C_CARD_HI, lv_pct(100), 60);
-  lv_obj_add_event_cb(refill_all, refillCb, LV_EVENT_CLICKED,
-                      (void *)(uintptr_t)0xFF);
+  // v1.11.6: the FOOD LEVEL card moved to the Schedule page's HOPPER tab
+  // (one place for hopper size/left/level; LOW FOOD % stays in policy above).
 
   // -- Display card (backlight + clock format rows)
   lv_obj_t *card_disp = makeCard(list, lv_pct(100), LV_SIZE_CONTENT);
@@ -3260,12 +3393,17 @@ void refreshFoodRows() {
         lv_label_set_text(pct, buf);
       }
       if (used) {
-        if (s_food_gps[i] > 0 && s_food_cap[i] > s_food_used[i]) {
-          const uint32_t g = ((uint32_t)(s_food_cap[i] - s_food_used[i]) *
-                              s_food_gps[i]);
-          snprintf(buf, sizeof(buf), "~%lu g left", (unsigned long)g);
+        // v1.11.6 FIX (food level accuracy): cap/used are GRAMS since v1.10.0.
+        // The v1.9.0-era formula multiplied the gram delta by the tank's g/s
+        // rate again — a 2541 g hopper at 37 g/s displayed "~94017 g left".
+        // Grams left is simply capacity - used; rates live in the CALIB tab.
+        if (s_food_cap[i] > s_food_used[i]) {
+          snprintf(buf, sizeof(buf), "~%lu g left  (%lu/%lu g)",
+                   (unsigned long)(s_food_cap[i] - s_food_used[i]),
+                   (unsigned long)s_food_used[i], (unsigned long)s_food_cap[i]);
         } else if (s_food_used[i] > 0) {
-          snprintf(buf, sizeof(buf), "%lu s fed", (unsigned long)s_food_used[i]);
+          snprintf(buf, sizeof(buf), "%lu/%lu g fed",
+                   (unsigned long)s_food_used[i], (unsigned long)s_food_cap[i]);
         } else {
           buf[0] = '\0';
         }
@@ -3299,6 +3437,91 @@ void refreshFoodRows() {
       char buf[24];
       snprintf(buf, sizeof(buf), "Food: %u%%", (unsigned)p);
       lv_label_set_text(s_food_home_lbl, buf);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.11.6: CALIB tab rows — per-tank food-rate calibration test
+// (Schedule > CALIB). Each row: [name + rate] [TEST 2 s] [TEST 5 s]
+// [measured g] [OK]. The test runs the relay for EXACT seconds; the weighed
+// grams become the tank's g/s rate via UI_EVT_CALIB_SET in loop().
+// ---------------------------------------------------------------------------
+void rebuildCalibRows() {
+  if (!s_calib_rows) return;
+  lv_obj_clean(s_calib_rows);
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    s_calib_name_lbl[i] = nullptr;
+    s_calib_rate_lbl[i] = nullptr;
+    s_calib_meas_sb[i] = nullptr;
+  }
+  for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
+    lv_obj_t *row = lv_obj_create(s_calib_rows);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 56);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    // name + rate column (grows; rate line repainted by refreshCalibRows)
+    lv_obj_t *col = lv_obj_create(row);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_flex_grow(col, 1);
+    lv_obj_set_height(col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, 2, 0);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *nm = lv_label_create(col);
+    lv_label_set_text(nm, s_tank_names[i]);
+    lv_obj_set_style_text_font(nm, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(nm, lv_color_hex(C_TEXT), 0);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(nm, lv_pct(100));
+    lv_obj_t *rate = lv_label_create(col);
+    lv_label_set_text(rate, "--");
+    lv_obj_set_style_text_font(rate, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(rate, lv_color_hex(C_MUTED), 0);
+    s_calib_name_lbl[i] = nm;
+    s_calib_rate_lbl[i] = rate;
+
+    // TEST 2 s / TEST 5 s — exact wire seconds, no rate rounding
+    static const uint8_t TEST_S[2] = {2, 5};
+    for (int k = 0; k < 2; k++) {
+      char lbl[12];
+      snprintf(lbl, sizeof(lbl), "TEST %u s", (unsigned)TEST_S[k]);
+      lv_obj_t *b = makeBtn(row, lbl, C_CARD, C_AMBER, C_CARD_HI, 104, 56);
+      lv_obj_add_event_cb(b, calibTestCb, LV_EVENT_CLICKED,
+                          (void *)(uintptr_t)(((i + 1) << 8) | TEST_S[k]));
+    }
+
+    // measured grams (0..2000 g, 4 digits) + OK
+    lv_obj_t *sb = makeSpinbox(row, 0, 2000, 0, 96, 56);
+    s_calib_meas_sb[i] = sb;
+    lv_obj_t *ok = makeBtn(row, LV_SYMBOL_OK, C_CARD, C_AMBER, C_CARD_HI, 56, 56);
+    lv_obj_add_event_cb(ok, calibSetCb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+  }
+  refreshCalibRows();
+}
+
+/** Repaint name + rate lines from prefs (idempotent; LVGL task only). */
+void refreshCalibRows() {
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    if (i >= s_tank_count) {
+      // rows beyond the configured count were cleaned up by rebuildCalibRows
+      continue;
+    }
+    if (s_calib_name_lbl[i])
+      lv_label_set_text(s_calib_name_lbl[i], s_tank_names[i]);
+    if (s_calib_rate_lbl[i]) {
+      uint16_t gps = prefs::getTankGps(i + 1);
+      const bool nominal = (gps == 0);
+      if (nominal) gps = CATFISH_DEFAULT_GPS;
+      char buf[44];
+      snprintf(buf, sizeof(buf), "%u g/s%s \xE2\x80\xA2 1 s = %u g",
+               (unsigned)gps, nominal ? " (nominal)" : "", (unsigned)gps);
+      lv_label_set_text(s_calib_rate_lbl[i], buf);
     }
   }
 }
@@ -4177,10 +4400,14 @@ void ui_set_food(uint8_t count, const uint8_t pct[CATFISH_MAX_TANKS],
   if (s_food_rows && s_food_rows_count != count) {
     // keep the current tank names in sync via s_tank_names (ui_tanks_rebuild)
     rebuildFoodRows();
+    rebuildCalibRows(); // v1.11.6: keep the CALIB tab rows in step
     changed = true;
   }
   if (changed || s_food_rows_count == count) refreshFoodRows();
 }
+
+/** Public hook: loop() repaints the CALIB rate labels after a set/tank edit. */
+void ui_refresh_calib() { refreshCalibRows(); }
 
 void ui_set_history(const String &json) {
   if (!s_hist_lbl) return;

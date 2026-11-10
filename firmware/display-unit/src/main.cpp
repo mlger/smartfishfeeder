@@ -830,6 +830,60 @@ static void handleUiEvent(const UiEvent &ev) {
       Serial.printf("[FEED] hopper refill (tank 0x%02X)\n", (unsigned)ev.a);
       break;
 
+    case UI_EVT_CALIB_TEST: {
+      // v1.11.6: Schedule > CALIB test dispense — runs ONE tank for EXACT
+      // wire seconds (no grams->seconds rounding through the tank rate, so
+      // the weighed output pins the rate down). Human at the panel: SRC_TOUCH
+      // passes the policy gate; the pulse lands in history + hopper usage
+      // like any manual feed (it really consumed feed).
+      const uint8_t tank = ev.a;
+      const uint8_t sec = ev.b;
+      if (tank < 1 || tank > relay_client::MAX_TANKS || sec < 1 || sec > 30)
+        break;
+      const uint8_t mask = (uint8_t)(1u << (tank - 1));
+      uint8_t secPerTank[4] = {0, 0, 0, 0};
+      secPerTank[tank - 1] = sec;
+      const uint16_t echoG =
+          catfishSecondsToGrams(sec, prefs::getTankGps(tank)); // bookkeeping
+      if (!net_wifi::wifi_is_connected()) {
+        uiToast("WiFi not connected");
+#if CATFISH_QEMU
+        g_qemu_wifi_aborts++; // smoke test asserts this abort path ran
+#endif
+        break;
+      }
+      if (net_worker::enqueueFeed(echoG, secPerTank, true, 0, 0, false, mask)) {
+        uiToast(String("Calib test: Tank ") + tank + " \xE2\x80\xA2 " + sec +
+                " s - weigh the output");
+        Serial.printf("[FEED] calib test: tank %u for %u s\n",
+                      (unsigned)tank, (unsigned)sec);
+      } else {
+        uiToast("Feeder busy - try again");
+      }
+      break;
+    }
+
+    case UI_EVT_CALIB_SET: {
+      // v1.11.6: weighed test output -> tank food rate. gps = round(g/s);
+      // 0 would mean "nominal" so the result clamps to >= 1.
+      const uint8_t tank = ev.a;
+      const uint8_t sec = ev.b ? ev.b : 2;
+      if (tank < 1 || tank > relay_client::MAX_TANKS || ev.grams == 0) break;
+      uint32_t gps =
+          ((uint32_t)ev.grams + (uint32_t)sec / 2u) / (uint32_t)sec;
+      if (gps < 1) gps = 1;
+      if (gps > 100) gps = 100;
+      prefs::setTankGps(tank, (uint16_t)gps);
+      lvgl_port_lock(-1);
+      ui_refresh_calib();
+      lvgl_port_unlock();
+      uiToast(String("Tank ") + tank + " rate: " + (unsigned)gps + " g/s");
+      Serial.printf("[FEED] calib set: tank %u = %u g in %u s -> %u g/s\n",
+                    (unsigned)tank, (unsigned)ev.grams, (unsigned)sec,
+                    (unsigned)gps);
+      break;
+    }
+
     case UI_EVT_GUARD_CFG:
       // v1.9.0 (F3/D1): feeding-policy card saved (single writer persists all).
       prefs::setMinGapMin(ev.a);
@@ -1578,10 +1632,40 @@ static void qemuSmokePump() {
       }
       qemuSmokeLog("SCHED_UPDATE rewrote 08:00 -> 09:15 (25 g)",
                    moved && oldGone && n == 3);
-      Serial.println("[QEMU] SMOKE PASS");
+      {
+        // v1.11.6: CALIB tab test dispense — WiFi is down on purpose, so this
+        // must abort cleanly (toast path) without touching the worker queue.
+        UiEvent ev{};
+        ev.type = UI_EVT_CALIB_TEST;
+        ev.a = 1; // tank 1
+        ev.b = 2; // 2 s test
+        qemuSmokeSend(ev);
+      }
       s_step = 10;
       break;
     }
+    case 10:
+      // counter is cumulative: 1 from the step-2 FEED abort + 1 from the
+      // CALIB_TEST abort just injected (both hit the no-WiFi branch).
+      qemuSmokeLog("CALIB_TEST aborts cleanly with no WiFi",
+                   g_qemu_wifi_aborts == 2);
+      {
+        // v1.11.6: CALIB tab SET — 74 g weighed after a 2 s test -> 37 g/s
+        UiEvent ev{};
+        ev.type = UI_EVT_CALIB_SET;
+        ev.a = 1;      // tank 1
+        ev.b = 2;      // test seconds
+        ev.grams = 74; // weighed output
+        qemuSmokeSend(ev);
+      }
+      s_step = 11;
+      break;
+    case 11:
+      qemuSmokeLog("CALIB_SET persisted (74 g / 2 s = 37 g/s)",
+                   prefs::getTankGps(1) == 37);
+      Serial.println("[QEMU] SMOKE PASS");
+      s_step = 12;
+      break;
     default: {
       // Steady-state heartbeat: keep running (dim timers, LVGL rebuilds,
       // 1 Hz housekeeping) so late crashes still fail the run.

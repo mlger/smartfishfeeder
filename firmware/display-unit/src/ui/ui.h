@@ -60,6 +60,10 @@ enum UiEventType : uint8_t {
                         //           bytes=bytes written, flag=true = aborted)
   UI_EVT_SCHED_UPDATE,  // v1.11.5: tap-to-edit Save (a=new h, b=new m,
                         //           c=orig h, d=orig m — identity-safe)
+  UI_EVT_CALIB_TEST,    // v1.11.6: CALIB tab test dispense (a=tank 1..4,
+                        //           b=exact wire seconds — no gps rounding)
+  UI_EVT_CALIB_SET,     // v1.11.6: CALIB tab measured result (a=tank 1..4,
+                        //           b=test seconds, grams=weighed grams)
 };
 
 struct UiEvent {
@@ -252,6 +256,10 @@ void ui_set_food(uint8_t count, const uint8_t pct[CATFISH_MAX_TANKS],
  * "ok":0/1,"f":flag}]); "" or "[]" clears the list.
  */
 void ui_set_history(const String &json);
+
+/** v1.11.6: repaint CALIB tab rate labels from prefs (after a set/tank edit).
+ *  Caller holds the LVGL lock. */
+void ui_refresh_calib();
 
 /** Request a manual feed (safe to call from LVGL callbacks). */
 void ui_request_feed(uint16_t grams);
