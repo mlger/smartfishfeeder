@@ -53,14 +53,16 @@ void workerTask(void * /*param*/) {
       for (int k = 0; k < 4; k++) r.gramTank[k] = cmd.gramTank[k]; // v1.10.1 echo
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
         if (!(mask & (1u << (t - 1)))) continue;
-        // v1.10.0: per-tank wire pulse precomputed by main from the portion
-        uint8_t secs = cmd.secPerTank[t - 1];
-        if (secs == 0) secs = 1; // defensive floor; main always fills set bits
-        const relay_client::Result fr = relay_client::feedTank(t, secs);
+        // v1.12.0: per-tank wire pulse precomputed by main (milliseconds)
+        uint16_t ms = cmd.pulseMsPerTank[t - 1];
+        if (ms == 0) ms = 1000; // defensive floor; main always fills set bits
+        const relay_client::Result fr = relay_client::feedTank(t, ms);
         if (fr.ok) {
           r.tanksOk |= (1u << (t - 1));
           r.secOk[t - 1] = fr.seconds_applied; // v1.9.0: per-tank applied
+          r.msOk[t - 1] = fr.ms_applied;       // v1.12.0: applied ms remainder
           r.seconds = fr.seconds_applied; // last applied wins (compat field)
+          r.ms = fr.ms_applied;
           strlcpy(r.ip, fr.ip.c_str(), sizeof(r.ip));
           if (fr.clamped) {
             r.clamped = true;
@@ -163,7 +165,7 @@ bool begin() {
   return true;
 }
 
-bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
+bool enqueueFeed(uint16_t grams, const uint16_t *pulseMsPerTank, bool manual,
                  uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
                  bool catchup, const uint16_t *gramTank) {
   if (!s_cmdq) return false;
@@ -176,8 +178,8 @@ bool enqueueFeed(uint16_t grams, const uint8_t *secPerTank, bool manual,
   c.hour = hour;
   c.minute = minute;
   c.tankMask = tankMask;
-  if (secPerTank) {
-    for (int i = 0; i < 4; i++) c.secPerTank[i] = secPerTank[i];
+  if (pulseMsPerTank) {
+    for (int i = 0; i < 4; i++) c.pulseMsPerTank[i] = pulseMsPerTank[i];
   }
   if (gramTank) {
     for (int i = 0; i < 4; i++) c.gramTank[i] = gramTank[i]; // v1.10.1

@@ -41,8 +41,11 @@ struct Result {
   bool ok = false;
   String ip = "";
   String error = "";
-  // FEED success extras: what the relay actually applied (it may clamp)
+  // FEED success extras: what the relay actually applied (it may clamp).
+  // v1.12.0: a relay with the "pulseMs" capability also reports the applied
+  // millisecond remainder; pre-1.12.0 relays leave ms_applied = 0.
   uint8_t seconds_applied = 0;
+  uint16_t ms_applied = 0;
   bool clamped = false;
   String note = ""; // relay "note" text when the request was clamped
 };
@@ -58,6 +61,7 @@ struct Status {
   int servoRest = -1;       // mechanism params from /status (-1 = unknown/pre-P4)
   int servoFeed = -1;
   int stepHz = -1;
+  bool pulseMs = false;     // v1.12.0: relay accepts sub-second /feed pulses
   String error = "";
 };
 
@@ -87,12 +91,18 @@ void clearTankIp(uint8_t tank1);
 Result discoverTank(uint8_t tank1);
 
 /**
- * POST /feed with {"seconds":n,"token":<tank token>} (6 s timeout).
+ * POST /feed pulsing @p totalMs milliseconds (v1.12.0; 1000..60000 typical).
+ * Relays advertising the /status "pulseMs" capability get an exact
+ * {"seconds":s,"ms":m} payload; pre-1.12.0 relays fall back to the legacy
+ * whole-second ceil({"seconds":n}, min 1) — identical to the v1.10/v1.11
+ * behavior, so a mixed-firmware pond never regresses. The sub-second
+ * capability is learned once per tank per boot via a GET /status probe
+ * (also refreshed by the 60 s status cadence).
  * Auto-discovers first if the tank has no IP. A transport failure with a
  * cached IP triggers one re-discovery + retry (stale-IP self-heal).
  * Blocking — call from the net worker task only.
  */
-Result feedTank(uint8_t tank1, uint8_t seconds);
+Result feedTank(uint8_t tank1, uint16_t totalMs);
 
 /**
  * GET /status for a tank -> parse {"state","feeding","lastFeedEpoch",

@@ -53,6 +53,16 @@ uint8_t s_transport_fail_streak[relay_client::MAX_TANKS] = {0};
 // (the 60 s probe cadence would otherwise repeat it forever).
 bool s_proto_warned = false;
 
+// v1.12.0 per-tank sub-second capability, learned from GET /status
+// "pulseMs". Tri-state: 0 = unknown (probe first feed), 1 = legacy relay
+// (whole-second pulses), 2 = v1.12.0+ relay (exact millisecond pulses).
+// Written by fetchStatusTank()/feedTank() (worker task only) — no guard
+// needed, same single-caller discipline as the HTTP paths themselves.
+uint8_t s_subsec_cap[relay_client::MAX_TANKS] = {0, 0, 0, 0};
+
+// One-time "relay supports ms pulses" log line per boot.
+bool s_subsec_logged = false;
+
 // Effective per-tank tokens, snapshotted by applyTankTokens() (loop ctx) and
 // read by the worker under this spinlock (same pattern as the old single
 // s_token guard in prefs).
@@ -229,6 +239,7 @@ void init() {
     strlcpy(s_ip[i], saved.c_str(), sizeof(s_ip[i]));
     portEXIT_CRITICAL(&s_ip_mux);
     s_transport_fail_streak[i] = 0;
+    s_subsec_cap[i] = 0; // capability unknown until the first /status
     if (s_ip[i][0]) {
       Serial.printf("[NET] tank %u: saved IP %s (will validate on first use)\n",
                     (unsigned)t, s_ip[i]);
@@ -344,36 +355,62 @@ Result discoverTank(uint8_t tank1) {
   return r;
 }
 
-Result feedTank(uint8_t tank1, uint8_t seconds) {
+Result feedTank(uint8_t tank1, uint16_t totalMs) {
   Result r;
   const int i = tIdx(tank1);
   if (i < 0) {
     r.error = "Bad tank id";
     return r;
   }
+  if (totalMs == 0) totalMs = 1000; // defensive floor (worker pre-fills set bits)
+  if (totalMs > CATFISH_MAX_PULSE_LIMIT_S * 1000u)
+    totalMs = (uint16_t)(CATFISH_MAX_PULSE_LIMIT_S * 1000u);
 
   if (!net_wifi::wifi_is_connected()) {
     r.error = "WiFi down";
     return r;
   }
 
+  bool freshIp = false;
   if (!s_ip[i][0]) {
     Result d = discoverTank(tank1);
     if (!d.ok) {
       r.error = "No relay (" + d.error + ")";
       return r;
     }
+    freshIp = true;
   }
 
+  // v1.12.0: learn the sub-second capability once per tank per boot. One
+  // extra GET /status (3 s timeout) on the first feed — the 60 s status
+  // cadence refreshes it afterwards, so a transient probe failure self-heals.
+  if (s_subsec_cap[i] == 0 || freshIp) {
+    const Status st = fetchStatusTank(tank1);
+    s_subsec_cap[i] = (st.ok && st.pulseMs) ? 2 : 1; // unknown/legacy -> 1
+  }
+  const bool subsec = (s_subsec_cap[i] == 2);
+
   JsonDocument doc;
-  doc["seconds"] = (int)seconds;
+  if (subsec) {
+    // Exact pulse: whole seconds + millisecond remainder (seconds may be 0).
+    doc["seconds"] = (int)(totalMs / 1000u);
+    const uint16_t rem = (uint16_t)(totalMs % 1000u);
+    if (rem) doc["ms"] = (int)rem;
+  } else {
+    // Legacy relay: whole seconds only, ceil (min 1) — the exact v1.10/v1.11
+    // catfishGramsToSeconds behavior, so mixed firmware feeds as before.
+    uint32_t s = ((uint32_t)totalMs + 999u) / 1000u;
+    if (s < 1u) s = 1u;
+    doc["seconds"] = (int)s;
+  }
   doc["token"] = tankToken(tank1);
   String body;
   serializeJson(doc, body);
 
   const String url0 = "http://" + String(s_ip[i]) + CATFISH_EP_FEED;
-  Serial.printf("[FEED] tank %u POST %s (%u bytes)\n", (unsigned)tank1,
-                url0.c_str(), (unsigned)body.length());
+  Serial.printf("[FEED] tank %u POST %s %u ms (subsec %d, %u bytes)\n",
+                (unsigned)tank1, url0.c_str(), (unsigned)totalMs,
+                (int)subsec, (unsigned)body.length());
 
   String resp;
   int code = httpReq(url0, true, body, 6000, resp);
@@ -434,8 +471,10 @@ Result feedTank(uint8_t tank1, uint8_t seconds) {
 
   r.ok = true;
   r.ip = String(s_ip[i]);
-  // What the relay actually applied (it clamps to maxPulseS and reports a note)
-  r.seconds_applied = (uint8_t)(rd["seconds"] | (int)seconds);
+  // What the relay actually applied (it clamps to maxPulseS and reports a
+  // note). v1.12.0 relays echo "ms" too; pre-1.12.0 relays omit it (-> 0).
+  r.seconds_applied = (uint8_t)(rd["seconds"] | (int)(totalMs / 1000u));
+  r.ms_applied = (uint16_t)(rd["ms"] | 0);
   r.clamped = rd["note"].is<const char *>();
   if (r.clamped) r.note = String((const char *)(rd["note"] | ""));
   return r;
@@ -489,6 +528,15 @@ Status fetchStatusTank(uint8_t tank1) {
   st.servoRest = (int)(doc["servoRestDeg"] | -1);
   st.servoFeed = (int)(doc["servoFeedDeg"] | -1);
   st.stepHz = (int)(doc["stepHz"] | -1);
+  // v1.12.0: sub-second /feed capability. Cache it per tank so the first
+  // feed after boot can pulse milliseconds without an extra round trip.
+  st.pulseMs = (bool)(doc["pulseMs"] | false);
+  if (st.ok) s_subsec_cap[i] = st.pulseMs ? 2 : 1;
+  if (st.pulseMs && !s_subsec_logged) {
+    s_subsec_logged = true;
+    Serial.printf("[NET] tank %u relay supports sub-second pulses (ms)\n",
+                  (unsigned)tank1);
+  }
 
   if (st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION &&
       !s_proto_warned) {

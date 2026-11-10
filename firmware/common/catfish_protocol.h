@@ -17,7 +17,7 @@
 // strings from this). The #ifndef guard lets an external -DCATFISH_APP_VERSION
 // override it without redefinition warnings.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.11.8"
+#define CATFISH_APP_VERSION "1.12.0"
 #endif
 
 // ------------------------------------------------------------ protocol version
@@ -60,11 +60,21 @@
 #define CATFISH_PULSE_S_LIMIT        30  // max editable default/entry pulse
 #define CATFISH_DEFAULT_PULSE_S      3   // factory default pulse
 
+// v1.12.0: sub-second pulses. The /feed wire contract gains an optional
+// "ms" remainder (0..999) next to "seconds"; relays flashed with < 1.12.0
+// ignore it (ArduinoJson only materializes read keys), so the field is
+// additive and fully backward compatible — CATFISH_PROTOCOL_VERSION stays 1.
+// CATFISH_MIN_PULSE_MS floors tiny pulses: an opto relay + motor needs a
+// short-but-real ON window (spin-up dwell), and it keeps a 1 g slip at a
+// miscalibrated 100 g/s rate from becoming a relay chatter request.
+#define CATFISH_MIN_PULSE_MS         100 // floor for any wire pulse
+
 // ------------------------------------------------------------ portion safety (grams, v1.10.0)
 // v1.10.0: the USER-FACING portion unit is GRAMS everywhere (touch UI, schedule
-// editor, web dashboard, history). The wire protocol to the relay stays in
-// SECONDS (relay firmware unchanged); the display converts grams -> seconds
-// per tank using the tank's calibrated grams-per-second rate (prefs tGpsN).
+// editor, web dashboard, history). The display converts grams -> a wire pulse
+// per tank using the tank's calibrated grams-per-second rate (prefs tGpsN):
+// v1.10.0..v1.11.x pulsed whole seconds (ceil); v1.12.0 pulses milliseconds
+// when the relay advertises the "pulseMs" capability in GET /status.
 #define CATFISH_MAX_GRAMS            500 // HARD cap on any portion
 #define CATFISH_DEFAULT_GRAMS        15  // factory default portion (3 s @ 5 g/s)
 #define CATFISH_DEFAULT_GPS          5   // nominal g/s when a tank has no rate set
@@ -87,6 +97,59 @@ static inline uint8_t catfishGramsToSeconds(uint16_t grams, uint16_t gps) {
   if (s < 1u) s = 1u;
   if (s > CATFISH_MAX_PULSE_LIMIT_S) s = CATFISH_MAX_PULSE_LIMIT_S;
   return (uint8_t)s;
+}
+
+/**
+ * v1.12.0: sub-second wire pulse. totalMs = seconds*1000 + ms (ms < 1000).
+ * Max pulse is 60 s = 60000 ms, which fits uint16_t.
+ */
+typedef struct {
+  uint8_t seconds; // whole seconds of the pulse (0 is legal when ms > 0)
+  uint16_t ms;     // millisecond remainder 0..999
+} catfishPulse;
+
+/** Pulse fields -> total milliseconds. Pure. */
+static inline uint32_t catfishPulseTotalMs(const catfishPulse &p) {
+  return (uint32_t)p.seconds * 1000u + p.ms;
+}
+
+/**
+ * Convert a portion in grams to a relay pulse at MILLIScond resolution
+ * (v1.12.0): rounds to the nearest millisecond, floors tiny requests to
+ * CATFISH_MIN_PULSE_MS and caps at the wire hard cap. A gps of 0 falls back
+ * to the nominal CATFISH_DEFAULT_GPS. Pure, host-testable.
+ *
+ * This replaces the v1.10.0 ceil-to-seconds math on the feed path: ceil
+ * quantized every portion to whole seconds, so at a real-world ~27 g/s rate
+ * a 31 g request pulsed 2 s (~54 g out) while a 30 g request pulsed 1 s
+ * (~27 g out) — calibration itself was correct, the wire quantization was
+ * not. Millisecond pulses make the delivered grams match the request within
+ * rounding (± 0.5 gps-ms ≈ ± 0.03 g at 30 g/s).
+ */
+static inline catfishPulse catfishGramsToPulse(uint16_t grams, uint16_t gps) {
+  if (gps == 0) gps = CATFISH_DEFAULT_GPS;
+  uint32_t totalMs = ((uint32_t)catfishClampGrams(grams) * 1000u + gps / 2u) / gps;
+  if (totalMs < CATFISH_MIN_PULSE_MS) totalMs = CATFISH_MIN_PULSE_MS;
+  const uint32_t cap = (uint32_t)CATFISH_MAX_PULSE_LIMIT_S * 1000u;
+  if (totalMs > cap) totalMs = cap;
+  catfishPulse p;
+  p.seconds = (uint8_t)(totalMs / 1000u);
+  p.ms = (uint16_t)(totalMs % 1000u);
+  return p;
+}
+
+/**
+ * Inverse of catfishGramsToPulse: an APPLIED pulse (seconds + ms remainder,
+ * as reported by a v1.12.0 relay) -> grams actually dispensed, rounded.
+ * Pure, host-testable.
+ */
+static inline uint16_t catfishPulseToGrams(uint8_t seconds, uint16_t ms,
+                                           uint16_t gps) {
+  if (gps == 0) gps = CATFISH_DEFAULT_GPS;
+  const uint32_t totalMs = (uint32_t)seconds * 1000u + ms;
+  uint32_t g = (totalMs * (uint32_t)gps + 500u) / 1000u;
+  if (g > CATFISH_MAX_GRAMS) g = CATFISH_MAX_GRAMS;
+  return (uint16_t)g;
 }
 
 /** Inverse of catfishGramsToSeconds (seconds -> approximate grams). Pure. */

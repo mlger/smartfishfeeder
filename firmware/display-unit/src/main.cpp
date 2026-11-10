@@ -640,13 +640,19 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
     return;
   }
 
-  // v1.10.0: per-tank wire pulse = grams / tank gps (ceil, clamped).
-  uint8_t secPerTank[4] = {0, 0, 0, 0};
+  // v1.10.0: per-tank wire pulse = portion / tank gps. v1.12.0: MILLISCOND
+  // resolution (round-to-nearest-ms + 100 ms floor + 60 s cap) instead of the
+  // old ceil-to-seconds, whose whole-second quantization over-fed any portion
+  // that was not an exact multiple of the tank's real rate (31 g @ 30 g/s
+  // pulsed 2 s = ~54 g out at a real ~27 g/s). Relays flashed < 1.12.0 still
+  // receive the legacy whole-second ceil inside relay_client::feedTank.
+  uint16_t pulseMsPerTank[4] = {0, 0, 0, 0};
   for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
     if (tankMask && !(tankMask & (1u << (t - 1)))) continue;
     const uint16_t gt =
         (gramTank && gramTank[t - 1]) ? gramTank[t - 1] : grams;
-    secPerTank[t - 1] = catfishGramsToSeconds(gt, prefs::getTankGps(t));
+    const catfishPulse p = catfishGramsToPulse(gt, prefs::getTankGps(t));
+    pulseMsPerTank[t - 1] = (uint16_t)(p.seconds * 1000u + p.ms); // <= 60000
   }
 
   if (!net_wifi::wifi_is_connected()) {
@@ -673,7 +679,7 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
 #endif
     return;
   }
-  if (!net_worker::enqueueFeed(grams, secPerTank, manual, hour, minute, retry,
+  if (!net_worker::enqueueFeed(grams, pulseMsPerTank, manual, hour, minute, retry,
                                tankMask, src == feed_state::SRC_CATCHUP,
                                gramTank)) {
     // v1.8.2: a scheduled feed dropped because the worker queue was full gets
@@ -841,8 +847,10 @@ static void handleUiEvent(const UiEvent &ev) {
       if (tank < 1 || tank > relay_client::MAX_TANKS || sec < 1 || sec > 30)
         break;
       const uint8_t mask = (uint8_t)(1u << (tank - 1));
-      uint8_t secPerTank[4] = {0, 0, 0, 0};
-      secPerTank[tank - 1] = sec;
+      // v1.12.0: wire pulse in milliseconds — the TEST duration is a whole
+      // number of seconds by design (weigh a meaningful pile), so sec*1000.
+      uint16_t pulseMsPerTank[4] = {0, 0, 0, 0};
+      pulseMsPerTank[tank - 1] = (uint16_t)sec * 1000u;
       const uint16_t echoG =
           catfishSecondsToGrams(sec, prefs::getTankGps(tank)); // bookkeeping
       if (!net_wifi::wifi_is_connected()) {
@@ -852,7 +860,7 @@ static void handleUiEvent(const UiEvent &ev) {
 #endif
         break;
       }
-      if (net_worker::enqueueFeed(echoG, secPerTank, true, 0, 0, false, mask)) {
+      if (net_worker::enqueueFeed(echoG, pulseMsPerTank, true, 0, 0, false, mask)) {
         lvgl_port_lock(-1);
         ui_set_calib_busy(true); // v1.11.7: no second TEST while this one runs
         lvgl_port_unlock();
@@ -1299,13 +1307,14 @@ static void handleWorkerResult(const net_worker::Result &r) {
                         : (String("Today ") + fmtHhmm(r.hour, r.minute));
       }
       feed_state::onFeedResult(true, r.seconds); // C3 counters
-      // v1.10.0 (D1): hopper usage in grams — derived from the applied wire
-      // pulses and each tank's calibrated g/s rate.
+      // v1.10.0 (D1): hopper usage in grams — derived from the APPLIED wire
+      // pulses and each tank's calibrated g/s rate. v1.12.0: pulses are
+      // seconds + ms (exact portion math, no whole-second inflation).
       uint16_t usedG[4] = {0, 0, 0, 0};
       for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++) {
         if (r.tanksOk & (1u << (t - 1)))
-          usedG[t - 1] = catfishSecondsToGrams(r.secOk[t - 1],
-                                               prefs::getTankGps(t));
+          usedG[t - 1] = catfishPulseToGrams(r.secOk[t - 1], r.msOk[t - 1],
+                                             prefs::getTankGps(t));
       }
       feed_state::hopperAddUsage(r.tanksOk, usedG);
 
@@ -1314,10 +1323,11 @@ static void handleWorkerResult(const net_worker::Result &r) {
         if (r.tanksOk & (1u << (t - 1))) {
           s_tank_feeding[t - 1] = true;
           s_opt_feeding[t - 1] = true;
-          s_opt_feeding_until[t - 1] =
-              millis() + (uint32_t)r.seconds * 1000UL + 2000UL;
+          const uint32_t appliedMs =
+              (uint32_t)r.secOk[t - 1] * 1000UL + r.msOk[t - 1];
+          s_opt_feeding_until[t - 1] = millis() + appliedMs + 2000UL;
           // v1.9.0 (B3): arm a mid-pulse verify probe for pulses >= 3 s
-          if (r.secOk[t - 1] >= 3) {
+          if (appliedMs >= 3000UL) {
             s_verify[t - 1].armed = true;
             s_verify[t - 1].pending = false;
             s_verify[t - 1].dueMs = millis() + 2500;

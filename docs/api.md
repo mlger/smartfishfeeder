@@ -32,21 +32,22 @@ Energizes the relay for a pulse, running the feeder motor.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `seconds` | integer | yes | Feed duration **in seconds** (see *Feeding mechanisms* below). Must be a strict JSON integer (`3` ok, `"3"`/`3.5` → 400). Hard cap 60 s; values above the configured `maxPulseS` (default 30) are clamped down, not rejected. |
+| `seconds` | integer | yes | Feed duration **in seconds** (see *Feeding mechanisms* below). Must be a strict JSON integer (`3` ok, `"3"`/`3.5` → 400). Hard cap 60 s; values above the configured `maxPulseS` (default 30) are clamped down, not rejected. `0` is legal when `ms` > 0 (v1.12.0 sub-second pulse). |
+| `ms` | integer | no | v1.12.0: millisecond remainder `0..999` added on top of `seconds` (e.g. `seconds: 1, ms: 500` → a 1.5 s pulse). Strict JSON integer when present; omitted/absent = `0`. Ignored by pre-1.12.0 relays (additive, backward compatible). Pulses are floored to 100 ms total. |
 | `token` | string | yes | Current auth token |
 
-A `GET /feed?seconds=N&token=T` variant exists with identical semantics (convenient for curl/browser testing).
+A `GET /feed?seconds=N&ms=M&token=T` variant exists with identical semantics (convenient for curl/browser testing).
 
 Order of checks (deterministic error codes):
 
 | Status | Meaning | Body |
 |--------|---------|------|
-| 200 | Feed pulse started | `{"ok":true,"seconds":3}` — plus a `note` string when the value was clamped to `maxPulseS` |
-| 400 | Malformed JSON, or `seconds` missing/not an integer/`< 1` | `{"ok":false,"error":"bad_json"}` or `{"ok":false,"error":"bad_seconds"}` |
+| 200 | Feed pulse started | `{"ok":true,"seconds":3,"ms":0}` — plus a `note` string when the value was clamped. `ms` echoes the applied millisecond remainder (v1.12.0). |
+| 400 | Malformed JSON, or `seconds` missing/not an integer/`< 0`, `ms` not an integer in `0..999`, or both zero | `{"ok":false,"error":"bad_json"}` or `{"ok":false,"error":"bad_seconds"}` |
 | 403 | Wrong or missing token | `{"ok":false,"error":"auth"}` |
 | 409 | A feed is already running (busy) | `{"ok":false,"error":"busy"}` |
 
-The `seconds` field in a 200 response is what the relay **actually applied** (after clamping). Display-side toasts surface the clamp, e.g. `Fed OK (30 s) - clamped`.
+The `seconds` (+ `ms`) fields in a 200 response are what the relay **actually applied** (after clamping). Display-side toasts surface the clamp, e.g. `Fed OK (30 s) - clamped`.
 
 Examples:
 
@@ -55,6 +56,11 @@ Examples:
 curl -X POST http://catfish-relay.local/feed \
      -H "Content-Type: application/json" \
      -d '{"seconds":3,"token":"catfish"}'
+
+# v1.12.0 sub-second pulse: 1.5 s = whole seconds + millisecond remainder
+curl -X POST http://catfish-relay.local/feed \
+     -H "Content-Type: application/json" \
+     -d '{"seconds":1,"ms":500,"token":"catfish"}'
 
 # GET convenience variant
 curl "http://catfish-relay.local/feed?seconds=3&token=catfish"
@@ -83,8 +89,9 @@ Full runtime snapshot (no auth).
   "heap": 21340,
   "rssi": -58,
   "ip": "192.168.1.42",
-  "version": "1.4.0",
+  "version": "1.12.0",
   "proto": 1,
+  "pulseMs": true,
   "ntpSynced": true
 }
 ```
@@ -107,6 +114,7 @@ Full runtime snapshot (no auth).
 | `rssi` | int | WiFi signal in dBm |
 | `ip` | string | Current IP address |
 | `version` | string | Firmware version |
+| `pulseMs` | bool | v1.12.0: relay accepts the `ms` remainder in `/feed` (sub-second pulses). Absent in pre-1.12.0 firmware — clients treat a missing flag as legacy whole-second feeding. |
 | `proto` | int | Wire-contract revision (see `CATFISH_PROTOCOL_VERSION` in `firmware/common/catfish_protocol.h`). The display unit compares it to its own value and warns on a mismatch — the usual cause is only one unit being re-flashed |
 | `ntpSynced` | bool | `true` once NTP time is valid (affects `lastFeedEpoch` accuracy) |
 

@@ -724,6 +724,56 @@ void test_grams_seconds_conversion_helpers(void) {
 }
 
 // ---------------------------------------------------------------------------
+// v1.12.0: grams <-> millisecond pulse conversion helpers (sub-second feed)
+// ---------------------------------------------------------------------------
+void test_grams_pulse_conversion_helpers(void) {
+  // round-to-nearest ms: 30 g @ 27 g/s = 1111.11 ms -> 1111 ms (1 s + 111)
+  catfishPulse p = catfishGramsToPulse(30, 27);
+  TEST_ASSERT_EQUAL_UINT8(1, p.seconds);
+  TEST_ASSERT_EQUAL_UINT16(111, p.ms);
+  TEST_ASSERT_EQUAL_UINT32(1111, catfishPulseTotalMs(p));
+  // the v1.11.x over-feed cases, now exact: 31 g @ 30 g/s = 1033 ms (was 2 s)
+  p = catfishGramsToPulse(31, 30);
+  TEST_ASSERT_EQUAL_UINT32(1033, catfishPulseTotalMs(p));
+  // 35 g @ 30 g/s = 1166.67 -> 1167 ms (was 2 s)
+  p = catfishGramsToPulse(35, 30);
+  TEST_ASSERT_EQUAL_UINT32(1167, catfishPulseTotalMs(p));
+  // exact multiples stay exact: 30 g @ 30 g/s -> 1000 ms
+  p = catfishGramsToPulse(30, 30);
+  TEST_ASSERT_EQUAL_UINT32(1000, catfishPulseTotalMs(p));
+  // gps 0 falls back to the nominal 5 g/s: 15 g -> 3000 ms
+  p = catfishGramsToPulse(15, 0);
+  TEST_ASSERT_EQUAL_UINT32(3000, catfishPulseTotalMs(p));
+  // sub-second small portions: 1 g @ 5 g/s = 200 ms
+  p = catfishGramsToPulse(1, 5);
+  TEST_ASSERT_EQUAL_UINT8(0, p.seconds);
+  TEST_ASSERT_EQUAL_UINT16(200, p.ms);
+  // tiny slip at a high rate floors to CATFISH_MIN_PULSE_MS (100 ms):
+  // 1 g @ 100 g/s would be 10 ms -> clamped to 100 ms
+  p = catfishGramsToPulse(1, 100);
+  TEST_ASSERT_EQUAL_UINT32(CATFISH_MIN_PULSE_MS, catfishPulseTotalMs(p));
+  // max portion @ slow rate caps at the 60 s wire limit
+  p = catfishGramsToPulse(500, 5);
+  TEST_ASSERT_EQUAL_UINT32(60000, catfishPulseTotalMs(p));
+  TEST_ASSERT_EQUAL_UINT8(60, p.seconds);
+  TEST_ASSERT_EQUAL_UINT16(0, p.ms);
+  // grams clamp happens first: 9999 g behaves as 500 g
+  p = catfishGramsToPulse(9999, 100);
+  TEST_ASSERT_EQUAL_UINT32(5000, catfishPulseTotalMs(p));
+
+  // applied pulse -> grams (inverse), rounded: 1111 ms @ 27 g/s = 29.997 -> 30
+  TEST_ASSERT_EQUAL_UINT16(30, catfishPulseToGrams(1, 111, 27));
+  // legacy relay echo (ms = 0): 3 s @ 5 g/s -> 15 g
+  TEST_ASSERT_EQUAL_UINT16(15, catfishPulseToGrams(3, 0, 5));
+  // sub-second echo: 200 ms @ 5 g/s = 1 g
+  TEST_ASSERT_EQUAL_UINT16(1, catfishPulseToGrams(0, 200, 5));
+  // clamp to CATFISH_MAX_GRAMS
+  TEST_ASSERT_EQUAL_UINT16(500, catfishPulseToGrams(60, 0, 100));
+  // gps 0 falls back to nominal
+  TEST_ASSERT_EQUAL_UINT16(25, catfishPulseToGrams(5, 0, 0));
+}
+
+// ---------------------------------------------------------------------------
 // v1.9.0: nextOccurrence() scans up to 8 days ahead
 // ---------------------------------------------------------------------------
 void test_next_occurrence_mon_only_from_tuesday(void) {
@@ -861,6 +911,7 @@ int main(void) {
   RUN_TEST(test_legacy_s_blob_migrates_to_grams);
   RUN_TEST(test_seed_defaults_grams);
   RUN_TEST(test_grams_seconds_conversion_helpers);
+  RUN_TEST(test_grams_pulse_conversion_helpers);
   RUN_TEST(test_next_occurrence_mon_only_from_tuesday);
   RUN_TEST(test_next_occurrence_mon_only_from_sunday_is_tomorrow);
   RUN_TEST(test_next_occurrence_today_future_days_ahead_zero);

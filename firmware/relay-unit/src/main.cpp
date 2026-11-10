@@ -13,8 +13,11 @@
  * HTTP API (LAN-only by design; JSON unless noted):
  *   GET  /health                  -> 200 "OK" (no auth; ESP32 validates a discovered IP)
  *   GET  /status                  -> JSON telemetry (no auth)
- *   POST /feed                    -> body {"seconds":1..60, "token":"..."} (auth)
- *   GET  /feed?seconds=N&token=T  -> same logic, curl convenience (auth)
+ *   POST /feed                    -> body {"seconds":0..60, "ms":0..999,
+ *                                    "token":"..."} (auth; "ms" optional,
+ *                                    v1.12.0 sub-second pulses — older relays
+ *                                    and callers without "ms" behave as before)
+ *   GET  /feed?seconds=N&ms=M&token=T -> same logic, curl convenience (auth)
  *   GET  /                        -> minimal status page, 10 s auto-refresh
  *   POST /config                  -> {"token":"<current>", "maxPulseS":1..60,
  *                                     "pulseS":1..30, "newToken":"<optional>",
@@ -36,6 +39,7 @@
  *   - hard cap MAX_PULSE_LIMIT_S (60 s) enforced at request parse AND engine start
  *   - per-device soft cap cfg.maxPulseS (default 30 s): larger requests are
  *     clamped and the response carries a "note"
+ *   - pulses below CATFISH_MIN_PULSE_MS (100 ms) are floored (v1.12.0)
  *   - busy guard: request while feeding -> 409 {"ok":false,"error":"busy"}
  *
  * Time: configTime("PHT-8", "pool.ntp.org", ...). lastFeedEpoch uses the real
@@ -366,11 +370,12 @@ static void mechServoPark() {
   g_servo.detach();
 }
 
-static void startFeedPulse(uint32_t seconds) {
-  if (seconds < 1) seconds = 1;  // paranoia
-  if (seconds > (uint32_t)MAX_PULSE_LIMIT_S) seconds = (uint32_t)MAX_PULSE_LIMIT_S;  // hard cap
+static void startFeedPulseMs(uint32_t durMs) {
+  if (durMs < CATFISH_MIN_PULSE_MS) durMs = CATFISH_MIN_PULSE_MS;  // paranoia
+  if (durMs > (uint32_t)MAX_PULSE_LIMIT_S * 1000UL)
+    durMs = (uint32_t)MAX_PULSE_LIMIT_S * 1000UL;                  // hard cap
   g_feedStartMs = millis();
-  g_feedDurMs = seconds * 1000UL;
+  g_feedDurMs = durMs;
   g_cfg.lastFeedEpoch = currentEpoch();
   g_feeding = true;
   g_ledMode = LED_MODE_FEED;
@@ -392,7 +397,7 @@ static void startFeedPulse(uint32_t seconds) {
       break;
   }
   saveConfig();  // persist lastFeedEpoch even if power is cut mid-pulse
-  LOG("feed START %u s (%s)", (unsigned)seconds, catfishMechName(g_mech.mechanism));
+  LOG("feed START %u ms (%s)", (unsigned)durMs, catfishMechName(g_mech.mechanism));
 }
 
 static void stopFeedPulse() {
@@ -585,6 +590,10 @@ static void handleStatus() {
   // warns when the two firmwares disagree; bump CATFISH_PROTOCOL_VERSION in
   // ../common/catfish_protocol.h whenever the JSON/endpoint contract changes.
   doc["proto"] = CATFISH_PROTOCOL_VERSION;
+  // v1.12.0 capability flag: the relay accepts an optional "ms" remainder in
+  // /feed (sub-second pulses). Absent in pre-1.12.0 relays — the display
+  // treats a missing flag as legacy and keeps pulsing whole seconds.
+  doc["pulseMs"] = true;
   doc["ntpSynced"] = ntpTimeSynced();  // extra field: explains lastFeedEpoch semantics
 
   char buf[640];
@@ -596,39 +605,53 @@ static void handleStatus() {
   g_server.send(200, "application/json", buf);
 }
 
-static void respondFeedSuccess(long seconds, bool clampedToCfg) {
-  char buf[160];
+static void respondFeedSuccess(uint32_t totalMs, bool clampedToCfg) {
+  char buf[192];
   if (clampedToCfg) {
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"seconds\":%ld,\"note\":\"clamped to maxPulseS (%u)\"}",
-             seconds, (unsigned)g_cfg.maxPulseS);
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"seconds\":%u,\"ms\":%u,"
+             "\"note\":\"clamped to maxPulseS (%u ms)\"}",
+             (unsigned)(totalMs / 1000UL), (unsigned)(totalMs % 1000UL),
+             (unsigned)totalMs);
   } else {
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"seconds\":%ld}", seconds);
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"seconds\":%u,\"ms\":%u}",
+             (unsigned)(totalMs / 1000UL), (unsigned)(totalMs % 1000UL));
   }
   g_server.send(200, "application/json", buf);
 }
 
 // Shared by POST /feed and GET /feed. Order: auth -> validate -> clamp -> busy.
-static void processFeedRequest(long seconds, const char* token) {
+// v1.12.0: @p extraMs (0..999) is the sub-second remainder of the pulse —
+// additive + backward compatible (pre-1.12.0 callers never send it; the
+// engine itself was always millisecond-based, so this is a pure parse win).
+static void processFeedRequest(long seconds, long extraMs, const char* token) {
   if (!tokenMatches(token)) {
     sendJsonError(403, "auth");
     return;
   }
-  if (seconds < 1) {
+  if (seconds < 0 || extraMs < 0 || extraMs > 999 ||
+      (seconds == 0 && extraMs == 0)) {
     sendJsonError(400, "bad_seconds");
     return;
   }
-  if (seconds > (long)MAX_PULSE_LIMIT_S) seconds = (long)MAX_PULSE_LIMIT_S;  // hard-cap clamp
+  uint32_t totalMs = (uint32_t)seconds * 1000UL + (uint32_t)extraMs;
   bool clampedToCfg = false;
-  if (seconds > (long)g_cfg.maxPulseS) {
-    seconds = (long)g_cfg.maxPulseS;
+  if (totalMs > (uint32_t)MAX_PULSE_LIMIT_S * 1000UL) {
+    totalMs = (uint32_t)MAX_PULSE_LIMIT_S * 1000UL;  // hard-cap clamp
     clampedToCfg = true;
   }
+  const uint32_t capCfg = (uint32_t)g_cfg.maxPulseS * 1000UL;
+  if (totalMs > capCfg) {
+    totalMs = capCfg;
+    clampedToCfg = true;
+  }
+  if (totalMs < CATFISH_MIN_PULSE_MS) totalMs = CATFISH_MIN_PULSE_MS;
   if (g_feeding) {
     sendJsonError(409, "busy");
     return;
   }
-  startFeedPulse((uint32_t)seconds);
-  respondFeedSuccess(seconds, clampedToCfg);
+  startFeedPulseMs(totalMs);
+  respondFeedSuccess(totalMs, clampedToCfg);
 }
 
 static void handleFeedPost() {
@@ -644,9 +667,19 @@ static void handleFeedPost() {
     sendJsonError(400, "bad_seconds");
     return;
   }
+  // v1.12.0: optional "ms" remainder (0..999). Strict integer check when
+  // present — pre-1.12.0 callers omit the key entirely (-> 0).
+  long extraMs = 0;
+  if (!doc["ms"].isNull()) {
+    if (!doc["ms"].is<long>()) {
+      sendJsonError(400, "bad_seconds");
+      return;
+    }
+    extraMs = doc["ms"].as<long>();
+  }
   const long seconds = doc["seconds"].as<long>();
   const char* token = doc["token"] | "";  // points into doc pool, valid for this call
-  processFeedRequest(seconds, token);
+  processFeedRequest(seconds, extraMs, token);
 }
 
 static void handleFeedGet() {
@@ -668,7 +701,18 @@ static void handleFeedGet() {
     sendJsonError(400, "bad_seconds");
     return;
   }
-  processFeedRequest(seconds, tokenArg.c_str());
+  // v1.12.0: optional "ms" remainder (0..999), same strict parsing.
+  long extraMs = 0;
+  if (g_server.hasArg("ms")) {
+    const String msArg = g_server.arg("ms");
+    char* endMs = nullptr;
+    extraMs = strtol(msArg.c_str(), &endMs, 10);
+    if (endMs == msArg.c_str() || *endMs != '\0') {
+      sendJsonError(400, "bad_seconds");
+      return;
+    }
+  }
+  processFeedRequest(seconds, extraMs, tokenArg.c_str());
 }
 
 static void handleRoot() {
