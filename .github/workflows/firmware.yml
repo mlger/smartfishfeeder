@@ -10,6 +10,10 @@
 #   releases under fw/<tag>/ and writes versions.json + per-release manifests.
 #   Release downloads are NOT CORS-enabled, so binaries must live on the Pages
 #   origin for ESP Web Tools to fetch them.
+#   One Pages deploy per commit SHA: a main run whose commit is already tagged
+#   stands down (GitHub Pages silently drops a second deploy of the same SHA),
+#   and the verify-picker job nudges a redeploy if a release ever goes missing
+#   from the live picker.
 # - Attaches firmware binaries to GitHub releases on v* tags, and maintains a
 #   rolling "latest" prerelease on every main build (so firmware is always
 #   attached to a release without needing a tag)
@@ -254,19 +258,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # One Pages deploy per commit SHA. deploy-pages keys the deployment by
+      # commit SHA: when main and a v* tag point at the same commit (the normal
+      # release flow pushes both seconds apart), the SECOND deploy of that SHA
+      # reports success but is silently dropped by the Pages backend, so the
+      # live content stays whatever the FIRST deploy shipped. v1.12.0 shipped
+      # exactly this way: the tag run's mirror (which waits for the release
+      # and lists it in versions.json) was the second deploy and got dropped,
+      # leaving the flasher picker stuck on v1.11.8. The tag run owns the
+      # deploy for a tagged commit, so a main run whose commit is already
+      # tagged stands down here.
+      - name: Stand down if this commit is already tagged (tag run owns the deploy)
+        id: taggate
+        if: github.ref == 'refs/heads/main'
+        run: |
+          TAGGED=$(git ls-remote origin 'refs/tags/v*' \
+            | awk '{print $1}' | grep -Fx "$GITHUB_SHA" || true)
+          if [ -n "$TAGGED" ]; then
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Commit ${GITHUB_SHA::7} is already tagged - the v* tag run owns the Pages deploy for this SHA (a second deploy of the same SHA is silently deduped by GitHub Pages and would drop the new release from the flasher picker). Standing down."
+          else
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download display-unit artifact
+        if: steps.taggate.outputs.tagged != 'true'
         uses: actions/download-artifact@v8
         with:
           name: fw-display-unit-${{ github.sha }}
           path: dist/display-unit
 
       - name: Download relay-unit artifact
+        if: steps.taggate.outputs.tagged != 'true'
         uses: actions/download-artifact@v8
         with:
           name: fw-relay-unit-${{ github.sha }}
           path: dist/relay-unit
 
       - name: Assemble site
+        if: steps.taggate.outputs.tagged != 'true'
         run: |
           mkdir -p site/fw
           # -a + /. : recursive — the self-hosted ESP Web Tools bundle lives in
@@ -276,6 +306,7 @@ jobs:
           cp dist/relay-unit/relay-unit-firmware.bin site/fw/relay-unit-firmware.bin
 
       - name: Generate dev manifests (version = short commit SHA)
+        if: steps.taggate.outputs.tagged != 'true'
         run: |
           python3 - <<'PY'
           import json
@@ -331,6 +362,7 @@ jobs:
       # version picker. The site-local fw/ copy (dev manifests above) stays
       # as a fallback when the release list is unavailable.
       - name: Mirror release firmware for the version picker
+        if: steps.taggate.outputs.tagged != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -507,9 +539,11 @@ jobs:
           PY
 
       - name: Configure Pages
+        if: steps.taggate.outputs.tagged != 'true'
         uses: actions/configure-pages@v6
 
       - name: Remove stale Pages artifacts (re-run idempotency)
+        if: steps.taggate.outputs.tagged != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -527,11 +561,13 @@ jobs:
           done
 
       - name: Upload Pages artifact
+        if: steps.taggate.outputs.tagged != 'true'
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - name: Deploy to GitHub Pages
+        if: steps.taggate.outputs.tagged != 'true'
         id: deployment
         uses: actions/deploy-pages@v5
 
@@ -645,3 +681,56 @@ jobs:
             --prerelease \
             --title "Firmware — rolling latest" \
             --notes "$NOTES"
+
+  # Post-release integrity check for the web flasher's version picker. The
+  # deploy-pages mirror waits for this tag's release to be usable before it
+  # ships, so the deployed picker should always list this tag — unless the
+  # same-SHA Pages dedupe ate the deploy (see the stand-down note in
+  # deploy-pages: this job guards the remaining window where a v* tag is
+  # pushed AFTER main already deployed that commit). On a miss it pushes an
+  # empty commit to main, whose fresh SHA cannot dedupe, forcing a redeploy
+  # that mirrors the release.
+  verify-picker:
+    name: Verify flasher picker lists this release
+    needs: [release, deploy-pages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # self-heal push (empty commit) when the picker is stale
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Wait for the live picker to list this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          PAGES_URL=$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq '.html_url' 2>/dev/null \
+            || echo "https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY##*/}/")
+          echo "checking $PAGES_URL/versions.json for $TAG"
+          MISSING=1
+          for i in 1 2 3 4 5 6; do
+            # cache-buster: never judge an integrity check from a cached copy
+            if curl -sf "$PAGES_URL/versions.json?vp=$GITHUB_RUN_ID-$i" | grep -q "\"$TAG\""; then
+              echo "attempt $i: picker lists $TAG — OK"
+              MISSING=0
+              break
+            fi
+            echo "attempt $i: $TAG not live yet (CDN purge can lag) — retrying in 30 s"
+            sleep 30
+          done
+          if [ "$MISSING" != "0" ]; then
+            echo "::warning::$TAG is missing from the live flasher picker after 3 min — the Pages deploy was most likely deduped for a SHA main already deployed (or the mirror shipped without this tag)."
+            echo "MISSING=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Self-heal — empty commit nudges a fresh deploy (new SHA cannot dedupe)
+        if: env.MISSING == '1'
+        run: |
+          git config user.name "catfish-ci"
+          git config user.email "actions@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B picker-nudge origin/main
+          git commit --allow-empty -m "ci(pages): picker missed ${GITHUB_REF_NAME} (same-SHA deploy dedupe) — nudge redeploy"
+          git push origin HEAD:main
