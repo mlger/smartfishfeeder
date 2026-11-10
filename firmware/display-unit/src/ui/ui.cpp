@@ -217,7 +217,12 @@ static lv_obj_t *s_calib_rows = nullptr;
 static lv_obj_t *s_calib_name_lbl[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 static lv_obj_t *s_calib_rate_lbl[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 static lv_obj_t *s_calib_meas_sb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_calib_test_btns[CATFISH_MAX_TANKS][2] = {};
+static lv_obj_t *s_calib_ok_btns[CATFISH_MAX_TANKS] = {};
 static uint8_t s_calib_test_s[CATFISH_MAX_TANKS] = {2, 2, 2, 2}; // last test seconds per tank
+// v1.11.7: TEST x2 + OK buttons per tank — disabled while a test pulse is in
+// flight (a second TEST would queue a second dispense; the weighed grams
+// would then cover BOTH pulses but SET divides by the last test seconds).
 
 // History (C1) — v1.11.6: widgets moved from the tap-in overlay into the
 // schedule page's HISTORY tab (always built, shown/hidden by the tab bar).
@@ -3454,6 +3459,9 @@ void rebuildCalibRows() {
     s_calib_name_lbl[i] = nullptr;
     s_calib_rate_lbl[i] = nullptr;
     s_calib_meas_sb[i] = nullptr;
+    s_calib_test_btns[i][0] = nullptr;
+    s_calib_test_btns[i][1] = nullptr;
+    s_calib_ok_btns[i] = nullptr;
   }
   for (uint8_t i = 0; i < s_tank_count && i < CATFISH_MAX_TANKS; i++) {
     lv_obj_t *row = lv_obj_create(s_calib_rows);
@@ -3494,6 +3502,7 @@ void rebuildCalibRows() {
       lv_obj_t *b = makeBtn(row, lbl, C_CARD, C_AMBER, C_CARD_HI, 104, 56);
       lv_obj_add_event_cb(b, calibTestCb, LV_EVENT_CLICKED,
                           (void *)(uintptr_t)(((i + 1) << 8) | TEST_S[k]));
+      s_calib_test_btns[i][k] = b; // v1.11.7: busy guard
     }
 
     // measured grams (0..2000 g, 4 digits) + OK
@@ -3501,6 +3510,7 @@ void rebuildCalibRows() {
     s_calib_meas_sb[i] = sb;
     lv_obj_t *ok = makeBtn(row, LV_SYMBOL_OK, C_CARD, C_AMBER, C_CARD_HI, 56, 56);
     lv_obj_add_event_cb(ok, calibSetCb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+    s_calib_ok_btns[i] = ok; // v1.11.7: busy guard
   }
   refreshCalibRows();
 }
@@ -4013,6 +4023,26 @@ void ui_set_feed_busy(bool busy) {
       lv_obj_add_state(s_feed_btn, LV_STATE_DISABLED);
     else
       lv_obj_clear_state(s_feed_btn, LV_STATE_DISABLED);
+  }
+}
+
+void ui_set_calib_busy(bool busy) {
+  // v1.11.7: while a calibration test pulse is in flight, block a second TEST
+  // (two queued dispenses -> weighed grams cover both, SET divides by the
+  // last test seconds -> silently wrong rate) and OK (grams not final yet).
+  for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
+    for (int k = 0; k < 2; k++) {
+      if (!s_calib_test_btns[i][k]) continue;
+      if (busy)
+        lv_obj_add_state(s_calib_test_btns[i][k], LV_STATE_DISABLED);
+      else
+        lv_obj_clear_state(s_calib_test_btns[i][k], LV_STATE_DISABLED);
+    }
+    if (!s_calib_ok_btns[i]) continue;
+    if (busy)
+      lv_obj_add_state(s_calib_ok_btns[i], LV_STATE_DISABLED);
+    else
+      lv_obj_clear_state(s_calib_ok_btns[i], LV_STATE_DISABLED);
   }
 }
 

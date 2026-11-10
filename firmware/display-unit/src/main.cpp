@@ -853,12 +853,15 @@ static void handleUiEvent(const UiEvent &ev) {
         break;
       }
       if (net_worker::enqueueFeed(echoG, secPerTank, true, 0, 0, false, mask)) {
+        lvgl_port_lock(-1);
+        ui_set_calib_busy(true); // v1.11.7: no second TEST while this one runs
+        lvgl_port_unlock();
         uiToast(String("Calib test: Tank ") + tank + " \xE2\x80\xA2 " + sec +
                 " s - weigh the output");
         Serial.printf("[FEED] calib test: tank %u for %u s\n",
                       (unsigned)tank, (unsigned)sec);
       } else {
-        uiToast("Feeder busy - try again");
+        uiToast("Too busy - try again");
       }
       break;
     }
@@ -1325,6 +1328,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
 
       lvgl_port_lock(-1);
       ui_set_feed_busy(false);
+      ui_set_calib_busy(false); // v1.11.7: a calib test pulse is a manual feed
       if (clock_ok) ui_set_last_feed(when);
       if (r.manual) {
         String t = String("Fed OK (") + r.grams + " g";
@@ -1383,6 +1387,7 @@ static void handleWorkerResult(const net_worker::Result &r) {
     } else if (r.manual) {
       lvgl_port_lock(-1);
       ui_set_feed_busy(false);
+      ui_set_calib_busy(false); // v1.11.7: failed calib test pulse too
       ui_toast(String("Feed failed: ") + r.error);
       lvgl_port_unlock();
       Serial.printf("[FEED] manual feed FAILED: %s\n", r.error);

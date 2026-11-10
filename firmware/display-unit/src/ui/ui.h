@@ -267,6 +267,11 @@ void ui_request_feed(uint16_t grams);
 /** Disable/re-enable FEED NOW while a feed request is in flight. */
 void ui_set_feed_busy(bool busy);
 
+/** v1.11.7: disable/re-enable the CALIB tab TEST + OK buttons while a
+ * calibration test pulse is in flight (a second TEST would queue a second
+ * dispense and the weighed grams would no longer match the test seconds). */
+void ui_set_calib_busy(bool busy);
+
 /** Disable/re-enable "Test connection" while a relay probe is in flight. */
 void ui_set_probe_busy(bool busy);
 
