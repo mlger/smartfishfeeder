@@ -421,9 +421,22 @@ jobs:
                   if wait_tag:
                       tag_ok = usable(next((r for r in rels if r.get("tag_name") == REF_NAME), None))
                   latest_ok = usable(next((r for r in rels if r.get("tag_name") == "latest"), None))
-                  if (tag_ok and latest_ok) or time.monotonic() >= deadline:
+                  # v1.11.6 fix: a concurrent v* tag run publishes its release in
+                  # parallel with this one. deploy-pages and release only need the
+                  # build jobs, so a main run can fetch the list while the new
+                  # tag's assets are mid-upload and ship versions.json without
+                  # it — then deploy LAST (last-deploy-wins) and the flasher's
+                  # version picker misses the brand-new tag. Require the newest
+                  # v* release to have both web-flashable assets before shipping.
+                  newest_rel = next((r for r in rels
+                                     if r.get("tag_name", "").startswith("v")
+                                     and not r.get("draft")), None)
+                  newest_ok = usable(newest_rel)
+                  if (tag_ok and latest_ok and newest_ok) or time.monotonic() >= deadline:
                       if not latest_ok:
                           print("::warning::rolling 'latest' release not usable yet; shipping without it")
+                      if not newest_ok:
+                          print("::warning::newest v* release not usable yet; shipping without it")
                       return rels
                   time.sleep(15)
 
