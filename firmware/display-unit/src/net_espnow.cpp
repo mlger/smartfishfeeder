@@ -91,15 +91,24 @@ State state() { return s_state; }
 bool beginOnce() {
   if (s_started) return true;
   rederiveKey();
+  // v1.12.1: a failed init is retried instead of latched — beginOnce() now
+  // runs as soon as the radio is up (not only when WiFi is connected), and
+  // under the QEMU stub the WiFi driver never starts, so a permanent Error
+  // latch would be both wrong on hardware race windows and noisy in CI.
   if (esp_now_init() != ESP_OK) {
-    s_state = State::Error;
-    Serial.println("[ESPNOW] init FAILED");
+    static uint32_t s_init_fails = 0;
+    s_init_fails++;
+    if (s_init_fails == 1 || (s_init_fails % 100) == 0) { // loop ~50 ms → 5 s
+      Serial.printf("[ESPNOW] init failed %u time(s), retrying\n",
+                    (unsigned)s_init_fails);
+    }
     return false;
   }
   esp_now_register_recv_cb(recvCb);
   s_started = true;
   s_state = State::Listening;
-  Serial.println("[ESPNOW] listening for feed nodes (channel follows WiFi)");
+  Serial.println("[ESPNOW] listening for feed nodes "
+                 "(pins last AP channel while WiFi is down)");
   return true;
 }
 

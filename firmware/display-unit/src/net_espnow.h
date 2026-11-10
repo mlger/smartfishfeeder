@@ -12,8 +12,11 @@
  * cross-task prefs reads.
  *
  * Feature gate: -DCATFISH_FEATURE_ESPNOW=1 (default). Started lazily once
- * WiFi STA is connected (so the listen channel matches the AP). Nodes must
- * transmit on that same channel.
+ * the RADIO is up (v1.12.1 — previously only after WiFi connected, which
+ * left the pucks dead whenever the router was off). While the link is down
+ * the wifi task pins the last AP channel (catfishRfnodeListenChannel,
+ * host-tested), so nodes keep matching it; nodes must transmit on the AP's
+ * channel (or channel 1 if the hub never joined a network).
  */
 #ifndef CATFISH_ESPNOW_H
 #define CATFISH_ESPNOW_H

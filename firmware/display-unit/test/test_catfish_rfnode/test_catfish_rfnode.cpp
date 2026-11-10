@@ -133,6 +133,27 @@ void test_build_parse_default_request(void) {
   TEST_ASSERT_EQUAL_UINT32(key, gotKey);
 }
 
+// ---- v1.12.1: listen-channel policy (ESP-NOW with WiFi down) ----
+
+void test_listen_channel_follows_ap_when_connected(void) {
+  TEST_ASSERT_EQUAL_UINT8(6, catfishRfnodeListenChannel(true, 6, 0));
+  TEST_ASSERT_EQUAL_UINT8(11, catfishRfnodeListenChannel(true, 11, 6));
+}
+
+void test_listen_channel_pins_last_ap_when_down(void) {
+  TEST_ASSERT_EQUAL_UINT8(6, catfishRfnodeListenChannel(false, 0, 6));
+  // a stale lastChan wins over a stale apChan while the link is down
+  TEST_ASSERT_EQUAL_UINT8(6, catfishRfnodeListenChannel(false, 99, 6));
+}
+
+void test_listen_channel_falls_back_to_default_when_never_connected(void) {
+  TEST_ASSERT_EQUAL_UINT8(CATFISH_ESPNOW_DEFAULT_CHANNEL,
+                          catfishRfnodeListenChannel(false, 0, 0));
+  // connected but channel not yet known (mid-handshake) also falls back
+  TEST_ASSERT_EQUAL_UINT8(CATFISH_ESPNOW_DEFAULT_CHANNEL,
+                          catfishRfnodeListenChannel(true, 0, 0));
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_build_produces_expected_bytes);
@@ -143,5 +164,8 @@ int main() {
   RUN_TEST(test_seconds_clamp);
   RUN_TEST(test_key_derivation_is_deterministic_and_token_sensitive);
   RUN_TEST(test_build_parse_default_request);
+  RUN_TEST(test_listen_channel_follows_ap_when_connected);
+  RUN_TEST(test_listen_channel_pins_last_ap_when_down);
+  RUN_TEST(test_listen_channel_falls_back_to_default_when_never_connected);
   return UNITY_END();
 }

@@ -5,8 +5,10 @@
  * Runs WiFiManager.autoConnect("CatfishFeeder-Setup") in a dedicated
  * FreeRTOS task ("wifi-task", core 0) so the LVGL task stays responsive.
  * After connect: WiFi sleep off, MDNS "catfishfeeder", NTP Asia/Manila.
- * Monitors link every 5 s; auto-reconnects; reopens the config portal
- * (180 s timeout) after >90 s of continuous downtime.
+ * Monitors link every 5 s; reopens the config portal (180 s timeout) after
+ * >90 s of continuous downtime. v1.12.1: while the link is down the radio is
+ * idled and PINNED to the last AP channel (bounded reconnect attempts in
+ * between) so ESP-NOW feed pucks keep matching the hub's channel.
  *
  * v1.10.0 on-display WiFi manager: the touch UI can trigger an async AP scan
  * (requestScan/scanState/scanItem) and connect to a picked AP with a password
@@ -38,6 +40,12 @@ enum Lifecycle : int {
 void start();
 
 bool wifi_is_connected();
+/**
+ * v1.12.1: true once the wifi task has brought the STA radio up — ESP-NOW
+ * may start listening WITHOUT waiting for a connection (pucks work with
+ * the router off; the task pins the last AP channel while the link is down).
+ */
+bool radio_started();
 String wifi_ip();
 String wifi_ssid();
 int wifi_rssi();

@@ -38,6 +38,24 @@
 #define CATFISH_RFNODE_CMD_FEED 1
 #define CATFISH_RFNODE_PKT_LEN  12
 
+/** v1.12.1: channel the hub listens on when it has never joined a network. */
+#define CATFISH_ESPNOW_DEFAULT_CHANNEL 1
+
+/**
+ * v1.12.1: pick the channel the hub's ESP-NOW receiver should listen on.
+ *  - STA connected: the AP's channel (pucks are paired to it).
+ *  - STA down: the last AP channel we saw — the wifi task pins the radio
+ *    there between reconnect attempts, so pucks keep matching while the
+ *    router is off (a scanning STA hops channels and deafens reception).
+ *  - Never connected: CATFISH_ESPNOW_DEFAULT_CHANNEL.
+ */
+inline uint8_t catfishRfnodeListenChannel(bool connected, uint8_t apChan,
+                                          uint8_t lastChan) {
+  if (connected && apChan) return apChan;
+  if (lastChan) return lastChan;
+  return CATFISH_ESPNOW_DEFAULT_CHANNEL;
+}
+
 /** Clamp a node-requested tank mask to the 4 supported tanks (0 stays 0). */
 inline uint8_t catfishRfnodeClampMask(uint8_t mask) { return mask & 0x0Fu; }
 

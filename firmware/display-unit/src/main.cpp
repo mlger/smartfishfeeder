@@ -287,7 +287,7 @@ static void radiosUiSync() {
   const char *et = "off";
   switch ((net_espnow::State)es) {
     case net_espnow::State::Disabled:   et = "disabled";          break;
-    case net_espnow::State::WaitingWifi: et = "waiting for WiFi"; break;
+    case net_espnow::State::WaitingWifi: et = "starting";         break;
     case net_espnow::State::Listening:  et = "listening";         break;
     case net_espnow::State::Error:      et = "error";             break;
   }
@@ -1862,9 +1862,11 @@ void loop() {
   beginOtaOnce();
   if (s_ota_ready) ArduinoOTA.handle();
 
-  // ESP-NOW: start listening once the STA has a channel (v1.8.0)
+  // ESP-NOW: start listening as soon as the radio is up — NOT only when WiFi
+  // is connected (v1.12.1 fix: pucks were dead whenever the router was off;
+  // the wifi task now pins the last AP channel while the link is down).
   if (net_espnow::state() == net_espnow::State::WaitingWifi &&
-      net_wifi::wifi_is_connected()) {
+      net_wifi::radio_started()) {
     net_espnow::beginOnce();
   }
 

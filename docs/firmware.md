@@ -220,12 +220,12 @@ Battery "pucks" (any ESP8266/ESP32 + button) can trigger a feed wirelessly. Both
 
 | Transport | Feature flag | Status shown in Settings → RADIOS |
 |-----------|--------------|-----------------------------------|
-| **ESP-NOW** (hub is the receiver) | `-DCATFISH_FEATURE_ESPNOW=1` (default) | `listening` once WiFi connects (channel follows the AP — pucks must send on the same channel) |
+| **ESP-NOW** (hub is the receiver) | `-DCATFISH_FEATURE_ESPNOW=1` (default) | `listening` once the radio starts — v1.12.1 also with WiFi down. On the AP's channel while connected; with the link down the hub pins the last-used AP channel (or channel 1 if it never connected) between bounded reconnect attempts |
 | **nRF24L01+** (CE GPIO43 / CSN GPIO44, SPI shared with the TF card) | `-DCATFISH_FEATURE_NRF24=1` (default) | `listening` / `not found` when no module answers |
 
 **Packet** (12 bytes): magic `'C''F'`, protocol version, command (`1` = feed), tank mask (0 = hub's current selection), seconds (0 = hub default pulse, hard-capped 60), a uint16 sequence number (repeated broadcasts are dropped), and a 4-byte key = FNV-1a of the **pairing token**. Trust model equals the LAN HTTP API: rotating the token invalidates every puck until it is re-provisioned (the hub re-keys automatically).
 
-**Puck settings (nRF24)**: 1 Mbps, channel 76 (`-DCATFISH_RF24_CHANNEL`), 5-byte address `0xCA 0x74 0xF1 0x5B 0x01`. **Puck settings (ESP-NOW)**: broadcast the 12-byte datagram on the hub's WiFi channel.
+**Puck settings (nRF24)**: 1 Mbps, channel 76 (`-DCATFISH_RF24_CHANNEL`), 5-byte address `0xCA 0x74 0xF1 0x5B 0x01`. **Puck settings (ESP-NOW)**: broadcast the 12-byte datagram on the hub's WiFi channel. With the router off the hub keeps listening on that same (last-used) channel — v1.12.1; a hub that has never joined any network listens on channel 1.
 
 **SPI sharing**: the nRF24 and the TF card sit on the same SPI pins; every SD and radio operation is serialized by `src/spi_bus_guard.h`, so both features can be enabled together. Remove a `-DCATFISH_FEATURE_*` line in `platformio.ini` to build a radio-free image — each feature degrades to a status line ("disabled"/"not found").
 

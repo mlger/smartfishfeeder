@@ -1,13 +1,23 @@
 /**
  * @file net_wifi.cpp
  * @brief WiFi connection manager task (WiFiManager + mDNS + NTP).
+ *
+ * v1.12.1: while the link is down the task no longer fires reconnect() every
+ * monitor pass — a scanning STA hops channels, which deafens the ESP-NOW feed
+ * pucks. Instead the STA is idled and the radio is PINNED to the last AP
+ * channel (catfishRfnodeListenChannel, host-tested); reconnects run as
+ * bounded attempts (30 s cadence, 10 s budget) with the channel re-pinned
+ * between them. ESP-NOW therefore keeps receiving with the router off.
  */
 #include "net_wifi.h"
 #include <Arduino.h>
+#include <esp_wifi.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <time.h>
+
+#include <catfish_rfnode.h>
 
 #include "diag.h"
 
@@ -16,6 +26,8 @@
 #define WIFI_MONITOR_MS    5000
 #define WIFI_PORTAL_AFTER_MS 90000  // reopen portal after this much downtime
 #define WIFI_PORTAL_TIMEOUT_S 180
+#define WIFI_RETRY_EVERY_MS   30000 // v1.12.1: reconnect cadence while down
+#define WIFI_ATTEMPT_BUDGET_MS 10000 // v1.12.1: give each attempt this long
 
 namespace {
 
@@ -26,6 +38,12 @@ char s_ip[16] = {0};
 char s_ssid[33] = {0};
 volatile int s_rssi = 0;
 bool s_mdns_started = false;
+
+// v1.12.1: ESP-NOW support while the link is down
+volatile bool s_radio_started = false; // set once the STA radio is up
+volatile uint8_t s_last_ap_chan = 0;   // last AP channel seen while connected
+uint32_t s_attempt_at = 0;             // millis() the current attempt began (0 = none)
+uint32_t s_next_attempt = 0;           // millis() the next attempt may start
 
 // ---- v1.10.0: on-display WiFi manager (UI = single writer, wifi-task consumes)
 constexpr uint8_t WIFI_MGR_MAX_APS = 12;
@@ -52,6 +70,10 @@ void publish() {
 /** Called on every (re)connect: sleep off, mDNS (once), NTP Asia/Manila (UTC+8). */
 void applyConnectedState() {
   WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true); // v1.12.1: restore driver-level fast reconnect
+  // v1.12.1: remember the AP channel — while the link is down the wifi task
+  // pins the radio here so ESP-NOW feed pucks keep matching it.
+  s_last_ap_chan = WiFi.channel();
   if (!s_mdns_started) {
     // MDNS.begin() fails when already started; guard so reconnect logs stay honest.
     if (MDNS.begin(WIFI_HOSTNAME)) {
@@ -60,6 +82,21 @@ void applyConnectedState() {
     }
   }
   configTzTime("PHT-8", "pool.ntp.org", "time.nist.gov"); // Asia/Manila UTC+8
+}
+
+/**
+ * v1.12.1: idle the STA and pin the radio to the channel the pucks know —
+ * the last AP channel, or channel 1 if the hub never connected. A scanning
+ * or auto-retrying STA hops channels, which deafens ESP-NOW reception, so
+ * reconnects run as bounded attempts with the channel re-pinned in between.
+ */
+void holdListenChannel() {
+  WiFi.mode(WIFI_STA);           // drop any leftover AP from the setup portal
+  WiFi.disconnect(false, false); // STA idle; stored credentials untouched
+  const uint8_t ch = catfishRfnodeListenChannel(false, 0, s_last_ap_chan);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[NET] radio idle - pinned to ch%u for ESP-NOW nodes\n",
+                (unsigned)ch);
 }
 
 void wifiTask(void * /*param*/) {
@@ -73,6 +110,7 @@ void wifiTask(void * /*param*/) {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(WIFI_HOSTNAME);
   WiFi.setAutoReconnect(true);
+  s_radio_started = true; // v1.12.1: radio up — ESP-NOW may start listening
 
   static WiFiManager wm; // persists for portal restarts
   wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
@@ -120,6 +158,7 @@ void wifiTask(void * /*param*/) {
         publish();
         s_connected = true;
         down_since = 0;
+        s_attempt_at = 0;
         Serial.printf("[NET] UI connect OK SSID='%s' IP=%s\n", s_ssid, s_ip);
       } else {
         // let the normal reconnect/portal machinery take back over
@@ -190,17 +229,36 @@ void wifiTask(void * /*param*/) {
       }
       s_connected = true;
       down_since = 0;
+      s_attempt_at = 0;
       publish();
-    } else {
+    } else if (s_conn_state != net_wifi::CONN_BUSY) {
+      // v1.12.1: an in-flight UI connect owns the radio — skip recovery.
       if (s_connected) {
         // just lost link
         s_connected = false;
         s_rssi = 0;
         down_since = millis();
-        Serial.println("[NET] WiFi lost - reconnecting");
-        WiFi.reconnect();
+        Serial.println("[NET] WiFi lost");
+        WiFi.setAutoReconnect(false); // manual bounded attempts below
+        s_next_attempt = millis() + WIFI_RETRY_EVERY_MS;
+        holdListenChannel();
       } else if (down_since == 0) {
         down_since = millis();
+      }
+
+      // v1.12.1: bounded reconnect attempts (30 s cadence, 10 s budget) —
+      // replaces the old fire-and-forget reconnect() every monitor pass,
+      // whose scan churn hopped channels and deafened the feed pucks.
+      if (s_attempt_at != 0 &&
+          (int32_t)(millis() - s_attempt_at) >= WIFI_ATTEMPT_BUDGET_MS) {
+        s_attempt_at = 0;
+        if (WiFi.status() != WL_CONNECTED) holdListenChannel();
+      } else if (s_attempt_at == 0 &&
+                 (int32_t)(millis() - s_next_attempt) >= 0) {
+        s_next_attempt = millis() + WIFI_RETRY_EVERY_MS;
+        s_attempt_at = millis();
+        Serial.println("[NET] reconnect attempt (stored credentials)");
+        WiFi.begin(); // stored credentials (WIFI_STORAGE_FLASH)
       }
 
       if (down_since != 0 && (millis() - down_since) > WIFI_PORTAL_AFTER_MS) {
@@ -232,6 +290,10 @@ void start() {
 
 bool wifi_is_connected() {
   return s_connected && WiFi.status() == WL_CONNECTED;
+}
+
+bool radio_started() {
+  return s_radio_started;
 }
 
 String wifi_ip() { return String(s_ip); }
