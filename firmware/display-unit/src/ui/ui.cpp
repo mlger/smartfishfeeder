@@ -216,9 +216,10 @@ static uint8_t s_tab_active = 0;
 static lv_obj_t *s_calib_rows = nullptr;
 static lv_obj_t *s_calib_name_lbl[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
 static lv_obj_t *s_calib_rate_lbl[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
-static lv_obj_t *s_calib_meas_sb[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr};
+static lv_obj_t *s_calib_meas_ta[CATFISH_MAX_TANKS] = {nullptr, nullptr, nullptr, nullptr}; // v1.11.7: measured grams (one-line numeric textarea — spinbox has no touch input here)
 static lv_obj_t *s_calib_test_btns[CATFISH_MAX_TANKS][2] = {};
 static lv_obj_t *s_calib_ok_btns[CATFISH_MAX_TANKS] = {};
+static lv_obj_t *s_calib_kb = nullptr; // v1.11.7: numeric keyboard for measured grams
 static uint8_t s_calib_test_s[CATFISH_MAX_TANKS] = {2, 2, 2, 2}; // last test seconds per tank
 // v1.11.7: TEST x2 + OK buttons per tank — disabled while a test pulse is in
 // flight (a second TEST would queue a second dispense; the weighed grams
@@ -396,6 +397,7 @@ void refillCb(lv_event_t *e);
 void policySaveCb(lv_event_t *e);
 void schedTabShow(uint8_t idx);
 void schedTabCb(lv_event_t *e);
+void calibTaFocusCb(lv_event_t *e); // v1.11.7: measured-grams numeric keyboard
 void calibTestCb(lv_event_t *e);
 void calibSetCb(lv_event_t *e);
 void rebuildCalibRows();
@@ -918,6 +920,7 @@ void policySaveCb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 void schedTabShow(uint8_t idx) {
   if (idx > 3) idx = 0;
+  kbHide(s_calib_kb); // v1.11.7: typing a value then switching tabs closes the pad
   s_tab_active = idx;
   for (uint8_t i = 0; i < 4; i++) {
     if (s_tab_pages[i]) {
@@ -959,8 +962,11 @@ void calibTestCb(lv_event_t *e) {
 // loop() (UI_EVT_CALIB_SET) so NVS writes stay off the LVGL task.
 void calibSetCb(lv_event_t *e) {
   const uintptr_t idx = (uintptr_t)(intptr_t)lv_event_get_user_data(e);
-  if (idx >= CATFISH_MAX_TANKS || !s_calib_meas_sb[idx]) return;
-  const uint16_t measured = (uint16_t)lv_spinbox_get_value(s_calib_meas_sb[idx]);
+  if (idx >= CATFISH_MAX_TANKS || !s_calib_meas_ta[idx]) return;
+  // v1.11.7: value lives in a one-line numeric textarea now (atoi + clamp;
+  // max_length 4 + accepted chars already bound it to 0..9999).
+  const uint16_t measured =
+      (uint16_t)atoi(lv_textarea_get_text(s_calib_meas_ta[idx]));
   if (measured == 0) {
     ui_toast("Weigh the output first");
     return;
@@ -971,6 +977,15 @@ void calibSetCb(lv_event_t *e) {
   ev.b = s_calib_test_s[idx] ? s_calib_test_s[idx] : 2;
   ev.grams = measured;
   uiEventSend(ev);
+}
+
+// v1.11.7: tap the measured-grams field -> numeric keypad (same pattern as
+// the tank name/token textareas; LVGL v8's keyboard only speaks textarea, so
+// this is a one-line numeric lv_textarea, NOT a spinbox).
+void calibTaFocusCb(lv_event_t *e) {
+  if (!s_calib_kb) return;
+  lv_keyboard_set_mode(s_calib_kb, LV_KEYBOARD_MODE_NUMBER);
+  kbShowFor(s_calib_kb, (lv_obj_t *)lv_event_get_target(e));
 }
 
 void editorSaveCb(lv_event_t *e) {
@@ -3458,7 +3473,7 @@ void rebuildCalibRows() {
   for (uint8_t i = 0; i < CATFISH_MAX_TANKS; i++) {
     s_calib_name_lbl[i] = nullptr;
     s_calib_rate_lbl[i] = nullptr;
-    s_calib_meas_sb[i] = nullptr;
+    s_calib_meas_ta[i] = nullptr;
     s_calib_test_btns[i][0] = nullptr;
     s_calib_test_btns[i][1] = nullptr;
     s_calib_ok_btns[i] = nullptr;
@@ -3505,14 +3520,46 @@ void rebuildCalibRows() {
       s_calib_test_btns[i][k] = b; // v1.11.7: busy guard
     }
 
-    // measured grams (0..2000 g, 4 digits) + OK
-    lv_obj_t *sb = makeSpinbox(row, 0, 2000, 0, 96, 56);
-    s_calib_meas_sb[i] = sb;
+    // measured grams — one-line numeric textarea (v1.11.7). The old spinbox
+    // was display-only on touch (makeSpinRow's +- buttons don't fit this row,
+    // and LVGL v8's keyboard only supports textareas). Tapping opens the
+    // numeric keypad; OK (calibSetCb) parses + clamps the grams.
+    lv_obj_t *ta = lv_textarea_create(row);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_accepted_chars(ta, "0123456789");
+    lv_textarea_set_max_length(ta, 4);
+    lv_textarea_set_placeholder_text(ta, "0");
+    lv_obj_set_size(ta, 96, 56);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(C_BG_DARK), 0);
+    lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(C_CARD_HI), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_radius(ta, 8, 0);
+    lv_obj_set_style_pad_all(ta, 8, 0);
+    lv_obj_add_event_cb(ta, calibTaFocusCb, LV_EVENT_FOCUSED, nullptr);
+    s_calib_meas_ta[i] = ta;
     lv_obj_t *ok = makeBtn(row, LV_SYMBOL_OK, C_CARD, C_AMBER, C_CARD_HI, 56, 56);
     lv_obj_add_event_cb(ok, calibSetCb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
     s_calib_ok_btns[i] = ok; // v1.11.7: busy guard
   }
   refreshCalibRows();
+
+  // v1.11.7: numeric keypad for the measured-grams fields (child of this tab
+  // page, so switching tabs hides it; schedTabShow also detaches the field).
+  // Created once — rebuildCalibRows runs again on tank-count changes.
+  if (!s_calib_kb) {
+    s_calib_kb = lv_keyboard_create(s_tab_pages[3]);
+    lv_obj_set_size(s_calib_kb, lv_pct(100), 210);
+    lv_obj_align(s_calib_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    kbStyle(s_calib_kb);
+    lv_keyboard_set_mode(s_calib_kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_obj_add_event_cb(s_calib_kb, kbReadyCb, LV_EVENT_READY, nullptr);
+    lv_obj_add_event_cb(s_calib_kb, kbCancelCb, LV_EVENT_CANCEL, nullptr);
+    lv_keyboard_set_textarea(s_calib_kb, nullptr);
+    lv_obj_add_flag(s_calib_kb, LV_OBJ_FLAG_HIDDEN);
+  }
 }
 
 /** Repaint name + rate lines from prefs (idempotent; LVGL task only). */
