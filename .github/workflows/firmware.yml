@@ -269,7 +269,9 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p site/fw
-          cp web-flasher/* site/
+          # -a + /. : recursive — the self-hosted ESP Web Tools bundle lives in
+          # web-flasher/vendor/ (v1.12.0); a bare `cp dir/*` skips subdirs.
+          cp -a web-flasher/. site/
           cp dist/display-unit/firmware.factory.bin site/fw/display-unit-merged.bin
           cp dist/relay-unit/relay-unit-firmware.bin site/fw/relay-unit-firmware.bin
 

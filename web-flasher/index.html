@@ -5,9 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Catfish Feeder — Web Flasher</title>
-  <!-- ESP Web Tools v10 (verified: resolves to 10.4.0) — the ONLY external resource on this page -->
-  <!-- v1.8.2: pinned exact version — the floating @10 tag made the flasher page break whenever unpkg served a bad/regressed release. -->
-  <script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+  <!-- ESP Web Tools v10.4.0 — SELF-HOSTED from ./vendor/ (no CDN dependency).
+       v1.8.2 pinned the exact version because the floating @10 unpkg tag made
+       the page break whenever the CDN served a bad/regressed release; v1.12.0
+       vendors the whole dist/web bundle same-origin instead — the installer
+       now loads even when unpkg is blocked/down or an ad-blocker strips
+       third-party scripts. Source: npm esp-web-tools@10.4.0 (dist/web). -->
+  <script type="module" src="./vendor/install-button.js"></script>
   <style>
     :root {
       --pond: #0f2321;        /* deep teal pond */
@@ -116,6 +120,20 @@
       color: var(--danger);
       font-size: 0.88rem;
     }
+
+    /* v1.12.0: visible warning when the installer script itself failed to load
+       (blocked by an extension/offline CDN) — before, the install buttons just
+       sat there dead with no explanation. */
+    #installer-load-error {
+      margin: 0.75rem 0 0;
+      color: var(--danger);
+      font-size: 0.9rem;
+      background: rgba(224, 122, 95, 0.08);
+      border: 1px solid rgba(224, 122, 95, 0.4);
+      border-radius: 10px;
+      padding: 0.6rem 0.8rem;
+    }
+    #installer-load-error[hidden] { display: none; }
 
     .sr-only {
       position: absolute;
@@ -259,6 +277,12 @@
         <p id="fw-version-error" class="vp-error" hidden>
           Couldn&rsquo;t load the release list — the install buttons below will
           flash the most recent <code>main</code> build instead.
+        </p>
+        <p id="installer-load-error" hidden>
+          <strong>The installer failed to load.</strong> The install buttons
+          will not work in this state. An ad-blocker / privacy extension or a
+          network filter is the most common cause — disable it for this page
+          and reload, then click Install again.
         </p>
       </section>
 
@@ -406,7 +430,8 @@
           <a href="https://github.com/mlger/smartfishfeeder/blob/main/docs/notes/hardware-4.3b.md">hardware notes (4.3B)</a>
         </p>
         <p>
-          Built with <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.
+          Built with <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>
+          (self-hosted, no external CDN).
           The version picker above mirrors every GitHub release — CI refreshes it
           on every push to <code>main</code> and on each new release.
         </p>
@@ -505,6 +530,19 @@
       select.addEventListener('change', function () {
         var idx = Number(select.value);
         if (idx >= 0) applyVersion(idx);
+      });
+
+      // v1.12.0 installer self-check: the ESP Web Tools module upgrades
+      // <esp-web-install-button> on load. If the custom element is still
+      // undefined a few seconds after DOM ready, the script was blocked —
+      // surface it instead of leaving dead buttons.
+      window.addEventListener('load', function () {
+        setTimeout(function () {
+          if (!window.customElements ||
+              customElements.get('esp-web-install-button') === undefined) {
+            document.getElementById('installer-load-error').hidden = false;
+          }
+        }, 4000);
       });
     })();
   </script>
