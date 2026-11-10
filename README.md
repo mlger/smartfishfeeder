@@ -137,6 +137,8 @@ CI builds both firmwares on every push (ESP32-S3 factory image pre-merged at boo
 - ~~OTA updates for the display unit~~ — shipped in v1.1.0 (ArduinoOTA on both units, optional build-time password)
 - ~~Multi-tank / multi-relay support (one display unit driving several relays)~~ — shipped in v1.5.0 (cap 4 tanks: per-tank IPs/tokens, tank-mask schedules, per-tank MQTT/dashboard entities)
 
+The full phased plan (stabilization → hardening → sensing → camera) lives in [ROADMAP.md](ROADMAP.md).
+
 ## Credits
 
 - [Waveshare](https://www.waveshare.com) — ESP32-S3-Touch-LCD-4.3B demo package (board config, `lvgl_v8_port`), Apache-2.0/CC0

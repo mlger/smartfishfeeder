@@ -96,7 +96,7 @@ NodeMCU GND, relay module GND and PSU GND must share a **common ground**. The re
 | Roller drum | Motor turns a paddle drum over an opening | Simple, tolerant of pellets | Portions less repeatable |
 | Archimedes screw (large pitch) | Same principle as auger with a wider tube | Handles bigger pellets | More motor torque needed |
 
-**Portion calibration:** start with **2-3 s feed pulses** (`POST /feed` with `duration_ms: 2000`, or the Feed Now button), weigh the dispensed pellets, and adjust the duration until the portion matches your stocking density. Record the calibrated duration in the Schedule screen. Re-check after changing pellet brand or size — pellet length strongly affects grams-per-second.
+**Portion calibration:** the easy path is the display unit's CALIB screen (v1.11.6): run a test pulse, weigh the dispensed pellets, enter the measured grams — the firmware derives grams-per-second and stores it per tank (v1.12.0 applies sub-second millisecond pulses, so portions land within a pellet or two). Via the relay API, send a raw pulse instead: `POST /feed` with `{"seconds":2,"token":"..."}` (optionally `"ms":500` for sub-second pulses). Re-check after changing pellet brand or size — pellet length strongly affects grams-per-second.
 
 ## Assembly checklist
 

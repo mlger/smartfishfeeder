@@ -24,7 +24,7 @@
 // (CATFISH_APP_VERSION, shared with the relay unit); this fallback keeps IDE
 // tooling happy and avoids macro redefinition.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.0.0"
+#define CATFISH_APP_VERSION "1.12.0"
 #endif
 
 // ---- Events: LVGL callbacks -> loop() (payload-bearing, race-free) ----

@@ -475,7 +475,7 @@ Then upload with the matching password — PlatformIO prompts (or use `--upload-
 
 - Flash: 16 MB QIO (`board_upload.flash_size = 16MB`, `board_build.flash_mode = qio`), partition table `default_16MB.csv` — large OTA-capable app slots, SPIFFS area, and the `boot_app0.bin` OTA-data sector at `0xe000` that selects the running slot.
 - PSRAM: 8 MB octal on the N16R8 module — requires `board_build.arduino.memory_type = qio_opi` and `-DBOARD_HAS_PSRAM`. Wrong memory type is the usual cause of PSRAM init failures.
-- LVGL pool: `include/lv_conf.h` sets `LV_MEM_SIZE` to 64 KB with the Montserrat fonts needed by the UI already enabled.
+- LVGL pool: `include/lv_conf.h` sets `LV_MEM_SIZE` to 160 KB (raised after the v1.11.x UI growth); see `include/catfish_lv_mem.h` for the pool helper.
 
 ## Troubleshooting
 

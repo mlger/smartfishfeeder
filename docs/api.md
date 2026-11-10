@@ -250,4 +250,4 @@ Single-tank setups keep the exact pre-v1.5.0 behavior — the legacy relay-IP st
 - The token guards `POST /feed` and `POST /config`; `/status`, `/health` and `/` are readable by anyone on the LAN. On a home network this is acceptable; on shared networks it is not.
 - **Change the default token (`catfish`)** before real use — no `curl` needed: the display unit's Settings → Relay Unit → *Pairing token* editor can rotate the relay's token directly (tick "Also update the relay unit"). Both sides stay in sync because the display only persists the new token after the relay accepted it.
 - Because HTTP is plaintext, treat the token as a light fence, not a secret: anyone sniffing the LAN can read it. Physically securing the network is the real control.
-- Planned hardening (see README roadmap): MQTT with credentials for Home Assistant integration.
+- MQTT with credentials + Home Assistant auto-discovery shipped in v1.2.0 (see [mqtt.md](mqtt.md)). Remaining hardening items are tracked in [ROADMAP.md](../ROADMAP.md).
