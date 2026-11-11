@@ -37,5 +37,8 @@ Thumbs.db
 *.swp
 *~
 
-# Local Espressif QEMU install (scripts/qemu_run.sh)
-tools/
+# Local Espressif QEMU install (scripts/qemu_run.sh) — but the vendored
+# libslirp fallback the CI job unpacks is tracked (pattern order matters:
+# dir/* + negation, a bare tools/ + ! would not re-include children)
+tools/*
+!tools/qemu-deps/
