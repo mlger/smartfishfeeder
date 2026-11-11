@@ -24,7 +24,7 @@
 // (CATFISH_APP_VERSION, shared with the relay unit); this fallback keeps IDE
 // tooling happy and avoids macro redefinition.
 #ifndef CATFISH_APP_VERSION
-#define CATFISH_APP_VERSION "1.12.1"
+#define CATFISH_APP_VERSION "1.13.0"
 #endif
 
 // ---- Events: LVGL callbacks -> loop() (payload-bearing, race-free) ----
@@ -75,6 +75,9 @@ struct UiEvent {
   bool flag = false;
   uint8_t feedSrc = 0;  // v1.9.0 (F3): FEED source: 0 touch/node, 1 web, 2 MQTT
   uint16_t grams = 0;   // v1.10.0: FEED/SCHED_ADD/SET_PORTION portion (g)
+  // v1.13.0: RF_FEED datagram seq — echoed to the relay in /feed "seq" so its
+  // direct ESP-NOW listener can dedup the same broadcast (0 = no datagram).
+  uint16_t seq = 0;
   uint32_t bytes = 0;   // v1.11.0: OTA_PROGRESS bytes written so far
   char token[24] = {0}; // == CATFISH_TOKEN_LEN (23 chars + NUL)
   uint8_t tankMask = 0; // FEED/SCHED_ADD: target tanks (bit i = tank i+1); 0 = tank 1
@@ -102,6 +105,10 @@ struct UiEvent {
   char tankName[CATFISH_TANK_NAME_LEN] = {0};   // == 16 (15 chars + NUL)
   uint16_t tankGps = 0;   // food rate g/second (0 = nominal)
   uint16_t tankHcap = 0;  // v1.10.0: hopper capacity in GRAMS (0 = unknown)
+  // v1.13.0: direct puck feed toggle for this tank's relay (POST /config
+  // "espnowDirect"). false = leave the relay's persisted flag untouched.
+  bool tankEspnowDirect = false;
+  bool tankEspnowDirectValid = false; // true = the toggle was touched
 };
 
 namespace ui {

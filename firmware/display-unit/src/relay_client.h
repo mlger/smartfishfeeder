@@ -62,6 +62,7 @@ struct Status {
   int servoFeed = -1;
   int stepHz = -1;
   bool pulseMs = false;     // v1.12.0: relay accepts sub-second /feed pulses
+  int espnowDirect = -1;    // v1.13.0: relay direct puck feed (1 on / 0 off / -1 unknown/pre-1.13.0)
   String error = "";
 };
 
@@ -102,7 +103,7 @@ Result discoverTank(uint8_t tank1);
  * cached IP triggers one re-discovery + retry (stale-IP self-heal).
  * Blocking — call from the net worker task only.
  */
-Result feedTank(uint8_t tank1, uint16_t totalMs);
+Result feedTank(uint8_t tank1, uint16_t totalMs, uint16_t rfSeq = 0);
 
 /**
  * GET /status for a tank -> parse {"state","feeding","lastFeedEpoch",
@@ -125,6 +126,25 @@ Result configureMechTank(uint8_t tank1, uint8_t mech, uint8_t restDeg,
  * persist it (prefs::setTankToken) and refresh applyTankTokens().
  */
 Result rotateTokenTank(uint8_t tank1, const String &newToken);
+
+/**
+ * v1.13.0: POST /config {"espnowDirect":<bool>} on a tank's relay — toggles
+ * its direct puck feed listener (relay-side ESP-NOW, works with the router
+ * off). The relay persists the flag in its own additive EEPROM record.
+ */
+Result configEspnowDirectTank(uint8_t tank1, bool direct);
+
+/**
+ * v1.13.0: cached direct-feed flag for @p tank1 (from the last /status probe).
+ * @return 1 on / 0 off / -1 unknown or pre-1.13.0 relay.
+ */
+int espnowDirectTank(uint8_t tank1);
+
+/**
+ * v1.13.0: true when ANY tank in @p tankMask has direct puck feed enabled —
+ * used to phrase WiFi-down feed toasts honestly (the relay may still feed).
+ */
+bool anyTankEspnowDirect(uint8_t tankMask);
 
 /**
  * One UDP broadcast round; bind every configured tank that has no live IP to

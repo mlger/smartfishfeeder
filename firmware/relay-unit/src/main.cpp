@@ -12,18 +12,37 @@
  *
  * HTTP API (LAN-only by design; JSON unless noted):
  *   GET  /health                  -> 200 "OK" (no auth; ESP32 validates a discovered IP)
- *   GET  /status                  -> JSON telemetry (no auth)
+ *   GET  /status                  -> JSON telemetry (no auth; "espnow"/"espnowMask"
+ *                                    capability since v1.13.0)
  *   POST /feed                    -> body {"seconds":0..60, "ms":0..999,
- *                                    "token":"..."} (auth; "ms" optional,
- *                                    v1.12.0 sub-second pulses — older relays
- *                                    and callers without "ms" behave as before)
- *   GET  /feed?seconds=N&ms=M&token=T -> same logic, curl convenience (auth)
+ *                                    "token":"...", "seq":<optional>} (auth;
+ *                                    "ms" optional, v1.12.0 sub-second pulses;
+ *                                    "seq" optional, v1.13.0 — the hub echoes the
+ *                                    originating puck datagram seq so the relay's
+ *                                    direct ESP-NOW listener can dedup)
+ *   GET  /feed?seconds=N&ms=M&seq=S&token=T -> same logic, curl convenience (auth)
  *   GET  /                        -> minimal status page, 10 s auto-refresh
  *   POST /config                  -> {"token":"<current>", "maxPulseS":1..60,
  *                                     "pulseS":1..30, "newToken":"<optional>",
  *                                     "mechanism":"motor|servo|stepper",
  *                                     "servoRestDeg","servoFeedDeg","stepHz",
- *                                     "stepDir"} (auth; P4 keys optional)
+ *                                     "stepDir", "espnowDirect":<bool>,
+ *                                     "espnowMask":0..15} (auth; P4 keys optional;
+ *                                     espnow keys v1.13.0)
+ *
+ * Direct puck feed (v1.13.0, opt-in via POST /config "espnowDirect":true):
+ *   The relay listens for the wireless feed-node datagram (catfish_rfnode.h)
+ *   on its WiFi channel and feeds DIRECTLY when the hub does not answer within
+ *   CATFISH_RFDEDUP_GRACE_MS (catfish_rfdedup.h) — so puck presses work with
+ *   the router off. Coordination: any authenticated /feed cancels the pending
+ *   intent (the hub is alive and owns feeding); a /feed carrying "seq":S marks
+ *   S executed so the same broadcast can never feed twice. The seq ring, grace
+ *   window and wraparound math are pinned by the native suite
+ *   test_catfish_rfdedup (firmware/display-unit/test/).
+ *   While the link is down the radio is PINNED to the last AP channel between
+ *   bounded reconnect attempts (same scheme as the display unit v1.12.1) and
+ *   a failed boot portal continues HEADLESS instead of restarting, so pucks
+ *   keep working with no router at all.
  *
  * Feeding mechanisms (Phase 4; all keep "feed for N seconds" semantics):
  *   motor (default) D1 relay/FET ON for N s — original behaviour
@@ -76,6 +95,11 @@
 #include <time.h>
 
 #include "config.h"
+#include <espnow.h>            // v1.13.0: direct puck feed (ESP-NOW slave)
+#include <user_interface.h>    // v1.13.0: wifi_get_channel/wifi_set_channel
+
+#include <catfish_rfnode.h>    // shared puck datagram parse + key derivation
+#include <catfish_rfdedup.h>   // shared direct-feed dedup state machine
 
 // ---------------------------------------------------------------------------
 // Logging (Serial 115200, every line tagged [RELAY])
@@ -281,6 +305,57 @@ static void otaConfigLoad() {
       (unsigned)strlen(g_ota.pwd));
 }
 
+// ---------------------------------------------------------------------------
+// ESP-NOW direct feed config — fourth, ADDITIVE EEPROM record (v1.13.0).
+// Lives at ESPNOW_EEPROM_OFFSET (192) with its own magic/checksum so flashing
+// this firmware onto an existing install preserves the token/pulse, mechanism
+// and OTA records byte-for-byte.
+// ---------------------------------------------------------------------------
+struct __attribute__((packed)) EspnowConfig {
+  uint32_t magic;    // ESPNOW_MAGIC
+  uint8_t direct;    // 1 = listen for puck broadcasts and feed directly
+  uint8_t mask;      // 0 = honor all datagram tank masks; else bitmask 1..0x0F
+  uint32_t checksum; // FNV-1a over everything above this field
+};
+static_assert(sizeof(EspnowConfig) == 10, "EspnowConfig EEPROM layout changed");
+
+static EspnowConfig g_espnow;
+
+static uint32_t espnowChecksum(const EspnowConfig &e) {
+  return fnv1a(&e, offsetof(EspnowConfig, checksum));
+}
+
+static void espnowDefaults(EspnowConfig &e) {
+  memset(&e, 0, sizeof(e));
+  e.magic = ESPNOW_MAGIC;
+  e.direct = 0; // OFF by default — enabling is an explicit, documented step
+  e.mask = 0;   // honor all masks (single-tank default)
+  e.checksum = espnowChecksum(e);
+}
+
+static void saveEspnowConfig() {
+  g_espnow.checksum = espnowChecksum(g_espnow);
+  EEPROM.put(ESPNOW_EEPROM_OFFSET, g_espnow);
+  EEPROM.commit();
+}
+
+static void espnowConfigLoad() {
+  EspnowConfig e;
+  EEPROM.get(ESPNOW_EEPROM_OFFSET, e);
+  if ((e.magic != ESPNOW_MAGIC) || (e.checksum != espnowChecksum(e))) {
+    LOG("espnow EEPROM empty/invalid -> defaults (direct OFF)");
+    espnowDefaults(e);
+    g_espnow = e;
+    saveEspnowConfig();
+    return;
+  }
+  e.direct = e.direct ? 1 : 0;
+  e.mask &= 0x0F;
+  g_espnow = e;
+  LOG("espnow loaded: direct=%u mask=0x%X", (unsigned)g_espnow.direct,
+      (unsigned)g_espnow.mask);
+}
+
 /** STEP/DIR idle-low from the first microseconds (same discipline as RELAY_PIN). */
 static void mechPinsBootSafe() {
   digitalWrite(STEP_PIN, LOW);
@@ -482,10 +557,115 @@ static void discoveryPump() {
 }
 
 // ---------------------------------------------------------------------------
+// v1.13.0: direct puck feed — ESP-NOW listener (opt-in, espnowDirect).
+//
+// The recv callback runs in the ESP8266 WiFi/SDK task context: parse + key
+// check + dedup bookkeeping ONLY — no HTTP, no EEPROM, no pulse start. The
+// pending->grace->direct execution happens on loop() via rfdedupTick(),
+// using the shared, host-tested state machine in catfish_rfdedup.h.
+// ---------------------------------------------------------------------------
+static CatfishRfDedup g_dedup;
+static bool g_espnowReady = false;
+static uint32_t g_espnowDrops = 0;
+
+static void espnowRecvCb(uint8_t *mac, uint8_t *data, uint8_t len) {
+  (void)mac; // sender MAC intentionally not filtered — the packet key is the gate
+  if (!g_espnow.direct) { g_espnowDrops++; return; }
+  uint8_t cmd = 0xFF, mask = 0, seconds = 0;
+  uint16_t seq = 0;
+  uint32_t key = 0;
+  if (!catfishRfnodeParse(data, (size_t)len, &cmd, &mask, &seconds, &seq, &key)) {
+    g_espnowDrops++;
+    return;
+  }
+  if (key != catfishRfnodeKeyFromToken(g_cfg.token)) {
+    g_espnowDrops++;
+    LOG("espnow: rejected packet (bad key, seq %u)", (unsigned)seq);
+    return;
+  }
+  // Tank-mask filter: relay mask 0 = honor everything; a datagram mask of 0
+  // means "hub default" which we cannot resolve headless — honor it too.
+  if (g_espnow.mask != 0 && mask != 0 && !(mask & g_espnow.mask)) {
+    g_espnowDrops++;
+    return;
+  }
+  if (!catfishRfDedupArm(&g_dedup, seq, seconds, millis())) {
+    return; // seq already executed — duplicate/re-broadcast, drop silently
+  }
+  LOG("espnow: puck request armed (seq %u, %u s, mask 0x%X) - %u ms grace",
+      (unsigned)seq, (unsigned)seconds, (unsigned)mask,
+      (unsigned)CATFISH_RFDEDUP_GRACE_MS);
+}
+
+/** (Re)start or stop the listener so it always matches g_espnow.direct. */
+static void espnowApplyConfig() {
+  if (g_espnow.direct && !g_espnowReady) {
+    if (esp_now_init() != 0) {
+      LOG("espnow init FAILED (staying off)");
+      return;
+    }
+    esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+    esp_now_register_recv_cb(espnowRecvCb);
+    catfishRfDedupInit(&g_dedup);
+    g_espnowReady = true;
+    LOG("espnow: DIRECT puck feed listening (channel follows WiFi, pinned while down)");
+  } else if (!g_espnow.direct && g_espnowReady) {
+    esp_now_deinit();
+    g_espnowReady = false;
+    LOG("espnow: direct mode OFF - listener stopped");
+  }
+}
+
+/** Feed straight from a datagram (hub echo missed the grace window). */
+static void directFeedStart(uint8_t seconds) {
+  if (g_feeding) {
+    LOG("direct feed skipped - pulse engine busy");
+    return;
+  }
+  // Same clamps as processFeedRequest: datagram seconds (0 = relay default),
+  // per-device soft cap, 100 ms floor (the engine hard-caps at 60 s itself).
+  uint32_t totalMs = seconds ? (uint32_t)seconds * 1000UL
+                             : (uint32_t)g_cfg.pulseS * 1000UL;
+  const uint32_t capCfg = (uint32_t)g_cfg.maxPulseS * 1000UL;
+  if (totalMs > capCfg) totalMs = capCfg;
+  if (totalMs < CATFISH_MIN_PULSE_MS) totalMs = CATFISH_MIN_PULSE_MS;
+  startFeedPulseMs(totalMs);
+}
+
+static void rfdedupTick() {
+  if (!g_espnowReady || !g_espnow.direct) return;
+  uint16_t seq = 0;
+  uint8_t seconds = 0;
+  if (catfishRfDedupPoll(&g_dedup, millis(), &seq, &seconds) ==
+      CATFISH_RFDEDUP_FEED) {
+    LOG("direct feed: no hub echo within grace (seq %u) - feeding directly",
+        (unsigned)seq);
+    directFeedStart(seconds);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // WiFi reconnect watchdog
+// v1.13.0: in espnowDirect mode the watchdog mirrors the display unit's
+// v1.12.1 scheme — bounded reconnect attempts (WIFI_RETRY_EVERY_MS cadence,
+// WIFI_ATTEMPT_BUDGET_MS budget) with the STA idled and the radio PINNED to
+// the last AP channel in between (wifi_set_channel). A scanning/auto-retrying
+// STA hops channels, which deafens the ESP-NOW listener. Legacy mode (direct
+// off) keeps the historical behaviour exactly.
 // ---------------------------------------------------------------------------
 static uint32_t g_wifiLastOkMs = 0;
 static bool g_wifiUp = false;
+static uint8_t g_lastApChan = 0;    // v1.13.0: last AP channel seen while up
+static uint32_t g_attemptAtMs = 0;  // v1.13.0: millis() current attempt began (0 = none)
+static uint32_t g_nextAttemptMs = 0; // v1.13.0: millis() next attempt may start
+
+static void holdListenChannel() {
+  if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA); // drop any leftover AP
+  WiFi.disconnect(); // STA idle; stored credentials untouched (wifioff=false)
+  const uint8_t ch = g_lastApChan ? g_lastApChan : 1;
+  wifi_set_channel(ch);
+  LOG("radio idle - pinned to ch%u for direct puck feeds", (unsigned)ch);
+}
 
 static void wifiWatchdog() {
   const bool up = (WiFi.status() == WL_CONNECTED);
@@ -494,12 +674,36 @@ static void wifiWatchdog() {
       g_wifiUp = true;
       LOG("wifi up: ip=%s rssi=%d", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
     }
+    g_lastApChan = WiFi.channel();
     g_wifiLastOkMs = millis();
+    g_attemptAtMs = 0;
+    WiFi.setAutoReconnect(true);
     return;
   }
   if (g_wifiUp) {
+    // just lost link
     g_wifiUp = false;
     LOG("wifi lost, watchdog armed");
+    if (g_espnow.direct) {
+      WiFi.setAutoReconnect(false); // stop SDK retry churn; bounded attempts below
+      g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
+      g_attemptAtMs = 0;
+      holdListenChannel();
+    }
+  }
+  if (g_espnow.direct) {
+    if (g_attemptAtMs != 0 &&
+        millis() - g_attemptAtMs >= WIFI_ATTEMPT_BUDGET_MS) {
+      g_attemptAtMs = 0;
+      if (WiFi.status() != WL_CONNECTED) holdListenChannel();
+    } else if (g_attemptAtMs == 0 &&
+               (int32_t)(millis() - g_nextAttemptMs) >= 0) {
+      g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
+      g_attemptAtMs = millis();
+      LOG("reconnect attempt (stored credentials)");
+      WiFi.begin(); // stored credentials
+    }
+    return;
   }
   if (millis() - g_wifiLastOkMs >= WIFI_RECONNECT_AFTER_MS) {
     LOG("wifi down > %u s -> WiFi.reconnect()", (unsigned)(WIFI_RECONNECT_AFTER_MS / 1000UL));
@@ -540,6 +744,8 @@ static void factoryResetTick() {
     saveMechConfig();
     otaDefaults(g_ota);    // v1.10.1: OTA password regenerates on factory reset
     saveOtaConfig();
+    espnowDefaults(g_espnow);  // v1.13.0: direct puck feed resets to OFF
+    saveEspnowConfig();
     if (g_mech.mechanism == CATFISH_MECH_SERVO && !g_feeding) mechServoPark();
     g_ledMode = LED_MODE_FEED;  // fast blink as confirmation
     delay(1500);
@@ -594,6 +800,11 @@ static void handleStatus() {
   // /feed (sub-second pulses). Absent in pre-1.12.0 relays — the display
   // treats a missing flag as legacy and keeps pulsing whole seconds.
   doc["pulseMs"] = true;
+  // v1.13.0 capability flags: direct puck feed (ESP-NOW listener) state. The
+  // display uses "espnow" to phrase WiFi-down feed toasts honestly; pre-1.13.0
+  // displays simply ignore the extra keys.
+  doc["espnow"] = (g_espnow.direct && g_espnowReady);
+  doc["espnowMask"] = g_espnow.mask;
   doc["ntpSynced"] = ntpTimeSynced();  // extra field: explains lastFeedEpoch semantics
 
   char buf[640];
@@ -620,14 +831,23 @@ static void respondFeedSuccess(uint32_t totalMs, bool clampedToCfg) {
   g_server.send(200, "application/json", buf);
 }
 
-// Shared by POST /feed and GET /feed. Order: auth -> validate -> clamp -> busy.
+// Shared by POST /feed and GET /feed. Order: auth -> dedup -> validate -> clamp -> busy.
 // v1.12.0: @p extraMs (0..999) is the sub-second remainder of the pulse —
 // additive + backward compatible (pre-1.12.0 callers never send it; the
 // engine itself was always millisecond-based, so this is a pure parse win).
-static void processFeedRequest(long seconds, long extraMs, const char* token) {
+// v1.13.0: @p seq (0/-1 = absent) is the hub's echo of the originating puck
+// datagram seq. ANY authenticated feed cancels a pending direct-feed intent
+// (the hub is alive and owns feeding); a positive seq additionally lands in
+// the executed ring so the direct listener can never double-feed that press.
+static void processFeedRequest(long seconds, long extraMs, const char* token,
+                               long seq = -1) {
   if (!tokenMatches(token)) {
     sendJsonError(403, "auth");
     return;
+  }
+  catfishRfDedupCancelPending(&g_dedup);              // hub is alive
+  if (seq > 0 && seq < 0x10000) {                     // hub echoed the datagram
+    catfishRfDedupRingAdd(&g_dedup, (uint16_t)seq);   // mark executed
   }
   if (seconds < 0 || extraMs < 0 || extraMs > 999 ||
       (seconds == 0 && extraMs == 0)) {
@@ -679,7 +899,16 @@ static void handleFeedPost() {
   }
   const long seconds = doc["seconds"].as<long>();
   const char* token = doc["token"] | "";  // points into doc pool, valid for this call
-  processFeedRequest(seconds, extraMs, token);
+  // v1.13.0: optional "seq" echo (strict integer when present; 0/-1 = none).
+  long seq = -1;
+  if (!doc["seq"].isNull()) {
+    if (!doc["seq"].is<long>()) {
+      sendJsonError(400, "bad_seq");
+      return;
+    }
+    seq = doc["seq"].as<long>();
+  }
+  processFeedRequest(seconds, extraMs, token, seq);
 }
 
 static void handleFeedGet() {
@@ -712,7 +941,18 @@ static void handleFeedGet() {
       return;
     }
   }
-  processFeedRequest(seconds, extraMs, tokenArg.c_str());
+  // v1.13.0: optional "seq" echo, same strict parsing.
+  long seq = -1;
+  if (g_server.hasArg("seq")) {
+    const String seqArg = g_server.arg("seq");
+    char* endSeq = nullptr;
+    seq = strtol(seqArg.c_str(), &endSeq, 10);
+    if (endSeq == seqArg.c_str() || *endSeq != '\0') {
+      sendJsonError(400, "bad_seq");
+      return;
+    }
+  }
+  processFeedRequest(seconds, extraMs, tokenArg.c_str(), seq);
 }
 
 static void handleRoot() {
@@ -837,6 +1077,25 @@ static void handleConfig() {
     hasOtaOpen = true;
   }
 
+  // v1.13.0: direct puck feed keys (validate first, like everything else).
+  bool hasEspnowDirect = false;
+  bool newEspnowDirect = false;
+  if (doc["espnowDirect"].is<bool>()) {
+    newEspnowDirect = doc["espnowDirect"].as<bool>();
+    hasEspnowDirect = true;
+  }
+  bool hasEspnowMask = false;
+  uint8_t newEspnowMask = 0;
+  if (doc["espnowMask"].is<long>()) {
+    const long v = doc["espnowMask"].as<long>();
+    if (v < 0 || v > 0x0F) {
+      sendJsonError(400, "espnowMask_range_0_15");
+      return;
+    }
+    newEspnowMask = (uint8_t)v;
+    hasEspnowMask = true;
+  }
+
   // ---- all validation passed: apply ----
   if (newTok != nullptr) {
     snprintf(g_cfg.token, sizeof(g_cfg.token), "%s", newTok);
@@ -900,6 +1159,23 @@ static void handleConfig() {
     LOG("ota config updated (applies after reboot)");
   }
 
+  // ---- v1.13.0: ESP-NOW direct feed keys (separate additive record) ----
+  bool espnowChanged = false;
+  if (hasEspnowDirect && ((uint8_t)(newEspnowDirect ? 1 : 0)) != g_espnow.direct) {
+    g_espnow.direct = newEspnowDirect ? 1 : 0;
+    espnowChanged = true;
+  }
+  if (hasEspnowMask && newEspnowMask != g_espnow.mask) {
+    g_espnow.mask = newEspnowMask;
+    espnowChanged = true;
+  }
+  if (espnowChanged) {
+    saveEspnowConfig();
+    espnowApplyConfig(); // start/stop the listener to match the new flag
+    LOG("espnow config: direct=%u mask=0x%X", (unsigned)g_espnow.direct,
+        (unsigned)g_espnow.mask);
+  }
+
   if (changed) saveConfig();
 
   // Echo the effective config back to the authenticated caller (LAN convenience).
@@ -915,6 +1191,8 @@ static void handleConfig() {
   echo["stepHz"] = (int)g_mech.stepHz;
   echo["otaOpen"] = (g_ota.open != 0);
   echo["otaPwd"] = g_ota.pwd;
+  echo["espnowDirect"] = (g_espnow.direct != 0);  // v1.13.0
+  echo["espnowMask"] = g_espnow.mask;             // v1.13.0
   char buf[320];
   const size_t n = serializeJson(echo, buf, sizeof(buf));
   if (n == 0) {
@@ -964,6 +1242,7 @@ void setup() {
   configLoad();
   mechConfigLoad();  // additive record at EEPROM offset 64 (P4)
   otaConfigLoad();   // additive record at EEPROM offset 128 (v1.10.1)
+  espnowConfigLoad(); // additive record at EEPROM offset 192 (v1.13.0)
   if (g_mech.mechanism == CATFISH_MECH_SERVO) {
     mechServoPark();  // servo starts parked at its rest angle
     LOG("servo parked at %u deg", (unsigned)g_mech.servoRestDeg);
@@ -986,10 +1265,22 @@ void setup() {
   });
   LOG("wifi: autoConnect (AP fallback '%s')", AP_NAME);
   if (!wm.autoConnect(AP_NAME)) {
-    LOG("wifi connect/portal failed (timeout %u s) -- restarting",
-        (unsigned)WM_PORTAL_TIMEOUT_S);
-    delay(1000);
-    ESP.restart();
+    if (g_espnow.direct) {
+      // v1.13.0: direct puck feed survives a routerless boot — stay up,
+      // pin the default channel and let the watchdog try bounded reconnects
+      // (the direct listener keeps working either way).
+      LOG("wifi connect/portal failed (timeout %u s) -- espnowDirect: continuing headless",
+          (unsigned)WM_PORTAL_TIMEOUT_S);
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect(); // STA idle; stored credentials untouched
+      wifi_set_channel(1); // never associated -> nothing to remember yet
+      g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
+    } else {
+      LOG("wifi connect/portal failed (timeout %u s) -- restarting",
+          (unsigned)WM_PORTAL_TIMEOUT_S);
+      delay(1000);
+      ESP.restart();
+    }
   }
   WiFi.hostname(HOSTNAME);  // re-assert after association (cheap, harmless)
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
@@ -1032,6 +1323,9 @@ void setup() {
   g_server.begin();
   LOG("HTTP ready on :80 (health/status/feed/config)");
 
+  // v1.13.0: start/stop the direct puck listener to match the persisted flag.
+  espnowApplyConfig();
+
   g_wifiUp = (WiFi.status() == WL_CONNECTED);
   g_wifiLastOkMs = millis();
   LOG("ready v%s -- heap=%u", FIRMWARE_VERSION, (unsigned)ESP.getFreeHeap());
@@ -1044,6 +1338,7 @@ void loop() {
   factoryResetTick();  // FLASH button held -> wipe config + reboot
   MDNS.update();       // v1.8.2: explicit pump (see setup comment)
   g_server.handleClient();
+  rfdedupTick();       // v1.13.0: direct puck feed after the grace window expires
   ArduinoOTA.handle();
   discoveryPump();
   wifiWatchdog();

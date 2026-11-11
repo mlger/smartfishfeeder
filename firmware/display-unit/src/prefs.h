@@ -161,6 +161,13 @@ void setTankGps(uint8_t tank1, uint16_t gps);
  */
 uint16_t getTankHopperCap(uint8_t tank1);
 void setTankHopperCap(uint8_t tank1, uint16_t capG);
+/**
+ * v1.13.0: hub-side mirror of the tank relay's direct puck feed flag
+ * (relay-side ESP-NOW listener). The relay's EEPROM record is authoritative;
+ * this mirror prefills the tank editor switch and is re-pushed on save.
+ */
+bool getTankEspnowDirect(uint8_t tank1);
+void setTankEspnowDirect(uint8_t tank1, bool direct);
 
 } // namespace prefs
 

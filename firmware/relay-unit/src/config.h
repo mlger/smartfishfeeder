@@ -101,6 +101,9 @@
 // v1.10.1: third ADDITIVE record — ArduinoOTA password (see main.cpp).
 #define OTA_EEPROM_OFFSET  128
 #define OTA_MAGIC          0x4F544131UL  // "OTA1" in ASCII
+// v1.13.0: fourth ADDITIVE record — direct puck feed (ESP-NOW listener).
+#define ESPNOW_EEPROM_OFFSET 192
+#define ESPNOW_MAGIC         0x45534E57UL  // "ESNW" in ASCII
 
 // -------------------------------------------------------------- identity
 #define AP_NAME            "CatfishRelay-Setup" // WiFiManager fallback AP SSID
@@ -108,6 +111,12 @@
 // ---------------------------------------------------------- wifi / portal
 #define WM_PORTAL_TIMEOUT_S     180UL    // setup portal gives up after this, device reboots and retries
 #define WIFI_RECONNECT_AFTER_MS 30000UL  // disconnected longer than this -> WiFi.reconnect()
+// v1.13.0 (espnowDirect): bounded reconnect attempts while the link is down —
+// a scanning STA hops channels and deafens the ESP-NOW listener, so the radio
+// is PINNED to the last AP channel between attempts (same scheme as the
+// display unit's v1.12.1 fix).
+#define WIFI_RETRY_EVERY_MS     30000UL
+#define WIFI_ATTEMPT_BUDGET_MS  10000UL
 
 // ------------------------------------------------------------------ time
 // POSIX TZ string, sign inverted: "PHT-8" == UTC+8 (Philippines).

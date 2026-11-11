@@ -59,6 +59,10 @@ uint16_t s_tank_gps[CATFISH_MAX_TANKS] = {0, 0, 0, 0}; // g/second per tank (0 =
 // v1.10.0: hopper capacity in GRAMS (0 = unknown). v1.9.0 stored pulse-seconds;
 // begin() migrates old values once to grams (x tank gps) and sets "hcapG".
 uint16_t s_tank_hcap[CATFISH_MAX_TANKS] = {0, 0, 0, 0};
+// v1.13.0: hub-side mirror of each relay's direct puck feed (ESP-NOW listener)
+// flag. The RELAY's EEPROM record is authoritative; this mirror drives the
+// tank-editor switch prefill and is re-pushed on every save.
+bool s_tank_espn[CATFISH_MAX_TANKS] = {false, false, false, false};
 uint16_t s_def_grams = CATFISH_DEFAULT_GRAMS; // v1.10.0: default portion (g)
 
 // Guards s_token: written by loop(), read by the net worker task.
@@ -188,6 +192,8 @@ bool begin() {
     s_tank_gps[i] = s_nvs.getUShort(key, 0);
     snprintf(key, sizeof(key), "hcap%d", i + 1);
     s_tank_hcap[i] = s_nvs.getUShort(key, 0);
+    snprintf(key, sizeof(key), "espn%d", i + 1);
+    s_tank_espn[i] = s_nvs.getBool(key, false);
   }
   // v1.10.0 one-time migration: v1.9.0 stored hopper caps in pulse-seconds;
   // grams = seconds x tank gps (nominal 5 g/s when unset). The flag key makes
@@ -468,6 +474,20 @@ void setTankGps(uint8_t tank1, uint16_t gps) {
 uint16_t getTankHopperCap(uint8_t tank1) {
   const int i = tankIdx(tank1);
   return (i < 0) ? 0 : s_tank_hcap[i];
+}
+
+bool getTankEspnowDirect(uint8_t tank1) {
+  const int i = tankIdx(tank1);
+  return (i < 0) ? false : s_tank_espn[i];
+}
+
+void setTankEspnowDirect(uint8_t tank1, bool direct) {
+  const int i = tankIdx(tank1);
+  if (i < 0) return;
+  s_tank_espn[i] = direct;
+  char key[8];
+  snprintf(key, sizeof(key), "espn%d", i + 1);
+  if (s_loaded && s_nvs.putBool(key, direct) == 0) nvsLogFail(key);
 }
 
 void setTankHopperCap(uint8_t tank1, uint16_t capG) {

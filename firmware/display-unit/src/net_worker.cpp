@@ -56,7 +56,7 @@ void workerTask(void * /*param*/) {
         // v1.12.0: per-tank wire pulse precomputed by main (milliseconds)
         uint16_t ms = cmd.pulseMsPerTank[t - 1];
         if (ms == 0) ms = 1000; // defensive floor; main always fills set bits
-        const relay_client::Result fr = relay_client::feedTank(t, ms);
+        const relay_client::Result fr = relay_client::feedTank(t, ms, cmd.seq);
         if (fr.ok) {
           r.tanksOk |= (1u << (t - 1));
           r.secOk[t - 1] = fr.seconds_applied; // v1.9.0: per-tank applied
@@ -95,6 +95,17 @@ void workerTask(void * /*param*/) {
       r.tankId = tank1;
       strlcpy(r.ip, mr.ip.c_str(), sizeof(r.ip));
       if (!mr.ok) fillError(r, mr.error);
+    } else if (cmd.type == net_worker::Cmd::CMD_ESPNOW_CFG) {
+      const uint8_t tank1 = sanitizeTank1(cmd.tankId);
+      Serial.printf("[NET] worker: espnowDirect -> %d (tank %u)", cmd.flag ? 1 : 0,
+                    (unsigned)tank1);
+      const relay_client::Result er =
+          relay_client::configEspnowDirectTank(tank1, cmd.flag);
+      r.kind = net_worker::Result::RES_ESPNOW;
+      r.ok = er.ok;
+      r.tankId = tank1;
+      strlcpy(r.ip, er.ip.c_str(), sizeof(r.ip));
+      if (!er.ok) fillError(r, er.error);
     } else if (cmd.type == net_worker::Cmd::CMD_SCAN_TANKS) {
       Serial.println("[NET] worker: tank scan request");
       uint8_t assigned = 0;
@@ -167,11 +178,12 @@ bool begin() {
 
 bool enqueueFeed(uint16_t grams, const uint16_t *pulseMsPerTank, bool manual,
                  uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
-                 bool catchup, const uint16_t *gramTank) {
+                 bool catchup, const uint16_t *gramTank, uint16_t rfSeq) {
   if (!s_cmdq) return false;
   Cmd c;
   c.type = Cmd::CMD_FEED;
   c.grams = grams;
+  c.seq = rfSeq; // v1.13.0: echoed to the relay in /feed "seq"
   c.manual = manual;
   c.retry = retry;
   c.catchup = catchup;
@@ -224,6 +236,15 @@ bool enqueueScanTanks() {
   if (!s_cmdq) return false;
   Cmd c;
   c.type = Cmd::CMD_SCAN_TANKS;
+  return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
+}
+
+bool enqueueEspnowDirect(uint8_t tank1, bool direct) {
+  if (!s_cmdq) return false;
+  Cmd c;
+  c.type = Cmd::CMD_ESPNOW_CFG;
+  c.flag = direct;
+  c.tankId = sanitizeTank1(tank1);
   return xQueueSend(s_cmdq, &c, 0) == pdTRUE;
 }
 

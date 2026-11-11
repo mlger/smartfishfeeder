@@ -229,6 +229,30 @@ Battery "pucks" (any ESP8266/ESP32 + button) can trigger a feed wirelessly. Both
 
 **SPI sharing**: the nRF24 and the TF card sit on the same SPI pins; every SD and radio operation is serialized by `src/spi_bus_guard.h`, so both features can be enabled together. Remove a `-DCATFISH_FEATURE_*` line in `platformio.ini` to build a radio-free image — each feature degrades to a status line ("disabled"/"not found").
 
+### Direct puck feed (v1.13.0, relay-side ESP-NOW, opt-in)
+
+Normally the puck path is *puck → (ESP-NOW) → display hub → (WiFi HTTP) → relay*, so a feed needs the router up twice over. **Direct puck feed** removes that dependency: the relay runs its own ESP-NOW listener for the same datagram, so puck presses work even with the router completely off (the radio channel is pinned to the last AP channel between bounded reconnect attempts — same scheme as the display unit's v1.12.1 fix — and a routerless boot continues headless instead of restarting).
+
+Enable it per relay: **Settings → TANKS → edit a tank → "Direct puck feed (relay feeds without WiFi)"** (requires display ≥ 1.13.0), or via curl:
+
+```sh
+curl -X POST http://catfish-relay.local/config \
+     -H "Content-Type: application/json" \
+     -d '{"token":"catfish","espnowDirect":true}'
+```
+
+**No-double-feed coordination** (both units ≥ 1.13.0): the relay arms a pending intent when it hears a valid puck broadcast and waits a 1.5 s grace window.
+
+- Router **up**: the hub hears the same broadcast and POSTs `/feed` (echoing the datagram `seq`) within the window — the relay feeds from the hub's precisely calibrated millisecond pulse and cancels its direct intent. Single feed, hub-authoritative.
+- Router **down**: no `/feed` arrives — after the grace window the relay feeds directly from the datagram (`seconds`, or its own `pulseS` default). Single feed.
+- Any authenticated `/feed` during the window cancels the intent (the hub is alive and owns feeding); a `/feed` echoing `seq` S marks S executed so the same broadcast can never feed twice. The dedup machine is host-tested (`test_catfish_rfdedup`, 12 cases).
+
+**Caveats**:
+
+- Requires **both** units on ≥ 1.13.0 for clean dedup. A direct-enabled relay paired with an older hub can double-feed while the router is up (the old hub's `/feed` carries no `seq`) — direct mode therefore defaults to **off**.
+- With the router down, the display hub still shows the press as "no WiFi" (it cannot know the relay fed); its toast says so honestly once it has probed a direct-enabled relay (`GET /status` → `"espnow": true`). History/counters on the hub will show the attempt as failed even though food was dispensed.
+- Multi-tank: a datagram without a tank mask ("hub default") is always honored by every direct-enabled relay — in multi-tank setups, program the pucks with an explicit tank mask and/or set `espnowMask` on the relays.
+
 ## Stability audit (v1.8.2)
 
 A full-codebase audit and fix round. User-visible fixes:

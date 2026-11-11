@@ -34,9 +34,10 @@ Energizes the relay for a pulse, running the feeder motor.
 |-------|------|----------|-------------|
 | `seconds` | integer | yes | Feed duration **in seconds** (see *Feeding mechanisms* below). Must be a strict JSON integer (`3` ok, `"3"`/`3.5` → 400). Hard cap 60 s; values above the configured `maxPulseS` (default 30) are clamped down, not rejected. `0` is legal when `ms` > 0 (v1.12.0 sub-second pulse). |
 | `ms` | integer | no | v1.12.0: millisecond remainder `0..999` added on top of `seconds` (e.g. `seconds: 1, ms: 500` → a 1.5 s pulse). Strict JSON integer when present; omitted/absent = `0`. Ignored by pre-1.12.0 relays (additive, backward compatible). Pulses are floored to 100 ms total. |
+| `seq` | integer | no | v1.13.0: the display hub echoes the originating puck datagram sequence number (`1..65535`) so a relay with **direct puck feed** enabled can dedup the same broadcast (no double feed). Strict JSON integer when present. Hub-initiated feeds (touch/dashboard/MQTT/scheduled) omit the key — the relay treats any authenticated `/feed` as "hub is alive" and cancels its pending direct-feed intent (see `docs/firmware.md` → *Direct puck feed*). |
 | `token` | string | yes | Current auth token |
 
-A `GET /feed?seconds=N&ms=M&token=T` variant exists with identical semantics (convenient for curl/browser testing).
+A `GET /feed?seconds=N&ms=M&seq=S&token=T` variant exists with identical semantics (convenient for curl/browser testing).
 
 Order of checks (deterministic error codes):
 
@@ -115,6 +116,8 @@ Full runtime snapshot (no auth).
 | `ip` | string | Current IP address |
 | `version` | string | Firmware version |
 | `pulseMs` | bool | v1.12.0: relay accepts the `ms` remainder in `/feed` (sub-second pulses). Absent in pre-1.12.0 firmware — clients treat a missing flag as legacy whole-second feeding. |
+| `espnow` | bool | v1.13.0: direct puck feed listener is enabled AND running (relay-side ESP-NOW receiver). Absent in pre-1.13.0 firmware. The display uses it to phrase WiFi-down feed toasts honestly ("relay may have fed directly"). |
+| `espnowMask` | int | v1.13.0: tank-mask filter for the direct listener (`0` = honor every datagram, else bitmask of accepted tanks). |
 | `proto` | int | Wire-contract revision (see `CATFISH_PROTOCOL_VERSION` in `firmware/common/catfish_protocol.h`). The display unit compares it to its own value and warns on a mismatch — the usual cause is only one unit being re-flashed |
 | `ntpSynced` | bool | `true` once NTP time is valid (affects `lastFeedEpoch` accuracy) |
 
@@ -159,6 +162,8 @@ Changes device configuration. Requires the **current** token for auth; an option
 | `stepDir` | integer | no | Stepper DIR level during feed, 0 or 1 |
 | `otaPwd` | string | no | New ArduinoOTA password (non-empty, shorter than 24 chars, v1.10.1+). Persists in a dedicated EEPROM record; takes effect after a reboot |
 | `otaOpen` | boolean | no | `true` = explicit opt-out: open OTA with no password (v1.10.1+). Takes effect after a reboot |
+| `espnowDirect` | boolean | no | v1.13.0: enable/disable the **direct puck feed** listener — the relay listens for wireless feed-node broadcasts itself and feeds when the hub does not answer within 1.5 s (works with the router off). Persists in a dedicated additive EEPROM record; starts/stops live (no reboot needed). Default off. |
+| `espnowMask` | integer | no | v1.13.0: tank-mask filter for the direct listener, `0` (honor all) or bitmask `1..15`. Multi-tank caveat: a datagram without a mask ("hub default") is always honored by a direct-enabled relay. |
 
 | Status | Meaning |
 |--------|---------|

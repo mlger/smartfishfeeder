@@ -29,9 +29,14 @@ struct Cmd {
     CMD_TOKEN_ROTATE,
     CMD_MECH,       // P4: switch a relay's feeding mechanism via POST /config
     CMD_SCAN_TANKS, // P5: UDP-scan the LAN and bind unassigned tanks
+    CMD_ESPNOW_CFG, // v1.13.0: toggle a relay's direct puck feed via POST /config
   };
   Type type = CMD_FEED;
   uint16_t grams = 0;  // v1.10.0: FEED requested portion (g) — echo/bookkeeping
+  // v1.13.0: RF_FEED datagram seq (0 = hub-initiated feed, no datagram) —
+  // echoed to the relay in /feed "seq" so its direct ESP-NOW listener can
+  // dedup the same broadcast (catfish_rfdedup.h contract).
+  uint16_t seq = 0;
   bool manual = false; // FEED: manual vs scheduled
   bool retry = false;  // FEED: this attempt IS the scheduled-feed retry
   bool catchup = false; // v1.9.0 (A4): this attempt is a missed-feed catch-up
@@ -49,6 +54,7 @@ struct Cmd {
   uint16_t gramTank[4] = {0, 0, 0, 0};
   bool report = false; // PROBE: toast the outcome
   bool verify = false; // v1.9.0 (B3): probe runs inside the pulse-verify window
+  bool flag = false;   // v1.13.0: CMD_ESPNOW_CFG requested direct-feed state
   char token[CATFISH_TOKEN_LEN] = {0}; // TOKEN_ROTATE: new token for the relay
   // Multi-tank (P5)
   uint8_t tankMask = 0; // FEED: target tanks (bit i = tank i+1); 0 = tank 1
@@ -62,7 +68,7 @@ struct Cmd {
 };
 
 struct Result {
-  enum Kind : uint8_t { RES_FEED = 0, RES_PROBE, RES_TOKEN, RES_MECH, RES_SCAN };
+  enum Kind : uint8_t { RES_FEED = 0, RES_PROBE, RES_TOKEN, RES_MECH, RES_SCAN, RES_ESPNOW };
   Kind kind = RES_FEED;
   bool ok = false;
   // FEED echo
@@ -118,12 +124,17 @@ bool begin();
  * @p gramTank requested per-tank portion overrides in grams (may be nullptr;
  * echoed back on the Result so a failed attempt re-arms the journal with the
  * SAME portions, v1.10.1).
+ * @p rfSeq v1.13.0: RF_FEED datagram seq echoed to the relay in /feed "seq"
+ * (direct ESP-NOW dedup contract); 0 = hub-initiated feed, no datagram.
  * @return false when the command queue is full.
  */
 bool enqueueFeed(uint16_t grams, const uint16_t *pulseMsPerTank, bool manual,
                  uint8_t hour, uint8_t minute, bool retry, uint8_t tankMask,
                  bool catchup = false,
-                 const uint16_t *gramTank = nullptr);
+                 const uint16_t *gramTank = nullptr, uint16_t rfSeq = 0);
+
+/** v1.13.0: toggle a tank relay's direct puck feed (POST /config espnowDirect). */
+bool enqueueEspnowDirect(uint8_t tank1, bool direct);
 
 /** Queue a per-tank relay probe (discover-if-needed + GET /status). */
 bool enqueueProbe(bool report, uint8_t tank1, bool verify = false);

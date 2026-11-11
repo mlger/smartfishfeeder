@@ -76,6 +76,7 @@ void recvCb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   // the UI's grams unit here using tank 1's calibrated rate.
   ev.grams = catfishSecondsToGrams(seconds, prefs::getTankGps(1));
   ev.tankMask = mask;
+  ev.seq = seq; // v1.13.0: echoed to the relay in /feed "seq" (direct-feed dedup)
   ui::ui_event_send(ev); // zero-timeout; drops silently when the queue is full
   Serial.printf("[ESPNOW] node feed request (%u s ~= %u g, mask 0x%X, seq %u)\n",
                 (unsigned)seconds, (unsigned)ev.grams, (unsigned)mask,

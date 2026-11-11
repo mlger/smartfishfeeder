@@ -624,7 +624,8 @@ static void beginOtaOnce() {
  */
 static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
                         uint8_t minute, bool retry, uint8_t tankMask,
-                        const uint16_t *gramTank, feed_state::FeedSource src) {
+                        const uint16_t *gramTank, feed_state::FeedSource src,
+                        uint16_t rfSeq = 0) {
   const uint32_t nowEpoch = (uint32_t)time(nullptr);
 
   // F3/A5 policy gate — retries re-check too (vacation may have flipped on
@@ -657,7 +658,14 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
 
   if (!net_wifi::wifi_is_connected()) {
     if (manual) {
-      uiToast("WiFi not connected");
+      // v1.13.0: with direct puck feed enabled on any target relay, the press
+      // may still have fed via the relay-side ESP-NOW listener — phrase the
+      // toast honestly so the user does not re-press and double-feed.
+      if (relay_client::anyTankEspnowDirect(tankMask)) {
+        uiToast("No WiFi - relay may have fed directly");
+      } else {
+        uiToast("WiFi not connected");
+      }
     } else if (!retry) {
       // H2: a scheduled feed must survive a WiFi blip at fire time - arm a
       // delayed attempt in the PERSISTENT journal (v1.9.0) instead of
@@ -681,7 +689,7 @@ static void requestFeed(uint16_t grams, bool manual, uint8_t hour,
   }
   if (!net_worker::enqueueFeed(grams, pulseMsPerTank, manual, hour, minute, retry,
                                tankMask, src == feed_state::SRC_CATCHUP,
-                               gramTank)) {
+                               gramTank, rfSeq)) {
     // v1.8.2: a scheduled feed dropped because the worker queue was full gets
     // a journal slot instead of being lost with a misleading "try again" toast.
     if (!manual && !retry) {
@@ -1187,6 +1195,14 @@ static void handleUiEvent(const UiEvent &ev) {
       prefs::setTankGps(ev.a, ev.tankGps);
       prefs::setTankHopperCap(ev.a, ev.tankHcap);
       relay_client::applyTankTokens(); // token override may have changed
+      // v1.13.0: direct puck feed toggle touched -> push to this tank's relay
+      // (POST /config "espnowDirect"); the relay persists it in its own
+      // additive EEPROM record and starts/stops its ESP-NOW listener live.
+      // The hub also keeps a mirror for the editor's prefill.
+      if (ev.tankEspnowDirectValid) {
+        prefs::setTankEspnowDirect(ev.a, ev.tankEspnowDirect);
+        net_worker::enqueueEspnowDirect(ev.a, ev.tankEspnowDirect);
+      }
       syncTanksUi();
       refreshFoodUi();
       uiToast("Tank updated");
@@ -1221,8 +1237,10 @@ static void handleUiEvent(const UiEvent &ev) {
                    : catfishSecondsToGrams(ev.a, prefs::getTankGps(1));
       Serial.printf("[RF] node feed %u g (mask 0x%X)\n", (unsigned)grams,
                     (unsigned)mask);
+      // v1.13.0: the datagram seq rides along — the relay's direct ESP-NOW
+      // listener uses it (plus the /feed echo) to never double-feed a press.
       requestFeed(grams, true, 0, 0, false, mask, nullptr,
-                  feed_state::SRC_TOUCH);
+                  feed_state::SRC_TOUCH, ev.seq);
       break;
     }
 
@@ -1270,6 +1288,18 @@ static void handleWorkerResult(const net_worker::Result &r) {
     } else {
       uiToast(String("Mechanism update failed: ") + r.error);
       Serial.printf("[NET] mechanism update FAILED: %s\n", r.error);
+    }
+    return;
+  }
+
+  if (r.kind == net_worker::Result::RES_ESPNOW) {
+    if (r.ok) {
+      uiToast("Direct puck feed updated");
+      Serial.printf("[NET] espnowDirect updated OK (ip %s) - re-probing\n", r.ip);
+      net_worker::enqueueProbe(true, r.tankId ? r.tankId : 1); // refresh /status cache
+    } else {
+      uiToast(String("Direct feed toggle failed: ") + r.error);
+      Serial.printf("[NET] espnowDirect update FAILED: %s\n", r.error);
     }
     return;
   }

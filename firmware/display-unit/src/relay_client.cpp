@@ -63,6 +63,11 @@ uint8_t s_subsec_cap[relay_client::MAX_TANKS] = {0, 0, 0, 0};
 // One-time "relay supports ms pulses" log line per boot.
 bool s_subsec_logged = false;
 
+// v1.13.0 per-tank direct puck feed flag, learned from GET /status "espnow".
+// Tri-state: -1 = unknown / pre-1.13.0 relay, 0 = off, 1 = on. Written by
+// fetchStatusTank() (worker task only) — single-caller discipline as above.
+int8_t s_espnow_direct[relay_client::MAX_TANKS] = {-1, -1, -1, -1};
+
 // Effective per-tank tokens, snapshotted by applyTankTokens() (loop ctx) and
 // read by the worker under this spinlock (same pattern as the old single
 // s_token guard in prefs).
@@ -355,7 +360,7 @@ Result discoverTank(uint8_t tank1) {
   return r;
 }
 
-Result feedTank(uint8_t tank1, uint16_t totalMs) {
+Result feedTank(uint8_t tank1, uint16_t totalMs, uint16_t rfSeq) {
   Result r;
   const int i = tIdx(tank1);
   if (i < 0) {
@@ -404,6 +409,11 @@ Result feedTank(uint8_t tank1, uint16_t totalMs) {
     doc["seconds"] = (int)s;
   }
   doc["token"] = tankToken(tank1);
+  // v1.13.0: echo the originating puck datagram seq (0 = hub-initiated feed,
+  // no datagram involved). The relay's direct ESP-NOW listener uses it for
+  // the double-feed dedup contract (catfish_rfdedup.h); pre-1.13.0 relays
+  // ignore the extra key.
+  if (rfSeq) doc["seq"] = (int)rfSeq;
   String body;
   serializeJson(doc, body);
 
@@ -537,6 +547,14 @@ Status fetchStatusTank(uint8_t tank1) {
     Serial.printf("[NET] tank %u relay supports sub-second pulses (ms)\n",
                   (unsigned)tank1);
   }
+  // v1.13.0: direct puck feed capability + state (absent = pre-1.13.0 relay).
+  if (!doc["espnow"].isNull()) {
+    st.espnowDirect = (bool)(doc["espnow"] | false) ? 1 : 0;
+    s_espnow_direct[i] = (int8_t)st.espnowDirect;
+  } else {
+    st.espnowDirect = -1;
+    s_espnow_direct[i] = -1;
+  }
 
   if (st.protocolVersion >= 0 && st.protocolVersion != CATFISH_PROTOCOL_VERSION &&
       !s_proto_warned) {
@@ -667,6 +685,67 @@ Result rotateTokenTank(uint8_t tank1, const String &newToken) {
   r.ok = true;
   r.ip = String(s_ip[i]);
   return r;
+}
+
+Result configEspnowDirectTank(uint8_t tank1, bool direct) {
+  Result r;
+  const int i = tIdx(tank1);
+  if (i < 0) {
+    r.error = "Bad tank id";
+    return r;
+  }
+
+  if (!net_wifi::wifi_is_connected()) {
+    r.error = "WiFi down";
+    return r;
+  }
+  if (!s_ip[i][0]) {
+    Result d = discoverTank(tank1);
+    if (!d.ok) {
+      r.error = "No relay (" + d.error + ")";
+      return r;
+    }
+  }
+
+  JsonDocument doc;
+  doc["token"] = tankToken(tank1); // current credential
+  doc["espnowDirect"] = direct;
+  String body;
+  serializeJson(doc, body);
+
+  String resp;
+  const int code =
+      httpReq("http://" + String(s_ip[i]) + CATFISH_EP_CONFIG, true, body, 4000,
+              resp);
+  if (code > 0) noteTransportSuccess(tank1);
+  if (code <= 0) {
+    noteTransportFailure(tank1);
+    r.error = describeError(code, resp);
+    return r;
+  }
+  if (code != 200) {
+    r.error = describeError(code, resp);
+    return r;
+  }
+  // v1.13.0: refresh the cache immediately (pre-1.13.0 relays echo nothing).
+  s_espnow_direct[i] = direct ? 1 : 0;
+  r.ok = true;
+  r.ip = String(s_ip[i]);
+  return r;
+}
+
+int espnowDirectTank(uint8_t tank1) {
+  const int i = tIdx(tank1);
+  if (i < 0) return -1;
+  return s_espnow_direct[i];
+}
+
+bool anyTankEspnowDirect(uint8_t tankMask) {
+  for (uint8_t t = 1; t <= MAX_TANKS; t++) {
+    if (tankMask && !(tankMask & (1u << (t - 1)))) continue;
+    if (s_espnow_direct[t - 1] == 1) return true;
+  }
+  return false;
 }
 
 int scanAndBindTanks(uint8_t tankCount, uint8_t *assignedMask) {

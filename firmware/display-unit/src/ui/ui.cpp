@@ -139,6 +139,7 @@ lv_obj_t *s_tank_ta_name = nullptr;
 lv_obj_t *s_tank_ta_tok = nullptr;
 lv_obj_t *s_tank_sb_gps = nullptr;  // v1.9.0 (A3): food rate g/s (0 = off)
 lv_obj_t *s_tank_sb_hcap = nullptr; // v1.9.0 (D1): hopper size in seconds
+lv_obj_t *s_tank_sw_direct = nullptr; // v1.13.0: direct puck feed toggle
 lv_obj_t *s_tank_kb = nullptr;
 uint8_t s_tank_edit_id = 1; // tank being edited (1-based)
 
@@ -3078,6 +3079,11 @@ void tankSaveCb(lv_event_t *e) {
   // v1.9.0 (A3/D1): per-tank food rate + hopper capacity
   if (s_tank_sb_gps) ev.tankGps = (uint16_t)lv_spinbox_get_value(s_tank_sb_gps);
   if (s_tank_sb_hcap) ev.tankHcap = (uint16_t)lv_spinbox_get_value(s_tank_sb_hcap);
+  // v1.13.0: direct puck feed toggle — always sent (the switch always exists);
+  // pre-1.13.0 relays simply ignore the extra /config key.
+  ev.tankEspnowDirect =
+      s_tank_sw_direct && lv_obj_has_state(s_tank_sw_direct, LV_STATE_CHECKED);
+  ev.tankEspnowDirectValid = (s_tank_sw_direct != nullptr);
   if (uiEventSend(ev)) closeTankOverlay(); // loop persists + rebuilds
 }
 
@@ -3170,6 +3176,28 @@ void buildTankOverlay() {
     lv_spinbox_set_digit_format(s_tank_sb_hcap, 5, 0);
   }
 
+  // v1.13.0: direct puck feed — the relay listens for puck broadcasts itself
+  // and feeds when the hub is unreachable (router off). Off = hub-only.
+  {
+    lv_obj_t *row_dir = lv_obj_create(card);
+    lv_obj_remove_style_all(row_dir);
+    lv_obj_set_width(row_dir, lv_pct(100));
+    lv_obj_set_height(row_dir, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row_dir, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row_dir, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row_dir, 12, 0);
+    lv_obj_clear_flag(row_dir, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *lbl_dir = lv_label_create(row_dir);
+    lv_label_set_text(lbl_dir, "Direct puck feed (relay feeds without WiFi)");
+    lv_obj_set_style_text_font(lbl_dir, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_dir, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_flex_grow(lbl_dir, 1);
+    s_tank_sw_direct = lv_switch_create(row_dir);
+    lv_obj_set_size(s_tank_sw_direct, 72, 36);
+    lv_obj_clear_flag(s_tank_sw_direct, LV_OBJ_FLAG_SCROLLABLE);
+  }
+
   lv_obj_t *btns = lv_obj_create(card);
   lv_obj_remove_style_all(btns);
   lv_obj_set_width(btns, lv_pct(100));
@@ -3208,6 +3236,13 @@ void openTankOverlay(uint8_t tank1) {
   if (s_tank_sb_gps) spinSetValueQuiet(s_tank_sb_gps, prefs::getTankGps(tank1));
   if (s_tank_sb_hcap)
     spinSetValueQuiet(s_tank_sb_hcap, prefs::getTankHopperCap(tank1));
+  // v1.13.0: direct puck feed prefill (hub mirror of the relay's flag)
+  if (s_tank_sw_direct) {
+    if (prefs::getTankEspnowDirect(tank1))
+      lv_obj_add_state(s_tank_sw_direct, LV_STATE_CHECKED);
+    else
+      lv_obj_clear_state(s_tank_sw_direct, LV_STATE_CHECKED);
+  }
   lv_obj_add_flag(s_tank_kb, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_tank_overlay, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(s_tank_overlay);

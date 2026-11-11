@@ -38,6 +38,14 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
 
 ## v1.13.0 — hardening 🔜
 
+- [x] **Direct puck feed** — relay-side ESP-NOW listener (v1.13.0): puck
+      presses feed with the router completely OFF. Shared, host-tested dedup
+      machine (`catfish_rfdedup.h`, 12 test cases): the hub echoes the puck
+      datagram `seq` in `/feed`; any authenticated feed cancels the relay's
+      pending direct intent; a missed echo past a 1.5 s grace window feeds
+      directly. Opt-in per relay (Settings → tank editor switch or POST
+      /config `espnowDirect`); relay pins the last AP channel while the link
+      is down and boots headless without a router.
 - [ ] Multi-tank history fidelity: record per-tank `secOk[]` outcomes in
       history/SD instead of "last applied wins" **[audit Q2 / suggestion #4]**
       (effort S)
