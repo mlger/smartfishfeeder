@@ -111,3 +111,10 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
   case **[suggestion #9]**
 - Release notes with feature narrative per version (currently auto-generated
   flash instructions)
+- **verify-picker self-heal is a no-op** (found live during v1.13.2): the
+  "empty commit nudges a fresh deploy" step pushes with `GITHUB_TOKEN`, and
+  GitHub never triggers workflow runs from `GITHUB_TOKEN` pushes — the nudge
+  lands on main but starts no build, so the dedupe-eaten Pages mirror stays
+  stale until a manual push. Fix: push the nudge with a PAT/App token secret,
+  or have verify-picker call the `workflow_dispatch` API to re-run
+  deploy-pages directly. (v1.13.2 shipped via a manual PAT nudge commit.)
