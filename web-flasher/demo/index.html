@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Catfish Feeder — Device UI Demo (LVGL XML)</title>
+  <meta name="description" content="Interactive preview of the Catfish Feeder 800x480 touch UI, rendered live in your browser from an LVGL-style XML file — no screenshots, no flashing." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0d1a19;
+      --panel: #12211f;
+      --panel2: #16302d;
+      --line: #24403c;
+      --text: #f2f7f6;
+      --muted: #8fa9a4;
+      --amber: #f2a33c;
+      --ink: #121e1c;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Montserrat", system-ui, -apple-system, "Segoe UI", sans-serif;
+      min-height: 100vh;
+    }
+    a { color: var(--amber); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap { max-width: 1460px; margin: 0 auto; padding: 24px 20px 48px; }
+    .masthead { margin-bottom: 18px; }
+    .bubble {
+      display: inline-block; font-size: 12px; letter-spacing: 1px;
+      text-transform: uppercase; color: var(--muted);
+      border: 1px solid var(--line); border-radius: 999px;
+      padding: 4px 12px; margin-bottom: 10px;
+    }
+    h1 { font-size: 26px; font-weight: 700; margin: 0 0 6px; }
+    h1 .accent { color: var(--amber); }
+    .tagline { color: var(--muted); font-size: 14px; margin: 0; max-width: 720px; line-height: 1.6; }
+    .tagline strong { color: var(--text); }
+
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 20px; align-items: start; }
+    @media (max-width: 1020px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+
+    /* -------- device stage -------- */
+    #stage-wrap { position: relative; width: 100%; overflow: hidden; }
+    #stage-scale { transform-origin: top center; width: 800px; margin: 0 auto; }
+    .device-frame {
+      background: #050908;
+      border: 1px solid #1c332f;
+      border-radius: 18px;
+      padding: 18px;
+      position: relative;
+      box-shadow: 0 18px 60px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.04);
+    }
+    .screen-label {
+      display: flex; gap: 8px; align-items: center; margin: 0 0 10px 4px;
+    }
+    .screen-pill {
+      font-size: 12px; letter-spacing: 1px; color: var(--muted);
+      border: 1px solid var(--line); background: transparent;
+      border-radius: 999px; padding: 5px 14px; cursor: pointer;
+      font-family: inherit;
+    }
+    .screen-pill:hover { color: var(--text); }
+    .pill-active { color: var(--ink); background: var(--amber); border-color: var(--amber); font-weight: 600; }
+    .pill-note { color: var(--muted); font-size: 12px; margin-left: 6px; }
+
+    #stage {
+      position: relative; width: 800px; height: 480px; overflow: hidden;
+      background: #10201F; border-radius: 6px;
+      user-select: none; -webkit-user-select: none; touch-action: none;
+    }
+    .load-err { color: #d96459; font-size: 16px; padding: 24px; }
+
+    /* -------- LVGL widgets rendered from XML -------- */
+    .lv-screen { position: absolute; inset: 0; display: none; font-family: "Montserrat", system-ui, sans-serif; }
+    .lv-screen-active { display: block; }
+    .lv-panel, .lv-screen { color: #f2f7f6; }
+    .lv-panel { position: relative; }
+    .lv-abs { position: absolute; }
+    .lv-label, .lv-button, .lv-switch, .lv-panel { line-height: 1.25; }
+    .lv-medium { font-weight: 500; }
+    .lv-bold { font-weight: 600; }
+    .lv-hidden { display: none !important; }
+    .lv-disabled { pointer-events: none; opacity: .45; }
+
+    .lv-panel { position: relative; }
+    .lv-scroll { overflow-y: auto; scrollbar-width: thin; scrollbar-color: #243F3B transparent; }
+    .lv-scroll::-webkit-scrollbar { width: 6px; }
+    .lv-scroll::-webkit-scrollbar-thumb { background: #243F3B; border-radius: 3px; }
+
+    .lv-button {
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; border: 0; font-family: inherit;
+      transition: background .12s ease, transform .05s ease;
+      border-radius: 12px;
+      background: var(--bg, #1A2E2C);
+      position: relative;
+      overflow: hidden;
+    }
+    .lv-button:active { background: var(--bg-pressed, var(--bg, #243F3B)); transform: scale(.985); }
+    .lv-holdfill {
+      position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+      background: #D98F2B; border-radius: inherit; z-index: 0; pointer-events: none;
+    }
+    .lv-button > .lv-label { position: relative; z-index: 1; }
+
+    .lv-switch {
+      width: 56px; height: 28px; border-radius: 14px; flex: 0 0 auto;
+      background: #0B1615; border: 1px solid #243F3B; position: relative;
+      cursor: pointer; transition: background .15s ease;
+    }
+    .lv-switch::after {
+      content: ""; position: absolute; top: 2px; left: 2px;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: #8FA9A4; transition: left .15s ease, background .15s ease;
+    }
+    .lv-switch.on { background: #F2A33C; border-color: #F2A33C; }
+    .lv-switch.on::after { left: 30px; background: #121E1C; }
+
+    /* toast, like the firmware's ui_toast */
+    #toast {
+      position: absolute; left: 50%; bottom: 104px; transform: translateX(-50%) translateY(8px);
+      background: #243F3B; color: #F2F7F6; font-size: 14px; font-weight: 500;
+      padding: 10px 18px; border-radius: 10px; max-width: 700px;
+      opacity: 0; pointer-events: none; transition: opacity .2s ease, transform .2s ease;
+      z-index: 50; white-space: nowrap; font-family: "Montserrat", system-ui, sans-serif;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* -------- side panel -------- */
+    .side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      overflow: hidden;
+    }
+    .card-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 16px; border-bottom: 1px solid var(--line);
+    }
+    .card-head h2 { font-size: 13px; letter-spacing: 2px; color: var(--muted); margin: 0; text-transform: uppercase; }
+    .card-head .lbl { font-size: 12px; color: var(--amber); font-family: ui-monospace, monospace; }
+    #xml-copy {
+      font-size: 12px; color: var(--amber); background: transparent;
+      border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; cursor: pointer;
+      font-family: inherit;
+    }
+    #xml-copy:hover { border-color: var(--amber); }
+    #xml-source {
+      margin: 0; padding: 14px 16px; max-height: 480px; overflow: auto;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11.5px; line-height: 1.55; color: #b9cdc9; white-space: pre; tab-size: 2;
+    }
+    .c-tag { color: var(--amber); }
+    .c-attr { color: #7fb8e0; }
+    .c-str { color: #9fd7a8; }
+    .c-com { color: #6b8a85; font-style: italic; }
+
+    .about { padding: 16px; font-size: 13px; color: var(--muted); line-height: 1.7; }
+    .about strong { color: var(--text); }
+    .about h3 { color: var(--text); font-size: 13px; letter-spacing: 1px; margin: 14px 0 6px; text-transform: uppercase; }
+    .about h3:first-child { margin-top: 0; }
+    .tokens { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+    .tokens td { padding: 5px 8px; border-bottom: 1px solid var(--line); }
+    .sw { display: inline-block; width: 14px; height: 14px; border-radius: 4px; margin-right: 8px; vertical-align: -2px; }
+    .about ul { margin: 6px 0 0 18px; padding: 0; }
+    .about li { margin-bottom: 4px; }
+
+    footer {
+      margin-top: 26px; color: var(--muted); font-size: 12.5px; text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="masthead">
+      <span class="bubble">Catfish Pond &middot; Device UI Preview</span>
+      <h1>Catfish Feeder — <span class="accent">LVGL XML UI demo</span></h1>
+      <p class="tagline">
+        The 800&times;480 touch UI rendered <strong>live from an LVGL-style XML file</strong> —
+        the screens, design tokens and interactions below are driven entirely by
+        <code>demo/ui/catfish-ui.xml</code>, interpreted in your browser. No screenshots,
+        no flashing, no hardware. Hold <strong>FEED&nbsp;NOW</strong> like on the real panel.
+      </p>
+    </header>
+
+    <div class="layout">
+      <section aria-label="Device demo">
+        <div class="screen-label">
+          <button class="screen-pill" data-screen="0" onclick="demoScreen(0)">Home</button>
+          <button class="screen-pill" data-screen="1" onclick="demoScreen(1)">Schedule</button>
+          <button class="screen-pill" data-screen="2" onclick="demoScreen(2)">Settings</button>
+          <span class="pill-note">or use the nav bar inside the device</span>
+        </div>
+        <div id="stage-wrap">
+          <div id="stage-scale">
+            <div class="device-frame">
+              <div id="stage" role="application" aria-label="Catfish Feeder UI preview"></div>
+              <div id="toast" aria-live="polite"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="side">
+        <div class="card">
+          <div class="card-head">
+            <h2>UI source — XML</h2>
+            <span class="lbl" id="xml-screen-label">screen id="home"</span>
+            <button id="xml-copy" type="button">Copy XML</button>
+          </div>
+          <pre id="xml-source">loading ui/catfish-ui.xml …</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>About this demo</h2></div>
+          <div class="about">
+            <p>
+              A tiny interpreter (<code>renderer.js</code>) fetches
+              <code>catfish-ui.xml</code>, walks the widget tree and maps every
+              LVGL-flavored attribute to DOM at the panel&rsquo;s true
+              <strong>800&times;480</strong>. The on-device UI itself is hand-written
+              LVGL&nbsp;v8 C code — this XML is the design source of truth.
+            </p>
+            <h3>Try it</h3>
+            <ul>
+              <li>Hold <strong>FEED&nbsp;NOW</strong> ~1&nbsp;s — the amber fill mirrors the firmware&rsquo;s 800&nbsp;ms hold-to-confirm; a quick tap just toasts.</li>
+              <li>Flip <strong>12-hour clock</strong> and <strong>Vacation</strong> in Settings — the status-bar clock and the Home badge react like the real unit.</li>
+              <li><strong>Scan for relays</strong> mimics the LAN UDP broadcast feedback.</li>
+            </ul>
+            <h3>Design tokens (firmware ui.cpp)</h3>
+            <table class="tokens">
+              <tr><td><span class="sw" style="background:#10201F"></span><code>#10201F</code></td><td>background (C_BG)</td></tr>
+              <tr><td><span class="sw" style="background:#0B1615"></span><code>#0B1615</code></td><td>bars (C_BG_DARK)</td></tr>
+              <tr><td><span class="sw" style="background:#1A2E2C"></span><code>#1A2E2C</code></td><td>cards (C_CARD)</td></tr>
+              <tr><td><span class="sw" style="background:#243F3B"></span><code>#243F3B</code></td><td>pressed (C_CARD_HI)</td></tr>
+              <tr><td><span class="sw" style="background:#F2A33C"></span><code>#F2A33C</code></td><td>accent (C_AMBER)</td></tr>
+              <tr><td><span class="sw" style="background:#46D07E"></span><code>#46D07E</code></td><td>online (C_GREEN)</td></tr>
+              <tr><td><span class="sw" style="background:#D96459"></span><code>#D96459</code></td><td>alert (C_RED)</td></tr>
+            </table>
+            <p style="margin-top:12px">
+              Schema docs in
+              <a href="https://github.com/mlger/smartfishfeeder/blob/main/docs/figma-lvgl.md">docs/figma-lvgl.md</a>
+              &middot; Back to the <a href="../">web flasher</a>.
+            </p>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <footer>
+      Rendered client-side from XML &middot; Catfish Feeder open-source firmware &middot;
+      <a href="https://github.com/mlger/smartfishfeeder">GitHub</a>
+    </footer>
+  </div>
+
+  <script>
+    // page-level screen pills delegate into the renderer
+    function demoScreen(i) { if (window.__catfishDemo) window.__catfishDemo.showScreen(i); }
+  </script>
+  <script src="renderer.js"></script>
+</body>
+</html>

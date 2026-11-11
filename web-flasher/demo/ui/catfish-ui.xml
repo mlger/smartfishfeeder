@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Catfish Feeder — device UI expressed in LVGL-style XML.
+
+  This file is the single source for the interactive GitHub Pages demo
+  (web-flasher/demo/). The demo's renderer.js parses it and maps every
+  widget to DOM at the panel's true 800x480 — no screenshots, no emulator.
+
+  The vocabulary deliberately mirrors LVGL: LV_ALIGN names (top-mid,
+  right-mid, ...), flex flow + aligns, pad / pad-row / pad-col, radius,
+  letter-space, and the montserrat sizes compiled into include/lv_conf.h
+  (10 12 14 16 20 24 26 30 32). Colors are the firmware design tokens from
+  ui.cpp (C_* constants) and docs/figma-lvgl.md.
+
+  Schema (project-local, documented in docs/figma-lvgl.md):
+    <screen id="...">                  one 800x480 screen
+      <panel ...>                      container (transparent unless bg-color)
+      <label text="..." .../>
+      <button ...><label .../></button>
+      <switch key="..." on="true|false"/>
+    Widget attributes:
+      w, h            px or %
+      align           LV_ALIGN kebab-case + ox / oy offsets
+      bg-color, bg-pressed, color (text), border-color, border-width
+      radius, pad, pad-row, pad-col, letter-space, font (px size)
+      flex (row|column), flex-main, flex-cross, grow
+      hidden, disabled, scroll, bind (dynamic text), on (switches)
+    Events:
+      nav="0|1|2"     switch screen (bottom nav bar)
+      hold="feed"     press-and-hold 800 ms action (FEED NOW)
+      action="..."    demo click behaviour (scan, add-time, edit, token, ...)
+-->
+<catfish-ui app="Catfish Feeder" version="1.13.2" resolution="800x480">
+
+  <consts>
+    <color name="bg"       value="#10201F"/> <!-- C_BG        -->
+    <color name="bg-dark"  value="#0B1615"/> <!-- C_BG_DARK   -->
+    <color name="card"     value="#1A2E2C"/> <!-- C_CARD      -->
+    <color name="card-hi"  value="#243F3B"/> <!-- C_CARD_HI   -->
+    <color name="amber"    value="#F2A33C"/> <!-- C_AMBER     -->
+    <color name="amber-hi" value="#D98F2B"/> <!-- C_AMBER_HI  -->
+    <color name="text"     value="#F2F7F6"/> <!-- C_TEXT      -->
+    <color name="muted"    value="#8FA9A4"/> <!-- C_MUTED     -->
+    <color name="green"    value="#46D07E"/> <!-- C_GREEN     -->
+    <color name="red"      value="#D96459"/> <!-- C_RED       -->
+    <color name="ink"      value="#121E1C"/> <!-- C_INK       -->
+  </consts>
+
+  <!-- ================================================== HOME -->
+  <!-- Chrome (status bar + nav bar) is repeated per screen exactly like the
+       firmware: every lv_obj screen carries its own chrome widgets. -->
+  <screen id="home">
+    <panel w="100%" h="48" bg-color="$bg-dark" align="top-mid">
+      <label text="CATFISH FEEDER" font="16" letter-space="3" color="$text" align="left-mid" ox="16"/>
+      <label id="badge-vacation" text="VACATION • SCHEDULES PAUSED" font="14" color="$red"
+             align="top-right" ox="-14" oy="52" hidden="true"/>
+      <label bind="clock" text="--:--" font="16" color="$text" align="right-mid" ox="-44"/>
+      <label text="◉" font="14" color="$muted" align="right-mid" ox="-16"/>
+    </panel>
+
+    <panel w="100%" h="360" align="top-mid" y="48" pad="16" pad-row="12"
+           flex="column" flex-main="center" flex-cross="center">
+      <!-- FEED NOW — hold to confirm, like the firmware (800 ms amber fill) -->
+      <button id="feed-btn" w="420" h="120" radius="24" bg-color="$amber" bg-pressed="$amber-hi" hold="feed">
+        <label text="▶  FEED NOW" font="32" color="$ink"/>
+      </button>
+      <label bind="feed-preview" text="15 g • All tanks • 3 fed today" font="12" color="$muted"/>
+
+      <panel w="100%" h="170" flex="row" flex-main="space-between" flex-cross="center">
+        <panel w="32%" h="170" bg-color="$card" radius="12" pad="16" pad-row="6" flex="column">
+          <label text="NEXT FEEDING" font="12" letter-space="2" color="$muted"/>
+          <label text="07:30" font="20" color="$text"/>
+          <label text="15 g • Mon–Fri" font="14" color="$muted"/>
+        </panel>
+        <panel w="32%" h="170" bg-color="$card" radius="12" pad="16" pad-row="6" flex="column">
+          <label text="LAST FED" font="12" letter-space="2" color="$muted"/>
+          <label bind="last-value" text="Yesterday" font="20" color="$text"/>
+          <label bind="last-sub" text="18:00 • 25 g" font="14" color="$muted"/>
+        </panel>
+        <panel w="32%" h="170" bg-color="$card" radius="12" pad="16" pad-row="6" flex="column">
+          <label text="RELAY UNIT" font="12" letter-space="2" color="$muted"/>
+          <label text="192.168.1.42" font="14" color="$text"/>
+          <label text="● online • 37 g/s" font="12" color="$green"/>
+        </panel>
+      </panel>
+    </panel>
+
+    <panel w="100%" h="72" bg-color="$bg-dark" align="bottom-mid" flex="row"
+           flex-main="space-evenly" flex-cross="center">
+      <button nav="0" w="244" h="64" radius="12" bg-color="$card-hi" bg-pressed="$card-hi" active="true">
+        <label text="⌂  Home" font="16" color="$amber"/>
+      </button>
+      <button nav="1" w="244" h="64" radius="12" bg-color="$card" bg-pressed="$card-hi">
+        <label text="☰  Schedule" font="16" color="$muted"/>
+      </button>
+      <button nav="2" w="244" h="64" radius="12" bg-color="$card" bg-pressed="$card-hi">
+        <label text="⚙  Settings" font="16" color="$muted"/>
+      </button>
+    </panel>
+  </screen>
+
+  <!-- ================================================ SCHEDULE -->
+  <screen id="schedule">
+    <panel w="100%" h="48" bg-color="$bg-dark" align="top-mid">
+      <label text="CATFISH FEEDER" font="16" letter-space="3" color="$text" align="left-mid" ox="16"/>
+      <label bind="clock" text="--:--" font="16" color="$text" align="right-mid" ox="-44"/>
+      <label text="◉" font="14" color="$muted" align="right-mid" ox="-16"/>
+    </panel>
+
+    <panel w="100%" h="360" align="top-mid" y="48" pad="16" pad-row="12" flex="column" scroll="true">
+      <panel w="100%" h="88" bg-color="$card" radius="12" pad="16" pad-col="14" flex="row" flex-cross="center">
+        <switch key="sched0" on="true"/>
+        <label text="07:30" font="24" color="$text"/>
+        <panel flex="column" pad-row="2" grow="1">
+          <label text="15 g" font="16" color="$text"/>
+          <label text="MON – FRI" font="12" color="$muted"/>
+        </panel>
+        <button action="edit" w="64" h="48" radius="12" bg-color="$card" bg-pressed="$card-hi">
+          <label text="✎" font="16" color="$amber"/>
+        </button>
+      </panel>
+
+      <panel w="100%" h="88" bg-color="$card" radius="12" pad="16" pad-col="14" flex="row" flex-cross="center">
+        <switch key="sched1" on="true"/>
+        <label text="12:00" font="24" color="$text"/>
+        <panel flex="column" pad-row="2" grow="1">
+          <label text="5 g" font="16" color="$text"/>
+          <label text="DAILY" font="12" color="$muted"/>
+        </panel>
+        <button action="edit" w="64" h="48" radius="12" bg-color="$card" bg-pressed="$card-hi">
+          <label text="✎" font="16" color="$amber"/>
+        </button>
+      </panel>
+
+      <panel w="100%" h="88" bg-color="$card" radius="12" pad="16" pad-col="14" flex="row" flex-cross="center">
+        <switch key="sched2" on="false"/>
+        <label text="18:00" font="24" color="$text"/>
+        <panel flex="column" pad-row="2" grow="1">
+          <label text="25 g" font="16" color="$text"/>
+          <label text="SAT – SUN" font="12" color="$muted"/>
+        </panel>
+        <button action="edit" w="64" h="48" radius="12" bg-color="$card" bg-pressed="$card-hi">
+          <label text="✎" font="16" color="$amber"/>
+        </button>
+      </panel>
+
+      <button action="add-time" w="100%" h="60" radius="12" bg-color="$card" bg-pressed="$card-hi"
+              border-color="$amber" border-width="2">
+        <label text="＋  ADD FEEDING TIME" font="16" color="$amber"/>
+      </button>
+
+      <panel w="100%" bg-color="$card" radius="12" pad="16" pad-row="8" flex="column">
+        <label text="FEED HISTORY (LATEST 24)" font="12" letter-space="2" color="$muted"/>
+        <label text="✓ Today 07:30 — 15 g • Tank 1" font="14" color="$text"/>
+        <label text="✗ Yesterday 12:00 — 5 g • skipped (no WiFi)" font="14" color="$muted"/>
+        <label text="✓ Yesterday 18:00 — 25 g • Tank 1" font="14" color="$text"/>
+      </panel>
+    </panel>
+
+    <panel w="100%" h="72" bg-color="$bg-dark" align="bottom-mid" flex="row"
+           flex-main="space-evenly" flex-cross="center">
+      <button nav="0" w="244" h="64" radius="12" bg-color="$card" bg-pressed="$card-hi">
+        <label text="⌂  Home" font="16" color="$muted"/>
+      </button>
+      <button nav="1" w="244" h="64" radius="12" bg-color="$card-hi" bg-pressed="$card-hi" active="true">
+        <label text="☰  Schedule" font="16" color="$amber"/>
+      </button>
+      <button nav="2" w="244" h="64" radius="12" bg-color="$card" bg-pressed="$card-hi">
+        <label text="⚙  Settings" font="16" color="$muted"/>
+      </button>
+    </panel>
+  </screen>
+
+  <!-- ================================================ SETTINGS -->
+  <screen id="settings">
+    <panel w="100%" h="48" bg-color="$bg-dark" align="top-mid">
+      <label text="CATFISH FEEDER" font="16" letter-space="3" color="$text" align="left-mid" ox="16"/>
+      <label bind="clock" text="--:--" font="16" color="$text" align="right-mid" ox="-44"/>
+      <label text="◉" font="14" color="$muted" align="right-mid" ox="-16"/>
+    </panel>
+
+    <panel w="100%" h="360" align="top-mid" y="48" pad="16" pad-row="12" flex="column" scroll="true">
+      <panel w="100%" bg-color="$card" radius="12" pad="16" pad-row="10" flex="column">
+        <label text="RELAY UNIT" font="12" letter-space="2" color="$muted"/>
+        <label text="Relay IP: 192.168.1.42" font="14" color="$text"/>
+        <panel w="100%" h="56" flex="row" flex-cross="center" pad-col="12">
+          <label text="Pairing token" font="16" color="$text" grow="1"/>
+          <button action="token" w="140" h="48" radius="12" bg-color="$card-hi" bg-pressed="$amber">
+            <label text="✎  Edit" font="16" color="$amber"/>
+          </button>
+        </panel>
+        <button action="scan" w="100%" h="56" radius="12" bg-color="$card" bg-pressed="$card-hi"
+                border-color="$amber" border-width="2">
+          <label text="◉  Scan for relays" font="16" color="$amber"/>
+        </button>
+      </panel>
+
+      <panel w="100%" bg-color="$card" radius="12" pad="16" pad-row="10" flex="column">
+        <label text="TANKS" font="12" letter-space="2" color="$muted"/>
+        <panel w="100%" h="52" flex="row" flex-cross="center" pad-col="12">
+          <label text="Relay units (tanks)" font="16" color="$text" grow="1"/>
+          <button action="tank-dec" w="52" h="48" radius="12" bg-color="$card-hi" bg-pressed="$amber">
+            <label text="−" font="20" color="$text"/>
+          </button>
+          <panel w="72" h="48" bg-color="$bg-dark" radius="8" flex="row" flex-main="center" flex-cross="center">
+            <label bind="tank-count" text="1" font="20" color="$text"/>
+          </panel>
+          <button action="tank-inc" w="52" h="48" radius="12" bg-color="$card-hi" bg-pressed="$amber">
+            <label text="＋" font="20" color="$text"/>
+          </button>
+        </panel>
+        <panel w="100%" h="44" flex="row" flex-cross="center" pad-col="12">
+          <label text="Tank 1" font="16" color="$text" grow="1"/>
+          <label text="37 g/s calibrated" font="14" color="$muted"/>
+        </panel>
+      </panel>
+
+      <panel w="100%" bg-color="$card" radius="12" pad="16" pad-row="10" flex="column">
+        <label text="PREFERENCES" font="12" letter-space="2" color="$muted"/>
+        <panel w="100%" h="52" flex="row" flex-cross="center" pad-col="12">
+          <label text="Backlight" font="16" color="$text" grow="1"/>
+          <switch key="backlight" on="true"/>
+        </panel>
+        <panel w="100%" h="52" flex="row" flex-cross="center" pad-col="12">
+          <label text="12-hour clock" font="16" color="$text" grow="1"/>
+          <switch key="clock12" on="true"/>
+        </panel>
+        <panel w="100%" h="52" flex="row" flex-cross="center" pad-col="12">
+          <label text="Vacation (pause feeding)" font="16" color="$text" grow="1"/>
+          <switch key="vacation" on="false"/>
+        </panel>
+        <panel w="100%" h="52" flex="row" flex-cross="center" pad-col="12">
+          <label text="Default portion (grams)" font="16" color="$text" grow="1"/>
+          <label text="15 g" font="16" color="$text"/>
+        </panel>
+      </panel>
+    </panel>
+
+    <panel w="100%" h="72" bg-color="$bg-dark" align="bottom-mid" flex="row"
+           flex-main="space-evenly" flex-cross="center">
+      <button nav="0" w="244" h="64" radius="12" bg-color="$card" bg-pressed="$card-hi">
+        <label text="⌂  Home" font="16" color="$muted"/>
+      </button>
+      <button nav="1" w="244" h="64" radius="12" bg-color="$card" bg-pressed="$card-hi">
+        <label text="☰  Schedule" font="16" color="$muted"/>
+      </button>
+      <button nav="2" w="244" h="64" radius="12" bg-color="$card-hi" bg-pressed="$card-hi" active="true">
+        <label text="⚙  Settings" font="16" color="$amber"/>
+      </button>
+    </panel>
+  </screen>
+</catfish-ui>

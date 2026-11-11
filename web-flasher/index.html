@@ -85,6 +85,24 @@
 
     .vp-desc { margin: 0 0 0.9rem; color: var(--muted); font-size: 0.92rem; }
 
+    /* ============ UI demo teaser ============ */
+    .demo-teaser {
+      display: flex;
+      align-items: center;
+      gap: 0.9rem;
+      background: var(--pond-card);
+      border: 1px solid var(--pond-card-edge);
+      border-left: 3px solid var(--amber);
+      border-radius: 12px;
+      padding: 0.9rem 1.1rem;
+      margin-bottom: 1.75rem;
+      font-size: 0.92rem;
+      color: var(--muted);
+    }
+    .demo-teaser .eye { font-size: 1.3rem; line-height: 1; }
+    .demo-teaser a { color: var(--amber); font-weight: 600; }
+    .demo-teaser a:hover { text-decoration: underline; }
+
     .vp-row {
       display: flex;
       flex-wrap: wrap;
@@ -283,6 +301,19 @@
           will not work in this state. An ad-blocker / privacy extension or a
           network filter is the most common cause — disable it for this page
           and reload, then click Install again.
+        </p>
+      </section>
+
+      <!-- ============ Device UI demo teaser ============ -->
+      <section class="demo-teaser" aria-label="Device UI demo">
+        <span class="eye" aria-hidden="true">▸</span>
+        <p style="margin: 0;">
+          <strong>Not ready to flash?</strong> Try the
+          <a href="demo/">interactive device UI demo</a> — the 800&times;480
+          touch interface rendered live in your browser from an
+          LVGL-style XML file. Click through Home / Schedule / Settings,
+          hold <strong>FEED&nbsp;NOW</strong> like on the real panel —
+          no hardware, no screenshots.
         </p>
       </section>
 

@@ -49,7 +49,43 @@ LVGL AI generates LVGL UI code from prompts (screens, layouts, styling) and can 
 
 ## Previewing without hardware
 
-- **viewer.lvgl.io** — open exported LVGL projects in a browser and click through screens before flashing. Use it to sanity-check layout and navigation between Feed Now / Schedule / Settings.
+- **Pages UI demo (this repo)** — `web-flasher/demo/` (deployed at
+  `…github.io/smartfishfeeder/demo/`) renders the three screens **live from
+  XML** in the browser: no screenshots, no emulator, no flashing. The screen
+  source is `web-flasher/demo/ui/catfish-ui.xml`; `renderer.js` is a ~500-line
+  interpreter that walks the widget tree and maps each LVGL-flavored
+  attribute to DOM at the panel's true 800x480 (scaled to fit the window).
+  It reproduces the firmware interactions: hold-to-confirm FEED NOW
+  (800 ms amber fill, tap = "Press and hold" toast), working switches
+  (12-hour clock reformats the status-bar clock, Vacation shows the red
+  badge and disables the feed button), scan toast, live ticking clock.
+  The page also shows the current screen's XML source alongside — the XML
+  is the design source of truth; the firmware's hand-written LVGL v8 C code
+  (`firmware/display-unit/src/ui/`) mirrors it.
+- **viewer.lvgl.io** — for *exported LVGL project* files from the Figma
+  plugin (a different artifact from this project-local XML).
+
+### Demo XML schema (project-local, LVGL-flavored)
+
+Root `<catfish-ui resolution="800x480">` with a `<consts>` color table
+(the firmware design tokens; reference colors as `$name` anywhere a color
+is accepted). Widgets and attributes:
+
+| Widget | Purpose | Key attributes |
+|--------|---------|----------------|
+| `<screen id>` | one 800x480 screen | — |
+| `<panel>` | container, transparent unless styled | `w h align ox oy bg-color radius pad pad-row pad-col flex flex-main flex-cross grow scroll hidden` |
+| `<label>` | text | `text font color letter-space align ox oy bind hidden` |
+| `<button>` | clickable, holds a `<label>` | `w h radius bg-color bg-pressed border-color border-width nav hold action` |
+| `<switch>` | toggle | `on key` |
+
+`align` uses LV_ALIGN kebab names (`top-mid`, `right-mid`, `center`, …);
+`font` is the px size — stick to the Montserrat sizes compiled into
+`include/lv_conf.h` (10 12 14 16 20 24 26 30 32). Events:
+`nav="0|1|2"` (bottom nav), `hold="feed"` (FEED NOW), `action="…"`
+(wired in `renderer.js`), `bind="…"` marks labels the runtime updates
+(clock, last-fed, feed preview). Keep mockups and this XML in sync with
+the design tokens below.
 
 ## Design tokens used by the firmware
 
