@@ -1494,14 +1494,17 @@ static void handleWorkerResult(const net_worker::Result &r) {
       // needs the router up and CANNOT work over ESP-NOW. With direct puck
       // feed enabled the pucks still feed without WiFi, so phrase the toast
       // honestly instead of a bare "WiFi down" (mirrors the v1.13.0 feed).
-      if (r.error == "WiFi down" && anyDirectPuckIntent()) {
+      // v1.13.2: r.error is a char[] — `r.error == "WiFi down"` compared
+      // POINTER addresses (always false), so the honest toast never fired and
+      // the QEMU scan abort counter never incremented (CI job red).
+      if (strcmp(r.error, "WiFi down") == 0 && anyDirectPuckIntent()) {
         uiToast("No WiFi - cannot scan, pucks still feed directly");
       } else {
         uiToast(String("Scan failed: ") + r.error);
       }
       Serial.printf("[NET] tank scan FAILED: %s\n", r.error);
 #if CATFISH_QEMU
-      if (r.error == "WiFi down") g_qemu_scan_wifi_aborts++;
+      if (strcmp(r.error, "WiFi down") == 0) g_qemu_scan_wifi_aborts++;
 #endif
     }
     return;

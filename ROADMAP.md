@@ -76,6 +76,17 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
       QEMU smoke gains a scan-WiFi-down step proving the result path completes
       and the scan button un-wedges.
 
+## v1.13.2 — patch 🔜
+
+- [x] The v1.13.1 scan fix compared the wrong thing — `r.error` is a `char[]`
+      (filled via `strlcpy`), so both `r.error == "WiFi down"` checks in the
+      RES_SCAN handler compared **pointer addresses** (always false): the
+      honest `No WiFi - cannot scan, pucks still feed directly` toast never
+      fired and the new QEMU smoke scan-abort counter never incremented —
+      the first-ever red run of that job caught it. Both checks now use
+      `strcmp` content compare; QEMU smoke is green again (13/13 checks +
+      SMOKE PASS verified locally on the emulated ESP32-S3).
+
 ## v1.14.0 — sensing 🔜
 
 - [ ] Food-level sensor on the relay unit (D2) — wire into the existing hopper
