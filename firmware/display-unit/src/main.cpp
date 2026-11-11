@@ -66,6 +66,10 @@ static Board *s_board = nullptr;
 // Smoke-test observability counters (zero cost in hardware builds; incremented
 // from requestFeed()'s WiFi-abort branch and asserted by qemuSmokePump()).
 static uint32_t g_qemu_wifi_aborts = 0;
+// v1.13.1: RES_SCAN completions while WiFi is down — scan is a LAN broadcast,
+// so the worker result still arrives (ok=false / "WiFi down"): the toast path
+// runs and the scan button must un-wedge cleanly.
+static uint32_t g_qemu_scan_wifi_aborts = 0;
 #endif
 
 // loop() cadence timestamps
@@ -1260,6 +1264,16 @@ static void handleUiEvent(const UiEvent &ev) {
   }
 }
 
+// v1.13.1: does any tank intend to feed pucks directly (relay-side ESP-NOW)?
+// Both sources matter: prefs is the user's saved intent (survives reboot and
+// works with the router OFF — exactly the state in which toasts get phrased),
+// the runtime cache mirrors what the relay actually reports via /status.
+static bool anyDirectPuckIntent() {
+  for (uint8_t t = 1; t <= relay_client::MAX_TANKS; t++)
+    if (prefs::getTankEspnowDirect(t)) return true;
+  return relay_client::anyTankEspnowDirect(0);
+}
+
 // ---------------------------------------------------------------------------
 // Worker result handling
 // ---------------------------------------------------------------------------
@@ -1476,8 +1490,19 @@ static void handleWorkerResult(const net_worker::Result &r) {
                     (unsigned)r.liveCount, (unsigned)r.boundMask);
       refreshSelectedTankCard();
     } else {
-      uiToast(String("Scan failed: ") + r.error);
+      // v1.13.1: "Scan for relays" is a UDP broadcast on the WiFi LAN — it
+      // needs the router up and CANNOT work over ESP-NOW. With direct puck
+      // feed enabled the pucks still feed without WiFi, so phrase the toast
+      // honestly instead of a bare "WiFi down" (mirrors the v1.13.0 feed).
+      if (r.error == "WiFi down" && anyDirectPuckIntent()) {
+        uiToast("No WiFi - cannot scan, pucks still feed directly");
+      } else {
+        uiToast(String("Scan failed: ") + r.error);
+      }
       Serial.printf("[NET] tank scan FAILED: %s\n", r.error);
+#if CATFISH_QEMU
+      if (r.error == "WiFi down") g_qemu_scan_wifi_aborts++;
+#endif
     }
     return;
   }
@@ -1695,6 +1720,19 @@ static void qemuSmokePump() {
       qemuSmokeLog("CALIB_TEST aborts cleanly with no WiFi",
                    g_qemu_wifi_aborts == 2);
       {
+        // v1.13.1: tank scan with WiFi down — the worker must complete the
+        // command with a WiFi-down result and the scan button must un-wedge
+        // (RES_SCAN failure path, not the pre-enqueue feed abort).
+        UiEvent ev{};
+        ev.type = UI_EVT_SCAN_TANKS;
+        qemuSmokeSend(ev);
+      }
+      s_step = 11;
+      break;
+    case 11:
+      qemuSmokeLog("SCAN completes cleanly with no WiFi",
+                   g_qemu_scan_wifi_aborts == 1);
+      {
         // v1.11.6: CALIB tab SET — 74 g weighed after a 2 s test -> 37 g/s
         UiEvent ev{};
         ev.type = UI_EVT_CALIB_SET;
@@ -1703,13 +1741,13 @@ static void qemuSmokePump() {
         ev.grams = 74; // weighed output
         qemuSmokeSend(ev);
       }
-      s_step = 11;
+      s_step = 12;
       break;
-    case 11:
+    case 12:
       qemuSmokeLog("CALIB_SET persisted (74 g / 2 s = 37 g/s)",
                    prefs::getTankGps(1) == 37);
       Serial.println("[QEMU] SMOKE PASS");
-      s_step = 12;
+      s_step = 13;
       break;
     default: {
       // Steady-state heartbeat: keep running (dim timers, LVGL rebuilds,

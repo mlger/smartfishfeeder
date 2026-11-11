@@ -63,6 +63,19 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
       least `LV_MEM_MONITOR` so UI growth can't wedge the 160 KB static pool
       again **[suggestion #11]** (effort S)
 
+## v1.13.1 — patch 🔜
+
+- [x] Honest "scan with router off" toast — *Scan for relays* is a UDP
+      broadcast on the WiFi LAN and cannot work over ESP-NOW, so with the
+      router off it reported a bare `Scan failed: WiFi down` (user-reported
+      confusion right after the ESP-NOW offline work). When any relay has
+      direct puck feed enabled, the toast now reads
+      `No WiFi - cannot scan, pucks still feed directly`; otherwise the
+      generic failure text stands. Gated on saved tank prefs (NVS) OR the
+      relay's last-reported capability, so it survives a router-off reboot.
+      QEMU smoke gains a scan-WiFi-down step proving the result path completes
+      and the scan button un-wedges.
+
 ## v1.14.0 — sensing 🔜
 
 - [ ] Food-level sensor on the relay unit (D2) — wire into the existing hopper
