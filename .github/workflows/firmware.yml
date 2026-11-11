@@ -211,10 +211,25 @@ jobs:
           restore-keys: |
             pio-display-unit-qemu-${{ runner.os }}-
 
-      - name: Install QEMU runtime dependencies
+      # Best-effort since 2026-11-11: the runner's apt DNS has recurring
+      # outages ("Temporary failure resolving security.ubuntu.com") that
+      # cancelled three QEMU jobs in a row. The only library the Espressif
+      # qemu-system-xtensa actually needs beyond the runner image is
+      # libslirp — it is vendored in tools/qemu-deps/ and unpacked below, so
+      # an apt failure no longer blocks the smoke test. SDL2/pixman stay in
+      # this step for images where the preflight would otherwise miss them.
+      - name: Install QEMU runtime dependencies (best-effort)
+        continue-on-error: true
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libslirp0 libsdl2-2.0-0 libpixman-1-0
+          sudo apt-get update -q || true
+          sudo apt-get install -y -q libslirp0 libsdl2-2.0-0 libpixman-1-0 || true
+
+      - name: Unpack vendored libslirp fallback (runner-script deps path)
+        run: |
+          DEPS_DIR="$GITHUB_WORKSPACE/../tools/deps"
+          mkdir -p "$DEPS_DIR"
+          dpkg -x tools/qemu-deps/libslirp0_4.7.0-1_amd64.deb "$DEPS_DIR"
+          echo "libslirp fallback unpacked to $DEPS_DIR/usr/lib/x86_64-linux-gnu"
 
       - name: Download Espressif QEMU (pinned esp32s3-capable release)
         run: |

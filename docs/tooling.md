@@ -276,10 +276,15 @@ mkdir -p tools && curl -sL -o /tmp/qemu.tar.xz \
   https://github.com/espressif/qemu/releases/download/esp-develop-9.2.2-20260417/qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz
 tar -xJf /tmp/qemu.tar.xz -C tools/   # -> tools/qemu/bin/qemu-system-xtensa
 sudo apt-get install libslirp0        # only runtime dependency
+# no root? scripts/qemu_run.sh also searches ../tools/deps/usr/lib/x86_64-linux-gnu
+# for libslirp — dpkg -x tools/qemu-deps/libslirp0_4.7.0-1_amd64.deb tools/deps/
 ```
 
 Notes:
 
+- The libslirp .deb is vendored at `tools/qemu-deps/` (v1.13.2): the CI QEMU
+  job installs apt packages best-effort and unpacks the vendored copy, so
+  recurring runner DNS outages can no longer fail the smoke test.
 - **Never flash `display-unit-qemu` to hardware** — it skips panel/RTC/SD/nRF24
   bring-up by design. Hardware env: `display-unit` (unchanged).
 - PSRAM is not emulated here; the headless build doesn't need it (LVGL draw
