@@ -283,8 +283,11 @@ sudo apt-get install libslirp0        # only runtime dependency
 Notes:
 
 - The libslirp .deb is vendored at `tools/qemu-deps/` (v1.13.2): the CI QEMU
-  job installs apt packages best-effort and unpacks the vendored copy, so
-  recurring runner DNS outages can no longer fail the smoke test.
+  job installs apt packages best-effort, falls back to a public DNS resolver
+  when the runner cannot resolve the Ubuntu mirrors, and unpacks the vendored
+  copy — so recurring runner apt/DNS outages can no longer fail the smoke
+  test. (SDL2 is genuinely required on the CI image; the vendored fallback
+  covers only libslirp.)
 - **Never flash `display-unit-qemu` to hardware** — it skips panel/RTC/SD/nRF24
   bring-up by design. Hardware env: `display-unit` (unchanged).
 - PSRAM is not emulated here; the headless build doesn't need it (LVGL draw

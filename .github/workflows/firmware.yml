@@ -213,11 +213,23 @@ jobs:
 
       # Best-effort since 2026-11-11: the runner's apt DNS has recurring
       # outages ("Temporary failure resolving security.ubuntu.com") that
-      # cancelled three QEMU jobs in a row. The only library the Espressif
-      # qemu-system-xtensa actually needs beyond the runner image is
-      # libslirp — it is vendored in tools/qemu-deps/ and unpacked below, so
-      # an apt failure no longer blocks the smoke test. SDL2/pixman stay in
-      # this step for images where the preflight would otherwise miss them.
+      # cancelled three QEMU jobs in a row. Two mitigations:
+      #   1. the DNS step below falls back to a public resolver when the
+      #      system resolver cannot resolve the Ubuntu mirrors (observed:
+      #      github.com resolves fine while the mirrors do not, so this is
+      #      resolver-side, not a network blackout);
+      #   2. libslirp — the only library not present on the runner image
+      #      besides SDL2 — is vendored in tools/qemu-deps/ and unpacked
+      #      below, so a still-failing apt for that one package is fine.
+      - name: Work around runner DNS outage for Ubuntu mirrors (best-effort)
+        run: |
+          if ! getent hosts security.ubuntu.com >/dev/null 2>&1; then
+            echo "::notice::runner resolver cannot resolve security.ubuntu.com — switching /etc/resolv.conf to a public resolver for this job"
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions edns0 trust-ad\n' | sudo tee /etc/resolv.conf
+          else
+            echo "runner resolver OK — no override needed"
+          fi
+
       - name: Install QEMU runtime dependencies (best-effort)
         continue-on-error: true
         run: |
