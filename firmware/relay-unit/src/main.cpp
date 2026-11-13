@@ -39,10 +39,18 @@
  *   S executed so the same broadcast can never feed twice. The seq ring, grace
  *   window and wraparound math are pinned by the native suite
  *   test_catfish_rfdedup (firmware/display-unit/test/).
- *   While the link is down the radio is PINNED to the last AP channel between
- *   bounded reconnect attempts (same scheme as the display unit v1.12.1) and
- *   a failed boot portal continues HEADLESS instead of restarting, so pucks
- *   keep working with no router at all.
+ *
+ * ESP-NOW discovery responder (v1.14.0, ALWAYS on):
+ *   The relay also answers 12-byte catfish_rfnode DISCOVER datagrams (cmd=2)
+ *   unicast with a DISCOVER_RSP (cmd=3) carrying its tank mask, default pulse
+ *   seconds and protocol version — token-keyed like every datagram. This is
+ *   what lets the display unit's "Scan for relays" find the pond with the
+ *   ROUTER OFF (a UDP LAN broadcast cannot exist without WiFi). Because the
+ *   responder is always listening, the WiFi watchdog now pins the radio to
+ *   the last AP channel and runs bounded reconnects for EVERY relay (v1.13.0
+ *   scheme, previously espnowDirect-only) and a routerless boot continues
+ *   HEADLESS whenever stored credentials exist, so offline scan + pucks keep
+ *   working with no router at all.
  *
  * Feeding mechanisms (Phase 4; all keep "feed for N seconds" semantics):
  *   motor (default) D1 relay/FET ON for N s — original behaviour
@@ -566,54 +574,119 @@ static void discoveryPump() {
 // ---------------------------------------------------------------------------
 static CatfishRfDedup g_dedup;
 static bool g_espnowReady = false;
+// v1.14.0: pending discovery answer (recv callback runs in the SDK WiFi
+// task, so the RSP goes out from loop() — same pattern as the direct-feed
+// pending->grace->execute machine). Latest REQ wins; the hub bursts every
+// ~300 ms, so losing a race costs one burst round at most.
+static uint8_t s_discPending = 0;
+static uint8_t s_discMac[6] = {0};
 static uint32_t g_espnowDrops = 0;
 
 static void espnowRecvCb(uint8_t *mac, uint8_t *data, uint8_t len) {
-  (void)mac; // sender MAC intentionally not filtered — the packet key is the gate
-  if (!g_espnow.direct) { g_espnowDrops++; return; }
+  // (void)mac — sender MAC intentionally not filtered; the packet key is the
+  // gate (and for discovery it IS the reply address, captured below).
   uint8_t cmd = 0xFF, mask = 0, seconds = 0;
   uint16_t seq = 0;
   uint32_t key = 0;
-  if (!catfishRfnodeParse(data, (size_t)len, &cmd, &mask, &seconds, &seq, &key)) {
+  if (catfishRfnodeParse(data, (size_t)len, &cmd, &mask, &seconds, &seq, &key)) {
+    // ---- feed datagram (v1.13.0, direct mode only) ----
+    if (!g_espnow.direct) { g_espnowDrops++; return; }
+    if (key != catfishRfnodeKeyFromToken(g_cfg.token)) {
+      g_espnowDrops++;
+      LOG("espnow: rejected packet (bad key, seq %u)", (unsigned)seq);
+      return;
+    }
+    // Tank-mask filter: relay mask 0 = honor everything; a datagram mask of 0
+    // means "hub default" which we cannot resolve headless — honor it too.
+    if (g_espnow.mask != 0 && mask != 0 && !(mask & g_espnow.mask)) {
+      g_espnowDrops++;
+      return;
+    }
+    if (!catfishRfDedupArm(&g_dedup, seq, seconds, millis())) {
+      return; // seq already executed — duplicate/re-broadcast, drop silently
+    }
+    LOG("espnow: puck request armed (seq %u, %u s, mask 0x%X) - %u ms grace",
+        (unsigned)seq, (unsigned)seconds, (unsigned)mask,
+        (unsigned)CATFISH_RFDEDUP_GRACE_MS);
+    return;
+  }
+
+  // ---- v1.14.0: discovery request (ALWAYS answered, direct mode irrelevant) --
+  // catfishRfnodeParse is strict about cmd=FEED, so nothing else reaches here;
+  // a DISCOVER burst must never arm a feed and a RSP is not accepted at all.
+  if (!catfishRfnodeParseDiscover(data, (size_t)len, &seq, &key)) {
     g_espnowDrops++;
     return;
   }
   if (key != catfishRfnodeKeyFromToken(g_cfg.token)) {
     g_espnowDrops++;
-    LOG("espnow: rejected packet (bad key, seq %u)", (unsigned)seq);
-    return;
+    return; // wrong token — stay silent, no error spam
   }
-  // Tank-mask filter: relay mask 0 = honor everything; a datagram mask of 0
-  // means "hub default" which we cannot resolve headless — honor it too.
-  if (g_espnow.mask != 0 && mask != 0 && !(mask & g_espnow.mask)) {
-    g_espnowDrops++;
-    return;
-  }
-  if (!catfishRfDedupArm(&g_dedup, seq, seconds, millis())) {
-    return; // seq already executed — duplicate/re-broadcast, drop silently
-  }
-  LOG("espnow: puck request armed (seq %u, %u s, mask 0x%X) - %u ms grace",
-      (unsigned)seq, (unsigned)seconds, (unsigned)mask,
-      (unsigned)CATFISH_RFDEDUP_GRACE_MS);
+  // The callback runs in the SDK WiFi task: stash the reply address ONLY and
+  // send the actual RSP from loop() (espnowDiscoveryTick), mirroring the
+  // direct-feed pending->grace->execute pattern. Latest REQ wins.
+  noInterrupts();
+  memcpy(s_discMac, mac, sizeof(s_discMac));
+  s_discPending = 1;
+  interrupts();
 }
 
-/** (Re)start or stop the listener so it always matches g_espnow.direct. */
-static void espnowApplyConfig() {
-  if (g_espnow.direct && !g_espnowReady) {
-    if (esp_now_init() != 0) {
-      LOG("espnow init FAILED (staying off)");
-      return;
-    }
-    esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
-    esp_now_register_recv_cb(espnowRecvCb);
-    catfishRfDedupInit(&g_dedup);
-    g_espnowReady = true;
-    LOG("espnow: DIRECT puck feed listening (channel follows WiFi, pinned while down)");
-  } else if (!g_espnow.direct && g_espnowReady) {
-    esp_now_deinit();
-    g_espnowReady = false;
-    LOG("espnow: direct mode OFF - listener stopped");
+/** Send the queued DISCOVER_RSP from loop() context. */
+static void espnowDiscoveryTick() {
+  if (!g_espnowReady || !s_discPending) return;
+  uint8_t mac[6];
+  noInterrupts();
+  memcpy(mac, s_discMac, sizeof(mac));
+  s_discPending = 0;
+  interrupts();
+
+  uint8_t rsp[CATFISH_RFNODE_PKT_LEN];
+  const size_t n = catfishRfnodeBuildDiscoverRsp(
+      rsp, sizeof(rsp), g_espnow.mask, (uint8_t)g_cfg.pulseS,
+      (uint16_t)CATFISH_PROTOCOL_VERSION,
+      catfishRfnodeKeyFromToken(g_cfg.token));
+  if (!n) return;
+
+  // esp_now_send only talks to registered peers: add (COMBO role, current
+  // channel), send, delete. Works identically with the STA up or pinned.
+  const uint8_t chan = wifi_get_channel();
+  if (esp_now_add_peer(mac, ESP_NOW_ROLE_COMBO, chan, NULL, 0) != 0) {
+    LOG("espnow: discovery peer add FAILED (ch%u)", (unsigned)chan);
+    return;
   }
+  const int rc = esp_now_send(mac, rsp, (uint8_t)n);
+  esp_now_del_peer(mac);
+  if (rc == 0) {
+    LOG("espnow: discovery answer -> %02X:%02X:%02X:%02X:%02X:%02X (ch%u, pulse %u s)",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (unsigned)chan,
+        (unsigned)g_cfg.pulseS);
+  } else {
+    LOG("espnow: discovery send FAILED rc=%d", rc);
+  }
+}
+
+/**
+ * v1.14.0: ESP-NOW is ALWAYS initialized — the discovery responder is what
+ * makes the display's offline "Scan for relays" work, and the direct-feed
+ * toggle is now just a gate check inside the recv callback (no re-init).
+ * Self role is COMBO (not SLAVE) because the relay now SENDS the RSP too.
+ */
+static void espnowApplyConfig() {
+  if (g_espnowReady) {
+    LOG("espnow: direct feed %s (listener already up)",
+        g_espnow.direct ? "ARMED" : "off");
+    return;
+  }
+  if (esp_now_init() != 0) {
+    LOG("espnow init FAILED (discovery responder off)");
+    return;
+  }
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_register_recv_cb(espnowRecvCb);
+  catfishRfDedupInit(&g_dedup);
+  g_espnowReady = true;
+  LOG("espnow: listening (discovery responder on, direct feed %s)",
+      g_espnow.direct ? "ARMED" : "off");
 }
 
 /** Feed straight from a datagram (hub echo missed the grace window). */
@@ -646,12 +719,15 @@ static void rfdedupTick() {
 
 // ---------------------------------------------------------------------------
 // WiFi reconnect watchdog
-// v1.13.0: in espnowDirect mode the watchdog mirrors the display unit's
-// v1.12.1 scheme — bounded reconnect attempts (WIFI_RETRY_EVERY_MS cadence,
+// v1.14.0: bounded reconnect attempts (WIFI_RETRY_EVERY_MS cadence,
 // WIFI_ATTEMPT_BUDGET_MS budget) with the STA idled and the radio PINNED to
-// the last AP channel in between (wifi_set_channel). A scanning/auto-retrying
-// STA hops channels, which deafens the ESP-NOW listener. Legacy mode (direct
-// off) keeps the historical behaviour exactly.
+// the last AP channel in between (wifi_set_channel) — for EVERY relay now,
+// not just espnowDirect ones: the always-on ESP-NOW discovery responder (and
+// any pucks) go deaf on a scanning/auto-retrying STA that hops channels.
+// Same scheme as the display unit's v1.12.1 fix. WiFi returns within one
+// attempt cycle when the router comes back; recovery latency moves from
+// ~seconds to <= ~40 s — the accepted trade for a pond that keeps feeding
+// and answering offline scans with no router.
 // ---------------------------------------------------------------------------
 static uint32_t g_wifiLastOkMs = 0;
 static bool g_wifiUp = false;
@@ -681,34 +757,25 @@ static void wifiWatchdog() {
     return;
   }
   if (g_wifiUp) {
-    // just lost link
+    // just lost link — v1.14.0: bounded attempts + channel pinning for every
+    // relay (see the section comment above).
     g_wifiUp = false;
-    LOG("wifi lost, watchdog armed");
-    if (g_espnow.direct) {
-      WiFi.setAutoReconnect(false); // stop SDK retry churn; bounded attempts below
-      g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
-      g_attemptAtMs = 0;
-      holdListenChannel();
-    }
+    LOG("wifi lost, watchdog armed (bounded reconnects, radio pinned)");
+    WiFi.setAutoReconnect(false); // stop SDK retry churn; bounded attempts below
+    g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
+    g_attemptAtMs = 0;
+    holdListenChannel();
   }
-  if (g_espnow.direct) {
-    if (g_attemptAtMs != 0 &&
-        millis() - g_attemptAtMs >= WIFI_ATTEMPT_BUDGET_MS) {
-      g_attemptAtMs = 0;
-      if (WiFi.status() != WL_CONNECTED) holdListenChannel();
-    } else if (g_attemptAtMs == 0 &&
-               (int32_t)(millis() - g_nextAttemptMs) >= 0) {
-      g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
-      g_attemptAtMs = millis();
-      LOG("reconnect attempt (stored credentials)");
-      WiFi.begin(); // stored credentials
-    }
-    return;
-  }
-  if (millis() - g_wifiLastOkMs >= WIFI_RECONNECT_AFTER_MS) {
-    LOG("wifi down > %u s -> WiFi.reconnect()", (unsigned)(WIFI_RECONNECT_AFTER_MS / 1000UL));
-    WiFi.reconnect();
-    g_wifiLastOkMs = millis();  // retry at the next interval, not in a tight loop
+  if (g_attemptAtMs != 0 &&
+      millis() - g_attemptAtMs >= WIFI_ATTEMPT_BUDGET_MS) {
+    g_attemptAtMs = 0;
+    if (WiFi.status() != WL_CONNECTED) holdListenChannel();
+  } else if (g_attemptAtMs == 0 &&
+             (int32_t)(millis() - g_nextAttemptMs) >= 0) {
+    g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
+    g_attemptAtMs = millis();
+    LOG("reconnect attempt (stored credentials)");
+    WiFi.begin(); // stored credentials
   }
 }
 
@@ -1171,7 +1238,8 @@ static void handleConfig() {
   }
   if (espnowChanged) {
     saveEspnowConfig();
-    espnowApplyConfig(); // start/stop the listener to match the new flag
+    espnowApplyConfig(); // v1.14.0: no-op re-init — the listener is always up,
+                         // the toggle is a gate check in the recv callback
     LOG("espnow config: direct=%u mask=0x%X", (unsigned)g_espnow.direct,
         (unsigned)g_espnow.mask);
   }
@@ -1265,18 +1333,20 @@ void setup() {
   });
   LOG("wifi: autoConnect (AP fallback '%s')", AP_NAME);
   if (!wm.autoConnect(AP_NAME)) {
-    if (g_espnow.direct) {
-      // v1.13.0: direct puck feed survives a routerless boot — stay up,
-      // pin the default channel and let the watchdog try bounded reconnects
-      // (the direct listener keeps working either way).
-      LOG("wifi connect/portal failed (timeout %u s) -- espnowDirect: continuing headless",
+    // v1.14.0: continue headless whenever stored credentials exist (was
+    // espnowDirect-only in v1.13.0) — the always-on discovery responder and
+    // pucks must survive a routerless boot, and the watchdog runs bounded
+    // reconnects. WITHOUT credentials, keep the historical reboot loop so a
+    // brand-new relay reopens its setup portal instead of going dark forever.
+    if (wm.getWiFiIsSaved()) {
+      LOG("wifi connect/portal failed (timeout %u s) -- continuing headless",
           (unsigned)WM_PORTAL_TIMEOUT_S);
       WiFi.mode(WIFI_STA);
       WiFi.disconnect(); // STA idle; stored credentials untouched
       wifi_set_channel(1); // never associated -> nothing to remember yet
       g_nextAttemptMs = millis() + WIFI_RETRY_EVERY_MS;
     } else {
-      LOG("wifi connect/portal failed (timeout %u s) -- restarting",
+      LOG("wifi connect/portal failed (timeout %u s) -- no credentials, restarting",
           (unsigned)WM_PORTAL_TIMEOUT_S);
       delay(1000);
       ESP.restart();
@@ -1323,7 +1393,7 @@ void setup() {
   g_server.begin();
   LOG("HTTP ready on :80 (health/status/feed/config)");
 
-  // v1.13.0: start/stop the direct puck listener to match the persisted flag.
+  // v1.14.0: always-on ESP-NOW listener (discovery responder + gated direct feed).
   espnowApplyConfig();
 
   g_wifiUp = (WiFi.status() == WL_CONNECTED);
@@ -1339,6 +1409,7 @@ void loop() {
   MDNS.update();       // v1.8.2: explicit pump (see setup comment)
   g_server.handleClient();
   rfdedupTick();       // v1.13.0: direct puck feed after the grace window expires
+  espnowDiscoveryTick(); // v1.14.0: answer queued offline-scan discovery requests
   ArduinoOTA.handle();
   discoveryPump();
   wifiWatchdog();

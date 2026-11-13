@@ -108,6 +108,10 @@ struct Result {
   // SCAN
   uint8_t boundMask = 0;  // tanks that got a NEW binding
   uint8_t liveCount = 0;  // tanks with a live IP after the scan
+  // v1.14.0: the scan ran over ESP-NOW discovery (router off) — liveCount is
+  // the number of relays that answered the token-keyed broadcast; no IPs are
+  // involved, so nothing was bound.
+  bool espnow = false;
   char ip[16] = {0};
   char version[16] = {0};
   char error[48] = {0};

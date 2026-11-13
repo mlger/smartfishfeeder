@@ -87,7 +87,39 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
       `strcmp` content compare; QEMU smoke is green again (13/13 checks +
       SMOKE PASS verified locally on the emulated ESP32-S3).
 
-## v1.14.0 — sensing 🔜
+## v1.14.0 — offline relay scan (ESP-NOW discovery) 🔜
+
+- [x] "Scan for relays" works with the ROUTER OFF (user-reported: the
+      v1.13.1 honest toast explained the WiFi-down limitation but the user
+      wants the capability, not the explanation). The scan now falls back to
+      a token-keyed ESP-NOW discovery round when WiFi is down:
+      - shared `catfish_rfnode.h` gains two additive datagram commands —
+        DISCOVER (cmd 2, broadcast by the hub) and DISCOVER_RSP (cmd 3,
+        unicast by the relay, carrying tank mask + default pulse seconds +
+        wire-protocol version in the spare envelope fields). Strict cmd
+        checks keep a discovery burst from ever arming a feed (host-tested).
+      - relay: the ESP-NOW listener is now ALWAYS on and answers discovery
+        in every mode (was: espnowDirect-only, opt-in). Consequences,
+        documented deliberately: (a) the WiFi watchdog runs bounded
+        reconnects + channel pinning for EVERY relay (was espnowDirect-only) —
+        WiFi recovery moves to ≤ ~40 s in exchange for a radio that keeps
+        answering offline scans and pucks; (b) a routerless boot continues
+        headless whenever stored credentials exist (first-boot provisioning
+        still reopens the portal / reboots, unchanged).
+      - display: `net_espnow::discoverRelays()` bursts ~5 broadcast REQs over
+        the same 1.5 s window the UDP scan uses, collects token-keyed RSPs
+        deduped by MAC; `net_worker` picks UDP when WiFi is up, ESP-NOW when
+        it is down; toasts phrase the transport honestly
+        (`Scan: N relay(s) via ESP-NOW (no WiFi)` / `No WiFi - no relays
+        answered via ESP-NOW`). ESP-NOW carries no IPs, so nothing binds and
+        tank cards keep their cached state.
+      - compat: pre-1.14.0 relays drop the REQ silently (strict parser),
+        pre-1.14.0 displays reject the RSP as garbage — mixed ponds never
+        misroute anything; CATFISH_PROTOCOL_VERSION stays 1 (additive).
+      QEMU smoke step updated: the WiFi-down scan now proves the fallback
+      path completes (no radio in QEMU → honest "no relays" result).
+
+## v1.15.0 — sensing 🔜
 
 - [ ] Food-level sensor on the relay unit (D2) — wire into the existing hopper
       estimator: calibration, low-food alerts, MQTT state. Oldest deferred
@@ -96,7 +128,7 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
       "LAN-only by design" decisions (default token, plaintext LAN traffic,
       unauthenticated GETs) **[audit S3–S7 / suggestion #13]** (effort S)
 
-## v1.15.0 — camera snapshot 🔜
+## v1.16.0 — camera snapshot 🔜
 
 - [ ] Camera snapshot on each feed event (last open item from the original
       README roadmap). Needs hardware selection first; the 4.3B display unit

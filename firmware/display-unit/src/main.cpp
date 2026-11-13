@@ -1477,34 +1477,53 @@ static void handleWorkerResult(const net_worker::Result &r) {
     ui_set_scan_busy(false);
     lvgl_port_unlock();
     if (r.ok) {
-      String ips[relay_client::MAX_TANKS];
-      for (uint8_t i = 0; i < relay_client::MAX_TANKS; i++)
-        ips[i] = relay_client::ip(i + 1);
-      lvgl_port_lock(-1);
-      ui_tanks_state(s_tank_online, s_tank_feeding, ips);
-      lvgl_port_unlock();
-      String t = String("Scan: ") + r.liveCount + " relay(s) live";
-      if (r.boundMask) t += ", " + String((int)__builtin_popcount(r.boundMask)) + " newly bound";
-      uiToast(t);
-      Serial.printf("[NET] tank scan done: live=%u bound=0x%X\n",
-                    (unsigned)r.liveCount, (unsigned)r.boundMask);
-      refreshSelectedTankCard();
+      if (r.espnow) {
+        // v1.14.0: router-off scan — the pond answered the token-keyed
+        // ESP-NOW discovery burst. No IPs travel over ESP-NOW, so the tank
+        // cards keep whatever binding they had; the toast is the point.
+        uiToast(String("Scan: ") + r.liveCount +
+                " relay(s) via ESP-NOW (no WiFi)");
+        Serial.printf("[NET] tank scan (ESP-NOW, no WiFi): %u relay(s)\n",
+                      (unsigned)r.liveCount);
+      } else {
+        String ips[relay_client::MAX_TANKS];
+        for (uint8_t i = 0; i < relay_client::MAX_TANKS; i++)
+          ips[i] = relay_client::ip(i + 1);
+        lvgl_port_lock(-1);
+        ui_tanks_state(s_tank_online, s_tank_feeding, ips);
+        lvgl_port_unlock();
+        String t = String("Scan: ") + r.liveCount + " relay(s) live";
+        if (r.boundMask)
+          t += ", " + String((int)__builtin_popcount(r.boundMask)) + " newly bound";
+        uiToast(t);
+        Serial.printf("[NET] tank scan done: live=%u bound=0x%X\n",
+                      (unsigned)r.liveCount, (unsigned)r.boundMask);
+        refreshSelectedTankCard();
+      }
     } else {
       // v1.13.1: "Scan for relays" is a UDP broadcast on the WiFi LAN — it
-      // needs the router up and CANNOT work over ESP-NOW. With direct puck
-      // feed enabled the pucks still feed without WiFi, so phrase the toast
-      // honestly instead of a bare "WiFi down" (mirrors the v1.13.0 feed).
+      // needs the router up. With direct puck feed enabled the pucks still
+      // feed without WiFi, so phrase the toast honestly instead of a bare
+      // "WiFi down" (mirrors the v1.13.0 feed).
       // v1.13.2: r.error is a char[] — `r.error == "WiFi down"` compared
       // POINTER addresses (always false), so the honest toast never fired and
       // the QEMU scan abort counter never incremented (CI job red).
-      if (strcmp(r.error, "WiFi down") == 0 && anyDirectPuckIntent()) {
+      // v1.14.0: with the router down the scan now first runs the ESP-NOW
+      // discovery round; only when NOTHING answers do we land here with
+      // "No relays via ESP-NOW" (relays below v1.14.0 have no responder).
+      if (strcmp(r.error, "No relays via ESP-NOW") == 0) {
+        uiToast("No WiFi - no relays answered via ESP-NOW");
+      } else if (strcmp(r.error, "WiFi down") == 0 && anyDirectPuckIntent()) {
         uiToast("No WiFi - cannot scan, pucks still feed directly");
       } else {
         uiToast(String("Scan failed: ") + r.error);
       }
       Serial.printf("[NET] tank scan FAILED: %s\n", r.error);
 #if CATFISH_QEMU
-      if (strcmp(r.error, "WiFi down") == 0) g_qemu_scan_wifi_aborts++;
+      if (strcmp(r.error, "No relays via ESP-NOW") == 0 ||
+          strcmp(r.error, "WiFi down") == 0) {
+        g_qemu_scan_wifi_aborts++;
+      }
 #endif
     }
     return;
@@ -1724,8 +1743,9 @@ static void qemuSmokePump() {
                    g_qemu_wifi_aborts == 2);
       {
         // v1.13.1: tank scan with WiFi down — the worker must complete the
-        // command with a WiFi-down result and the scan button must un-wedge
-        // (RES_SCAN failure path, not the pre-enqueue feed abort).
+        // command and the scan button must un-wedge. v1.14.0: the completion
+        // path is the ESP-NOW discovery fallback (QEMU has no radio, so zero
+        // relays answer and the result is the honest no-relays failure).
         UiEvent ev{};
         ev.type = UI_EVT_SCAN_TANKS;
         qemuSmokeSend(ev);
@@ -1733,7 +1753,7 @@ static void qemuSmokePump() {
       s_step = 11;
       break;
     case 11:
-      qemuSmokeLog("SCAN completes cleanly with no WiFi",
+      qemuSmokeLog("SCAN completes cleanly with no WiFi (ESP-NOW fallback)",
                    g_qemu_scan_wifi_aborts == 1);
       {
         // v1.11.6: CALIB tab SET — 74 g weighed after a 2 s test -> 37 g/s

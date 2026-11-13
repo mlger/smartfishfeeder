@@ -30,7 +30,7 @@
       hold="feed"     press-and-hold 800 ms action (FEED NOW)
       action="..."    demo click behaviour (scan, add-time, edit, token, ...)
 -->
-<catfish-ui app="Catfish Feeder" version="1.13.2" resolution="800x480">
+<catfish-ui app="Catfish Feeder" version="1.14.0" resolution="800x480">
 
   <consts>
     <color name="bg"       value="#10201F"/> <!-- C_BG        -->

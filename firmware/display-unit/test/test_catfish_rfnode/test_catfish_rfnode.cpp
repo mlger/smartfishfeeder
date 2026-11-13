@@ -8,6 +8,7 @@
 #include <unity.h>
 
 #include <catfish_rfnode.h>
+#include <catfish_protocol.h> // CATFISH_PROTOCOL_VERSION (discovery RSP field)
 #include <string.h>
 
 void test_build_produces_expected_bytes(void) {
@@ -154,6 +155,103 @@ void test_listen_channel_falls_back_to_default_when_never_connected(void) {
                           catfishRfnodeListenChannel(true, 0, 0));
 }
 
+// ---- v1.14.0: offline relay discovery datagrams ----
+
+void test_discover_req_roundtrip(void) {
+  uint8_t buf[CATFISH_RFNODE_PKT_LEN];
+  const uint32_t key = catfishRfnodeKeyFromToken("catfish");
+  TEST_ASSERT_EQUAL_UINT(CATFISH_RFNODE_PKT_LEN,
+                         catfishRfnodeBuildDiscover(buf, sizeof(buf), 0xBEEF,
+                                                    key));
+  TEST_ASSERT_EQUAL_UINT8(CATFISH_RFNODE_CMD_DISCOVER, buf[3]);
+  TEST_ASSERT_EQUAL_UINT8(0, buf[4]); // mask zeroed — never looks like a feed
+  TEST_ASSERT_EQUAL_UINT8(0, buf[5]); // seconds zeroed
+
+  uint16_t seq = 0;
+  uint32_t gotKey = 0;
+  TEST_ASSERT_TRUE(catfishRfnodeParseDiscover(buf, sizeof(buf), &seq, &gotKey));
+  TEST_ASSERT_EQUAL_UINT16(0xBEEF, seq);
+  TEST_ASSERT_EQUAL_UINT32(key, gotKey);
+}
+
+void test_discover_req_rejects_feed_and_rsp(void) {
+  uint8_t buf[CATFISH_RFNODE_PKT_LEN];
+  const uint32_t key = catfishRfnodeKeyFromToken("catfish");
+  catfishRfnodeBuild(buf, sizeof(buf), CATFISH_RFNODE_CMD_FEED, 0, 3, 1, key);
+  uint16_t seq = 0;
+  uint32_t gotKey = 0;
+  // a FEED datagram must never satisfy the discovery parser (the relay's
+  // recv path tries feed first, but the strict cmd check is what keeps a
+  // discovery burst from arming a direct feed on any firmware)
+  TEST_ASSERT_FALSE(catfishRfnodeParseDiscover(buf, sizeof(buf), &seq, &gotKey));
+  catfishRfnodeBuildDiscoverRsp(buf, sizeof(buf), 0x0F, 5, CATFISH_PROTOCOL_VERSION, key);
+  TEST_ASSERT_FALSE(catfishRfnodeParseDiscover(buf, sizeof(buf), &seq, &gotKey));
+}
+
+void test_discover_rsp_roundtrip(void) {
+  uint8_t buf[CATFISH_RFNODE_PKT_LEN];
+  const uint32_t key = catfishRfnodeKeyFromToken("tuna-2025");
+  TEST_ASSERT_EQUAL_UINT(CATFISH_RFNODE_PKT_LEN,
+                         catfishRfnodeBuildDiscoverRsp(buf, sizeof(buf), 0x05, 7,
+                                                       CATFISH_PROTOCOL_VERSION,
+                                                       key));
+  TEST_ASSERT_EQUAL_UINT8(CATFISH_RFNODE_CMD_DISCOVER_RSP, buf[3]);
+
+  uint8_t mask = 0, pulseS = 0;
+  uint16_t proto = 0;
+  uint32_t gotKey = 0;
+  TEST_ASSERT_TRUE(catfishRfnodeParseDiscoverRsp(buf, sizeof(buf), &mask,
+                                                 &pulseS, &proto, &gotKey));
+  TEST_ASSERT_EQUAL_UINT8(0x05, mask);
+  TEST_ASSERT_EQUAL_UINT8(7, pulseS);
+  TEST_ASSERT_EQUAL_UINT16(CATFISH_PROTOCOL_VERSION, proto);
+  TEST_ASSERT_EQUAL_UINT32(key, gotKey);
+}
+
+void test_discover_rsp_rejects_feed_and_req(void) {
+  uint8_t buf[CATFISH_RFNODE_PKT_LEN];
+  const uint32_t key = catfishRfnodeKeyFromToken("catfish");
+  uint8_t mask = 0, pulseS = 0;
+  uint16_t proto = 0;
+  uint32_t gotKey = 0;
+  // a puck FEED broadcast reaching the hub must not parse as a relay answer
+  catfishRfnodeBuild(buf, sizeof(buf), CATFISH_RFNODE_CMD_FEED, 0x0F, 10, 9, key);
+  TEST_ASSERT_FALSE(catfishRfnodeParseDiscoverRsp(buf, sizeof(buf), &mask,
+                                                  &pulseS, &proto, &gotKey));
+  catfishRfnodeBuildDiscover(buf, sizeof(buf), 4, key);
+  TEST_ASSERT_FALSE(catfishRfnodeParseDiscoverRsp(buf, sizeof(buf), &mask,
+                                                  &pulseS, &proto, &gotKey));
+}
+
+void test_discover_rsp_clamps_pulse(void) {
+  uint8_t buf[CATFISH_RFNODE_PKT_LEN];
+  const uint32_t key = catfishRfnodeKeyFromToken("catfish");
+  // a relay pulse cap over the wire hard cap clamps like a feed datagram
+  TEST_ASSERT_EQUAL_UINT(CATFISH_RFNODE_PKT_LEN,
+                         catfishRfnodeBuildDiscoverRsp(buf, sizeof(buf), 0, 200,
+                                                       CATFISH_PROTOCOL_VERSION,
+                                                       key));
+  uint8_t mask = 0, pulseS = 0;
+  uint16_t proto = 0;
+  uint32_t gotKey = 0;
+  TEST_ASSERT_TRUE(catfishRfnodeParseDiscoverRsp(buf, sizeof(buf), &mask,
+                                                 &pulseS, &proto, &gotKey));
+  TEST_ASSERT_EQUAL_UINT8(60, pulseS);
+}
+
+void test_discover_rejects_truncated(void) {
+  uint8_t buf[CATFISH_RFNODE_PKT_LEN];
+  const uint32_t key = catfishRfnodeKeyFromToken("catfish");
+  (void)catfishRfnodeBuildDiscover(buf, sizeof(buf), 1, key);
+  uint16_t seq = 0;
+  uint32_t gotKey = 0;
+  uint8_t mask = 0, pulseS = 0;
+  uint16_t proto = 0;
+  TEST_ASSERT_FALSE(catfishRfnodeParseDiscover(buf, 8, &seq, &gotKey));
+  TEST_ASSERT_FALSE(catfishRfnodeParseDiscoverRsp(buf, 11, &mask, &pulseS,
+                                                  &proto, &gotKey));
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_build_produces_expected_bytes);
@@ -167,5 +265,11 @@ int main() {
   RUN_TEST(test_listen_channel_follows_ap_when_connected);
   RUN_TEST(test_listen_channel_pins_last_ap_when_down);
   RUN_TEST(test_listen_channel_falls_back_to_default_when_never_connected);
+  RUN_TEST(test_discover_req_roundtrip);
+  RUN_TEST(test_discover_req_rejects_feed_and_rsp);
+  RUN_TEST(test_discover_rsp_roundtrip);
+  RUN_TEST(test_discover_rsp_rejects_feed_and_req);
+  RUN_TEST(test_discover_rsp_clamps_pulse);
+  RUN_TEST(test_discover_rejects_truncated);
   return UNITY_END();
 }

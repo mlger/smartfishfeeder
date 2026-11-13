@@ -17,6 +17,11 @@
  * the wifi task pins the last AP channel (catfishRfnodeListenChannel,
  * host-tested), so nodes keep matching it; nodes must transmit on the AP's
  * channel (or channel 1 if the hub never joined a network).
+ *
+ * v1.14.0: the hub also SENDS now — discoverRelays() broadcasts token-keyed
+ * DISCOVER datagrams so the offline "Scan for relays" can find relays with
+ * the router off (the relay answers with its ESP-NOW MAC + capabilities;
+ * a UDP LAN broadcast cannot exist without WiFi).
  */
 #ifndef CATFISH_ESPNOW_H
 #define CATFISH_ESPNOW_H
@@ -37,6 +42,14 @@ enum State : uint8_t {
   Error,
 };
 
+/** One relay discovered by the offline ESP-NOW scan (v1.14.0). */
+struct EspnowRelay {
+  uint8_t mac[6];   // relay's ESP-NOW MAC (from the RSP's source address)
+  uint8_t tankMask; // relay's direct-feed tank filter (0 = accepts all)
+  uint8_t pulseS;   // relay's default pulse seconds (0 = factory default)
+  uint16_t proto;   // CATFISH_PROTOCOL_VERSION the relay speaks
+};
+
 State state();
 
 /**
@@ -47,6 +60,15 @@ bool beginOnce();
 
 /** Re-derive the packet key from the pairing token (loop() context). */
 void onTokenChanged();
+
+/**
+ * v1.14.0: offline relay discovery — broadcast DISCOVER REQ bursts on the
+ * current radio channel for @p windowMs and collect token-keyed
+ * DISCOVER_RSPs (same trust gate as feed datagrams). BLOCKING by design —
+ * call from the net worker task only (it is the ESP-NOW twin of the UDP
+ * broadcast round). @return relays written into @p out (up to @p maxOut).
+ */
+int discoverRelays(uint32_t windowMs, EspnowRelay *out, int maxOut);
 
 } // namespace net_espnow
 

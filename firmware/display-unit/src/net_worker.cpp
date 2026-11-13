@@ -8,6 +8,8 @@
 #include <catfish_mech.h>
 #include "prefs.h"
 #include "relay_client.h"
+#include "net_wifi.h"
+#include "net_espnow.h"
 
 namespace {
 
@@ -108,13 +110,35 @@ void workerTask(void * /*param*/) {
       if (!er.ok) fillError(r, er.error);
     } else if (cmd.type == net_worker::Cmd::CMD_SCAN_TANKS) {
       Serial.println("[NET] worker: tank scan request");
-      uint8_t assigned = 0;
-      const int live = relay_client::scanAndBindTanks(prefs::getTankCount(), &assigned);
-      r.kind = net_worker::Result::RES_SCAN;
-      r.ok = (live >= 0);
-      r.boundMask = assigned;
-      r.liveCount = (uint8_t)(live < 0 ? 0 : live);
-      if (live < 0) fillError(r, "WiFi down");
+      if (net_wifi::wifi_is_connected()) {
+        // Router up: the classic LAN UDP broadcast round (gives IPs to bind).
+        uint8_t assigned = 0;
+        const int live =
+            relay_client::scanAndBindTanks(prefs::getTankCount(), &assigned);
+        r.kind = net_worker::Result::RES_SCAN;
+        r.ok = (live >= 0);
+        r.boundMask = assigned;
+        r.liveCount = (uint8_t)(live < 0 ? 0 : live);
+        if (live < 0) fillError(r, "WiFi down");
+      } else {
+        // v1.14.0: router OFF — fall back to ESP-NOW discovery. The UDP
+        // broadcast cannot exist without WiFi, but the token-keyed 12-byte
+        // datagram round still reaches every relay (its responder is always
+        // on since v1.14.0). No IPs travel over ESP-NOW, so nothing is
+        // bound — this scan tells the user the pond is reachable offline.
+        net_espnow::EspnowRelay found[relay_client::MAX_TANKS];
+        const int n = net_espnow::discoverRelays(1500, found,
+                                                 relay_client::MAX_TANKS);
+        r.kind = net_worker::Result::RES_SCAN;
+        if (n > 0) {
+          r.ok = true;
+          r.liveCount = (uint8_t)n;
+          r.espnow = true;
+        } else {
+          r.ok = false;
+          fillError(r, "No relays via ESP-NOW");
+        }
+      }
     } else {
       // PROBE: discover when needed, then GET /status (per tank)
       const uint8_t tank1 = sanitizeTank1(cmd.tankId);
