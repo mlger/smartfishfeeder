@@ -23,6 +23,7 @@ Status legend: ✅ shipped · 🔜 planned · 💤 deferred
 | v1.10.0 | Grams dosing, on-display WiFi manager |
 | v1.11.x | UI overhaul (hold-to-feed, undo, 7-day chart), on-device schedule editing + calibration |
 | v1.12.0 | Sub-second millisecond relay pulses (calibration accuracy), self-hosted ESP Web Tools |
+| v1.14.0 | Offline relay scan — ESP-NOW discovery finds relays with the router off (always-on relay responder) |
 
 ## v1.12.x — stabilization (patch train) 🔜
 
